@@ -1,0 +1,34 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Build/package artifacts
+*.egg-info/
+build/
+dist/
+
+# Data and generated results
+datasets/
+carto_outputs/
+hector_outputs/
+outputs/
+
+# Nested generated folders
+**/outputs/
+**/__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
