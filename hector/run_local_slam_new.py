@@ -28,6 +28,7 @@ from carto.local_slam.range_to_points import ranges_to_points
 from carto.local_slam.pose_extrapolator import PoseExtrapolatorCV
 
 from slam_core.matching.core import MatcherManager
+from slam_core.matching.preprocessing import PointCloudProcessor, PointCloudProcessorConfig
 from slam_core.matching.scan_to_submap import (
     SubmapBuilder2D,
     ScanToSubmapMatcher,
@@ -76,6 +77,19 @@ def main():
         print("Using scans:", len(scans))
 
     # ------------------------------------------------
+    # Shared point-cloud preprocessing
+    # ------------------------------------------------
+    point_processor = PointCloudProcessor(
+        PointCloudProcessorConfig(
+            fixed_voxel_size=0.03,
+            adaptive_voxel_max_size=0.15,
+            adaptive_min_num_points=100,
+            adaptive_num_iterations=8,
+            enabled=True,
+        )
+    )
+
+    # ------------------------------------------------
     # Shared matcher dependencies
     # ------------------------------------------------
     submaps = SubmapBuilder2D(
@@ -112,10 +126,10 @@ def main():
         gn_iters_per_level=[15, 12, 10, 8],
         gn_damping=1e-3,
         min_points=20,
-        min_inliers_accept=35,
-        min_score=0.52,
-        step_clip_xy=0.012,
-        step_clip_th=np.deg2rad(0.6),
+        min_inliers_accept=25,
+        min_score=0.45,
+        step_clip_xy=0.02,
+        step_clip_th=np.deg2rad(0.7),
     )
 
     if MATCHER_TYPE == "scan_to_submap":
@@ -216,7 +230,7 @@ def main():
             t = float(s["t"])
             odom = Pose2(*s["odom"])
 
-            pts = ranges_to_points(
+            pts_raw = ranges_to_points(
                 s["ranges"],
                 ANGLE_MIN,
                 ANGLE_INC,
@@ -224,6 +238,7 @@ def main():
                 RANGE_MAX,
                 stride=BEAM_STRIDE,
             )
+            pts, proc_debug = point_processor.process(pts_raw)
 
             pose, result, do_insert, did_insert = adapter.process_scan(
                 t=t,
@@ -273,6 +288,13 @@ def main():
                     f"dtime={motion_debug.get('dtime', 0.0):.3f}",
                     f"do_insert={motion_debug.get('do_insert', False)}",
                     f"did_insert={motion_debug.get('did_insert', False)}",
+                )
+
+                print(
+                    "preprocess:",
+                    f"raw={proc_debug['n_input']}",
+                    f"fixed={proc_debug['n_after_fixed']}",
+                    f"adaptive={proc_debug['n_after_adaptive']}",
                 )
 
                 print(

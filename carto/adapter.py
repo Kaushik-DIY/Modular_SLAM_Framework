@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
@@ -12,14 +12,9 @@ from carto.pose_graph.pose_graph_2d import PoseGraph2D
 
 @dataclass
 class MotionFilterParams:
-    """
-    Cartographer-style motion filter thresholds in tracking/world frame.
-    """
     max_time_seconds: float
     max_distance_meters: float
     max_angle_radians: float
-
-    # defensive clamps
     min_distance_meters: float = 0.05
     min_angle_radians: float = np.deg2rad(0.5)
     max_distance_cap_meters: float = 0.50
@@ -36,10 +31,6 @@ def make_motion_filter_from_expected_velocity(
     max_dist: float = 0.50,
     max_ang: float = np.deg2rad(10.0),
 ) -> MotionFilterParams:
-    """
-    Derive dataset-rate-independent motion filter thresholds
-    from expected robot velocities.
-    """
     d = float(v_expected_mps) * float(target_insert_period_s)
     a = float(w_expected_rps) * float(target_insert_period_s)
 
@@ -64,11 +55,6 @@ def motion_filter_decision(
     last_time: Optional[float],
     p: MotionFilterParams,
 ) -> Tuple[bool, float, float, float]:
-    """
-    Returns:
-        do_insert, dtrans, drot, dtime
-    All computed in tracking/world frame.
-    """
     if last_pose is None or last_time is None:
         return True, 0.0, 0.0, 0.0
 
@@ -87,23 +73,6 @@ def motion_filter_decision(
 
 
 class CartoLocalSlamAdapter:
-    """
-    Cartographer-style orchestration layer using a swappable matcher manager.
-
-    Responsibilities:
-      - pose prediction via extrapolator
-      - motion filter
-      - matcher invocation
-      - target update policy
-      - pose graph insertion policy
-      - rolling matched buffer update
-
-    Does NOT own:
-      - matcher internals
-      - submap building internals
-      - scan matching internals
-    """
-
     def __init__(
         self,
         matcher_manager: MatcherManager,
@@ -111,15 +80,16 @@ class CartoLocalSlamAdapter:
         pose_graph: Optional[PoseGraph2D] = None,
         motion_params: Optional[MotionFilterParams] = None,
         solve_every_n_nodes: int = 30,
+        global_slam: Optional[Any] = None,
     ):
         self.matcher_manager = matcher_manager
         self.extrap = extrapolator
         self.pose_graph = pose_graph
+        self.global_slam = global_slam
 
         self.motion_params = motion_params
         self.solve_every_n_nodes = int(solve_every_n_nodes)
 
-        # Reference pose/time for motion statistics or insert gating
         self.last_insert_pose: Optional[Pose2] = None
         self.last_insert_time: Optional[float] = None
         self.node_count: int = 0
@@ -153,16 +123,8 @@ class CartoLocalSlamAdapter:
         *,
         odom_alpha: float = 0.0,
     ) -> Tuple[Pose2, MatchResult, bool, bool]:
-        """
-        Process one scan through:
-          predict -> motion stats/filter -> matcher -> target update -> graph update -> buffer update
-
-        Returns:
-          final_pose, match_result, do_insert, did_insert
-        """
         t = float(t)
 
-        # Activate pending matcher, if a switch has been requested and buffer is ready.
         self.matcher_manager.maybe_activate_pending()
 
         active_matcher = self.matcher_manager.active_matcher
@@ -170,7 +132,6 @@ class CartoLocalSlamAdapter:
 
         pred_world = self._predict_world_pose(t, odom_pose_world, odom_alpha)
 
-        # Compute motion statistics always, even if some matcher ignores motion filtering.
         if self.motion_params is None:
             motion_insert, dtrans, drot, dtime = True, 0.0, 0.0, 0.0
         else:
@@ -182,7 +143,6 @@ class CartoLocalSlamAdapter:
                 p=self.motion_params,
             )
 
-        # Real Hector-style scan_to_map should update map every scan.
         if matcher_name == "scan_to_map":
             do_insert = True
         else:
@@ -203,12 +163,10 @@ class CartoLocalSlamAdapter:
         if not np.all(np.isfinite([final_pose.x, final_pose.y, final_pose.theta])):
             raise ValueError(f"Non-finite final pose from matcher: {final_pose}")
 
-        # Extrapolator always continues on final chosen pose
         self.extrap.update(t, final_pose)
 
         did_insert = False
 
-        # Hector-style scan_to_map: update target every scan
         if matcher_name == "scan_to_map":
             did_insert = self.matcher_manager.update_active_target(
                 pose_world=final_pose,
@@ -216,7 +174,6 @@ class CartoLocalSlamAdapter:
                 t=t,
             )
 
-        # Cartographer-style scan_to_submap: update only on motion-filter insert
         elif do_insert:
             did_insert = self.matcher_manager.update_active_target(
                 pose_world=final_pose,
@@ -226,32 +183,36 @@ class CartoLocalSlamAdapter:
 
         self._last_did_insert = bool(did_insert)
 
-        # Update motion reference:
-        # - for scan_to_map: every accepted scan, because map is updated every scan
-        # - for scan_to_submap: only on insert events
         if did_insert:
-            if matcher_name == "scan_to_map":
-                self.last_insert_pose = final_pose
-                self.last_insert_time = t
-            elif matcher_name != "scan_to_map":
-                self.last_insert_pose = final_pose
-                self.last_insert_time = t
+            self.last_insert_pose = final_pose
+            self.last_insert_time = t
 
-                # Pose graph insertion only for submap-style matchers
-                if self.pose_graph is not None:
-                    if hasattr(active_matcher, "get_active_submaps"):
-                        active_for_constraints = active_matcher.get_active_submaps()
-                        self.pose_graph.add_node_with_intra_constraints(
-                            t=t,
-                            node_pose_world=final_pose,
-                            active_submaps=active_for_constraints,
-                        )
-                        self.node_count += 1
+            if matcher_name != "scan_to_map" and self.pose_graph is not None:
+                if hasattr(active_matcher, "get_last_inserted_submaps"):
+                    insertion_submaps = active_matcher.get_last_inserted_submaps()
+                elif hasattr(active_matcher, "get_active_submaps"):
+                    insertion_submaps = active_matcher.get_active_submaps()
+                else:
+                    insertion_submaps = []
 
-                        if self.node_count % self.solve_every_n_nodes == 0:
-                            self.pose_graph.solve()
+                node_id = self.pose_graph.add_node_with_intra_constraints(
+                    t=t,
+                    node_pose_world=final_pose,
+                    active_submaps=insertion_submaps,
+                )
+                self.node_count += 1
 
-        # rolling matched buffer is always AFTER matching
+                if self.global_slam is not None:
+                    self.global_slam.on_node_inserted(
+                        node_id=node_id,
+                        timestamp=t,
+                        scan_points=scan_points_local,
+                        pose_global=final_pose,
+                        insertion_submaps=insertion_submaps,
+                    )
+                elif self.node_count % self.solve_every_n_nodes == 0:
+                    self.pose_graph.solve()
+
         self.matcher_manager.push_buffered_scan(
             t=t,
             scan_points_local=scan_points_local,
@@ -272,11 +233,10 @@ class CartoLocalSlamAdapter:
         return final_pose, result, bool(do_insert), bool(did_insert)
 
     def finalize(self) -> None:
-        if self.pose_graph is not None and self.node_count > 0:
+        if self.global_slam is not None:
+            self.global_slam.finalize()
+        elif self.pose_graph is not None and self.node_count > 0:
             self.pose_graph.solve()
 
     def last_motion_debug(self) -> Optional[dict]:
         return self._last_motion_debug
-
-    def last_match_result(self) -> Optional[MatchResult]:
-        return self._last_match_result

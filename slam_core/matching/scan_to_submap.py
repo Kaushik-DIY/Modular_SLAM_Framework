@@ -389,9 +389,7 @@ class CartoRefinementProblem:
 
 class SubmapBuilder2D:
     """
-    Cartographer-style:
-      - keep 2 active submaps
-      - insert each accepted scan into both
+    Cartographer-style submap manager.
     """
 
     def __init__(
@@ -420,6 +418,9 @@ class SubmapBuilder2D:
         )
         self._next_id = 0
         self.active: List[Submap2D] = []
+        self.finished_submaps: List[Submap2D] = []
+        self._newly_finished_ids: List[int] = []
+        self._last_inserted_submaps: List[Submap2D] = []
         self._initialized = False
 
     @staticmethod
@@ -456,8 +457,10 @@ class SubmapBuilder2D:
 
     def _maybe_finish_oldest(self, pose_world: Pose2) -> None:
         while self.active and self.active[0].num_inserted >= self.scans_per_submap:
-            self.active[0].finished = True
-            self.active.pop(0)
+            finished = self.active.pop(0)
+            finished.finished = True
+            self.finished_submaps.append(finished)
+            self._newly_finished_ids.append(int(finished.id))
             self.active.append(self._new_submap(pose_world))
 
     def insert_scan(self, pose_world: Pose2, scan_points_local: np.ndarray) -> bool:
@@ -465,9 +468,12 @@ class SubmapBuilder2D:
             self._ensure_two_active(pose_world)
             self._initialized = True
 
+        inserted_into = list(self.active)
+        self._last_inserted_submaps = list(inserted_into)
+
         endpoints_world = transform_points_pose(pose_world, scan_points_local)
 
-        for sm in self.active:
+        for sm in inserted_into:
             T_ws_inv = inverse_pose(sm.pose_world)
 
             origin_sub = transform_points_pose(
@@ -481,7 +487,6 @@ class SubmapBuilder2D:
 
         self._maybe_finish_oldest(pose_world)
         self._ensure_two_active(pose_world)
-
         return True
 
     def _integrate_submap_frame(
@@ -512,8 +517,32 @@ class SubmapBuilder2D:
     def get_active_submaps(self) -> List[Submap2D]:
         return list(self.active)
 
+    def get_last_inserted_submaps(self) -> List[Submap2D]:
+        return list(self._last_inserted_submaps)
+
+    def get_finished_submaps(self) -> List[Submap2D]:
+        return list(self.finished_submaps)
+
+    def consume_newly_finished_ids(self) -> List[int]:
+        ids = list(self._newly_finished_ids)
+        self._newly_finished_ids.clear()
+        return ids
+
+    def get_submap_by_id(self, submap_id: int) -> Submap2D:
+        submap_id = int(submap_id)
+        for sm in self.active:
+            if int(sm.id) == submap_id:
+                return sm
+        for sm in self.finished_submaps:
+            if int(sm.id) == submap_id:
+                return sm
+        raise KeyError(f"Unknown submap id: {submap_id}")
+
     def clear(self) -> None:
         self.active = []
+        self.finished_submaps = []
+        self._newly_finished_ids = []
+        self._last_inserted_submaps = []
         self._initialized = False
         self._next_id = 0
 
@@ -724,6 +753,9 @@ class ScanToSubmapMatcher(ScanMatcherBase):
 
     def get_active_submaps(self):
         return self.submap_builder.get_active_submaps()
+    
+    def get_last_inserted_submaps(self):
+        return self.submap_builder.get_last_inserted_submaps()
 
     # --------------------------------------------------------
     # Optional debug helpers

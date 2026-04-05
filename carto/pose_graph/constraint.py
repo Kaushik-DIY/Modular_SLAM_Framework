@@ -1,11 +1,13 @@
 from dataclasses import dataclass
-import numpy as np
 from carto.common.types import Pose2
+
+
+INTRA_SUBMAP = "INTRA_SUBMAP"
+INTER_SUBMAP = "INTER_SUBMAP"
 
 
 @dataclass
 class PoseGraphNode:
-    """Trajectory node (scan)."""
     id: int
     time: float
     pose: Pose2
@@ -13,23 +15,29 @@ class PoseGraphNode:
 
 @dataclass
 class PoseGraphSubmap:
-    """Submap node (optimized globally)."""
     id: int
     pose: Pose2
 
 
 @dataclass
+class ConstraintPose2D:
+    """
+    Cartographer-style relative pose constraint payload.
+    """
+    relative_pose: Pose2
+    translation_weight: float
+    rotation_weight: float
+    match_score: float = 1.0
+
+
+@dataclass
 class PoseGraphConstraint:
     """
-    Generic constraint between either:
-      - submap -> node   (intra)
-      - submap -> submap (inter)
-      - node -> node     (optional)
+    Cartographer-style 2D constraint:
+      submap_id -> node_id
+    tagged as either INTRA_SUBMAP or INTER_SUBMAP.
     """
-    type_from: str  # 'node' or 'submap'
-    id_from: int
-    type_to: str    # 'node' or 'submap'
-    id_to: int
-
-    relative_pose: Pose2
-    information: np.ndarray  # 3x3
+    submap_id: int
+    node_id: int
+    pose: ConstraintPose2D
+    tag: str
