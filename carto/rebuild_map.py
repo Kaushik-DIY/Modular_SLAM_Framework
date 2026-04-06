@@ -273,7 +273,7 @@ def plot_before_after(grid_local, grid_opt, traj_local, traj_opt, out_prefix: st
 
 def main():
     log_path = "datasets/fr079/fr079.clf"
-    prefix = "carto_outputs/trajectory_scan_to_submap_loop_1000"
+    prefix = "carto_outputs/trajectory_scan_to_submap_loop_700"
 
     debug_path = f"{prefix}_debug.txt"
     optimized_nodes_path = f"{prefix}_optimized_nodes.txt"

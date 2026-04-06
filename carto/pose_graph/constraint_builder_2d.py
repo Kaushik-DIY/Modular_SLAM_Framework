@@ -9,12 +9,10 @@ from slam_core.common.types import Pose2
 from slam_core.common.se2 import inverse_pose, pose_compose, wrap_angle
 from slam_core.loop_closure import pose_relative, pose_translation_distance
 from slam_core.matching.scan_to_submap import (
-    CartoRefinementProblem,
     ScanToSubmapMatcher,
-    Submap2D,
+    SubmapMatchRequest,
 )
 from carto.pose_graph.pose_graph_2d import PoseGraph2D
-from carto.pose_graph.scan_matcher_cache_2d import SubmapScanMatcherCache2D
 
 
 @dataclass
@@ -46,20 +44,6 @@ class ConstraintBuilder2DConfig:
     # Candidate eligibility
     min_node_index_separation: int = 40
     recent_finished_submap_exclusion: int = 3
-
-    # Coarse scan matching
-    min_valid: int = 20
-    coarse_level: int = 2
-    coarse_xy_window: float = 0.8
-    coarse_th_window: float = 0.3
-    coarse_xy_step: float = 0.20
-    coarse_th_step: float = 0.08
-
-    # Refinement
-    do_refine: bool = True
-    max_match_points: int = 40
-    max_refine_points: int = 120
-    refine_min_points: int = 25
 
     # Consistency gate between predicted and measured relative pose
     consistency_max_translation_delta: float = 1.0
@@ -93,30 +77,19 @@ class FixedRatioSampler:
 
 class ConstraintBuilder2D:
     """
-    Cartographer-style 2D constraint builder.
-
-    This module is responsible for:
-      1. candidate gating,
-      2. per-submap sampling,
-      3. scan-to-finished-submap verification,
-      4. consistency gating,
-      5. loop-constraint creation,
-      6. batched optimization triggering.
+    Cartographer-style 2D constraint builder using the shared scan-to-submap
+    abstraction with an explicit chosen target submap.
     """
 
     def __init__(
         self,
-        matcher: ScanToSubmapMatcher,
+        loop_matcher: ScanToSubmapMatcher,
         pose_graph: PoseGraph2D,
         config: Optional[ConstraintBuilder2DConfig] = None,
     ) -> None:
-        self.matcher = matcher
+        self.loop_matcher = loop_matcher
         self.pose_graph = pose_graph
         self.config = config or ConstraintBuilder2DConfig()
-
-        self.cache = SubmapScanMatcherCache2D(
-            precomp_levels=int(self.matcher.corr_params.get("precomp_levels", 3))
-        )
 
         self.nodes: Dict[int, TrajectoryNodeRecord] = {}
         self._accepted_pairs: set[tuple[int, int]] = set()
@@ -150,7 +123,7 @@ class ConstraintBuilder2D:
 
     def maybe_add_constraints_for_new_node(self, node_id: int) -> None:
         node = self.nodes[int(node_id)]
-        finished_submaps = self.matcher.submap_builder.get_finished_submaps()
+        finished_submaps = self.loop_matcher.submap_builder.get_finished_submaps()
         if not finished_submaps:
             return
 
@@ -222,7 +195,7 @@ class ConstraintBuilder2D:
 
     def maybe_add_constraints_for_finished_submap(self, submap_id: int) -> None:
         sid = int(submap_id)
-        submap = self.matcher.submap_builder.get_submap_by_id(sid)
+        submap = self.loop_matcher.submap_builder.get_submap_by_id(sid)
         latest_node_id = max(self.nodes.keys()) if self.nodes else -1
 
         for node_id in sorted(self.nodes.keys()):
@@ -308,62 +281,28 @@ class ConstraintBuilder2D:
     def _verify_pair(
         self,
         node: TrajectoryNodeRecord,
-        submap: Submap2D,
+        submap,
     ) -> Optional[Tuple[float, Pose2]]:
-        sid = int(submap.id)
-        submap_pose = self.pose_graph.get_submap_pose(sid)
-
-        # Predicted node pose in the chosen submap frame.
-        pred_sub = pose_compose(inverse_pose(submap_pose), node.pose_global)
-
-        pts_match = node.scan_points
-        max_match_pts = int(self.config.max_match_points)
-        if pts_match.shape[0] > max_match_pts:
-            stride = max(1, pts_match.shape[0] // max_match_pts)
-            pts_match = pts_match[::stride]
-
-        coarse_pose_sub, coarse_score = self.cache.coarse_match(
+        request = SubmapMatchRequest(
+            scan_points_local=node.scan_points,
+            predicted_pose_world=node.pose_global,
+            submap_pose_world=self.pose_graph.get_submap_pose(int(submap.id)),
             submap=submap,
-            points_local=pts_match,
-            initial_submap_pose=pred_sub,
-            min_valid=int(self.config.min_valid),
-            coarse_level=int(self.config.coarse_level),
-            coarse_xy_window=float(self.config.coarse_xy_window),
-            coarse_th_window=float(self.config.coarse_th_window),
-            coarse_xy_step=float(self.config.coarse_xy_step),
-            coarse_th_step=float(self.config.coarse_th_step),
+            timestamp=float(node.timestamp),
+            odom_pose_world=None,
         )
 
-        if coarse_score < float(self.config.min_score):
+        response = self.loop_matcher.match_against_submap(request)
+        if not response.success:
             return None
 
-        refined_sub = coarse_pose_sub
+        score = float(response.score)
+        matched_pose_world = response.pose_world
 
-        if bool(self.config.do_refine):
-            x0 = np.array([coarse_pose_sub.x, coarse_pose_sub.y, coarse_pose_sub.theta], dtype=float)
-            xpred = np.array([pred_sub.x, pred_sub.y, pred_sub.theta], dtype=float)
+        if score < float(self.config.min_score):
+            return None
 
-            refine_pts = node.scan_points
-            max_refine_pts = int(self.config.max_refine_points)
-            if refine_pts.shape[0] > max_refine_pts:
-                stride = max(1, refine_pts.shape[0] // max_refine_pts)
-                refine_pts = refine_pts[::stride]
-
-            problem = CartoRefinementProblem(
-                grid=submap.grid,
-                pts_local=refine_pts,
-                pred_pose_sub=xpred,
-                min_points=int(self.config.refine_min_points),
-                w_trans=float(self.matcher.corr_params.get("refine_w_trans", 1.0)),
-                w_rot=float(self.matcher.corr_params.get("refine_w_rot", 1.0)),
-            )
-
-            x_opt = self.matcher.refine_solver.solve(x0, problem.compute_r_J).reshape(3)
-            x_opt[2] = wrap_angle(x_opt[2])
-            refined_sub = Pose2(float(x_opt[0]), float(x_opt[1]), float(x_opt[2]))
-
-        matched_pose_world = pose_compose(submap_pose, refined_sub)
-        return float(coarse_score), matched_pose_world
+        return score, matched_pose_world
 
     # ------------------------------------------------------------------
     # Acceptance improvements

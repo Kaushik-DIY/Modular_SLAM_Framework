@@ -35,6 +35,8 @@ from slam_core.matching.core import MatcherManager
 from slam_core.matching.scan_to_submap import (
     SubmapBuilder2D,
     ScanToSubmapMatcher,
+    ScanToSubmapBackendConfig,
+    SubmapSearchWindow,
 )
 from slam_core.matching.scan_to_map import ScanToMapMatcher
 
@@ -68,12 +70,15 @@ def main():
     # ------------------------------------------------
     # Experiment config
     # ------------------------------------------------
-    MATCHER_TYPE = "scan_to_map"     # "scan_to_submap" or "scan_to_map"
-    MAX_SCANS = 500                 # use None for full dataset later
-    VERBOSE_EVERY = 10                # print every scan for now
+    MATCHER_TYPE = "scan_to_submap"          # "scan_to_submap" or "scan_to_map"
+    SUBMAP_BACKEND_TYPE = "two_stage_bruteforce"   # "two_stage_bruteforce" or "branch_and_bound"
+    MAX_SCANS = 700                          # set None for full dataset
+    VERBOSE_EVERY = 10
 
-    print("runner:", "carto")
+    print("runner:", "carto_local_only")
     print("matcher_type:", MATCHER_TYPE)
+    if MATCHER_TYPE == "scan_to_submap":
+        print("submap_backend_type:", SUBMAP_BACKEND_TYPE)
 
     if MAX_SCANS is not None:
         scans = scans[:int(MAX_SCANS)]
@@ -84,9 +89,9 @@ def main():
     # ------------------------------------------------
     point_processor = PointCloudProcessor(
         PointCloudProcessorConfig(
-            fixed_voxel_size=0.03,
-            adaptive_voxel_max_size=0.15,
-            adaptive_min_num_points=100,
+            fixed_voxel_size=0.05,
+            adaptive_voxel_max_size=0.0,
+            adaptive_min_num_points=90,
             adaptive_num_iterations=8,
             enabled=True,
         )
@@ -110,29 +115,51 @@ def main():
     # ------------------------------------------------
     # Matcher configs
     # ------------------------------------------------
-    corr_params_submap = dict(
-        min_score=0.52,
-        odom_alpha=0.2,
-        max_match_points=60,
+    local_submap_backend_config = ScanToSubmapBackendConfig(
+        backend_type=SUBMAP_BACKEND_TYPE,
+        min_score=0.52 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 0.66,
         min_valid=20,
-        precomp_levels=3,
-        coarse_level=2,
-        coarse_xy_window=0.8,
-        coarse_th_window=0.3,
-        coarse_xy_step=0.20,
-        coarse_th_step=0.08,
-        fine_level=0,
-        fine_xy_window=0.25,
-        fine_th_window=0.12,
-        fine_xy_step=0.05,
-        fine_th_step=0.02,
+        precomp_levels=8 if SUBMAP_BACKEND_TYPE == "branch_and_bound" else 3,
+        do_refine=True,
+        max_match_points=60 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 40,
+        max_refine_points=180 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 120,
+        refine_min_points=20 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 25,
+        refine_w_trans=1.0,
+        refine_w_rot=1.0,
+        refine_iters=8,
+        refine_damping=1e-3,
+        refine_eps_stop=1e-6,
+        refine_step_clip_xy=0.10,
+        refine_step_clip_th=np.deg2rad(5.0),
+        refine_verbose=False,
+        coarse=SubmapSearchWindow(
+            xy_window=0.8,
+            theta_window=0.3,
+            xy_step=0.20 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 0.05,
+            theta_step=0.08 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 0.02,
+            level=2 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 0,
+        ),
+        fine=(
+            SubmapSearchWindow(
+                xy_window=0.25,
+                theta_window=0.12,
+                xy_step=0.05,
+                theta_step=0.02,
+                level=0,
+            )
+            if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce"
+            else None
+        ),
+        bnb_depth_limit=8,
+        bnb_min_rotational_step=0.02,
+        bnb_branching=4,
     )
 
     corr_params_map = dict(
         gn_iters_per_level=[15, 12, 10, 8],
         gn_damping=1e-3,
         min_points=20,
-        min_inliers_accept = 25,
+        min_inliers_accept=25,
         min_score=0.45,
         step_clip_xy=0.02,
         step_clip_th=np.deg2rad(0.7),
@@ -144,13 +171,13 @@ def main():
     if MATCHER_TYPE == "scan_to_submap":
         matcher = ScanToSubmapMatcher(
             submap_builder=submaps,
-            corr_params=corr_params_submap,
+            backend_config=local_submap_backend_config,
         )
 
     elif MATCHER_TYPE == "scan_to_map":
         map_params = dict(
             base_res=SUBMAP_RESOLUTION,
-            size_m= 80.0,
+            size_m=80.0,
             num_levels=4,
             l0=L0,
             l_min=L_MIN,
@@ -206,7 +233,7 @@ def main():
     # ------------------------------------------------
     # Pose graph
     # ------------------------------------------------
-    backend = SciPyBackend2D()
+    backend = SciPyBackend2D(huber_scale=1.0)
     backend.set_fixed("submap", 0)
 
     pg = PoseGraph2D(
@@ -224,6 +251,7 @@ def main():
         pose_graph=pg,
         motion_params=motion_params,
         solve_every_n_nodes=30,
+        global_slam=None,
     )
 
     # ------------------------------------------------
@@ -240,13 +268,20 @@ def main():
     # ------------------------------------------------
     os.makedirs("carto_outputs", exist_ok=True)
 
-    traj_path = f"carto_outputs/trajectory_{MATCHER_TYPE}_{len(scans)}.txt"
-    meta_path = f"carto_outputs/trajectory_{MATCHER_TYPE}_{len(scans)}_debug.txt"
+    suffix = MATCHER_TYPE
+    if MATCHER_TYPE == "scan_to_submap":
+        suffix = f"{MATCHER_TYPE}_{SUBMAP_BACKEND_TYPE}"
+
+    traj_path = f"carto_outputs/trajectory_{suffix}_{len(scans)}.txt"
+    meta_path = f"carto_outputs/trajectory_{suffix}_{len(scans)}_debug.txt"
 
     with open(traj_path, "w") as f_traj, open(meta_path, "w") as f_meta:
         f_meta.write(f"# matcher_type={MATCHER_TYPE}\n")
+        if MATCHER_TYPE == "scan_to_submap":
+            f_meta.write(f"# submap_backend_type={SUBMAP_BACKEND_TYPE}\n")
         f_meta.write(
-            "k t x y theta score inliers dx dy dtheta do_insert did_insert\n"
+            "k t x y theta score inliers dx dy dtheta do_insert did_insert "
+            "constraints_total constraints_intra constraints_loop nodes submaps\n"
         )
 
         # ------------------------------------------------
@@ -288,6 +323,14 @@ def main():
                 else:
                     dx = dy = dtheta = np.nan
 
+            constraint_counts = pg.get_constraint_counts()
+            n_constraints_total = constraint_counts["total"]
+            n_constraints_intra = constraint_counts["intra"]
+            n_constraints_loop = constraint_counts["loop"]
+
+            n_nodes = len(pg.backend.nodes)
+            n_submaps = len(pg.backend.submaps)
+
             f_traj.write(
                 f"{t:.6f} {pose.x:.6f} {pose.y:.6f} {pose.theta:.6f} {score:.6f}\n"
             )
@@ -297,7 +340,9 @@ def main():
                 f"{score:.6f} "
                 f"{-1 if inliers is None else int(inliers)} "
                 f"{dx:.6f} {dy:.6f} {dtheta:.6f} "
-                f"{int(do_insert)} {int(did_insert)}\n"
+                f"{int(do_insert)} {int(did_insert)} "
+                f"{n_constraints_total} {n_constraints_intra} {n_constraints_loop} "
+                f"{n_nodes} {n_submaps}\n"
             )
 
             if (k % VERBOSE_EVERY) == 0:
@@ -328,9 +373,14 @@ def main():
                     f"score={score:.3f} {dmsg} {imsg}"
                 )
 
-                print("constraints:", len(pg.backend.constraints))
-                print("nodes:", len(pg.backend.nodes))
-                print("submaps:", len(pg.backend.submaps))
+                print(
+                    "constraints:",
+                    f"total={n_constraints_total}",
+                    f"intra={n_constraints_intra}",
+                    f"loop={n_constraints_loop}",
+                )
+                print("nodes:", n_nodes)
+                print("submaps:", n_submaps)
 
     adapter.finalize()
 

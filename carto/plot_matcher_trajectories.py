@@ -38,11 +38,11 @@ def wrap_angle(a):
 
 
 def main():
-    submap_traj_path = "carto_outputs/trajectory_scan_to_submap_500.txt"
-    map_traj_path = "carto_outputs/trajectory_scan_to_map_500.txt"
+    submap_traj_path = "carto_outputs/trajectory_scan_to_submap_two_stage_bruteforce_700.txt"
+    map_traj_path = "carto_outputs/trajectory_scan_to_map_two_stage_bruteforce_700.txt"
 
-    submap_dbg_path = "carto_outputs/trajectory_scan_to_submap_500_debug.txt"
-    map_dbg_path = "carto_outputs/trajectory_scan_to_map_500_debug.txt"
+    submap_dbg_path = "carto_outputs/trajectory_scan_to_submap_two_stage_bruteforce_700_debug.txt"
+    map_dbg_path = "carto_outputs/trajectory_scan_to_map_two_stage_bruteforce_700_debug.txt"
 
     t1, x1, y1, th1, s1 = load_traj(submap_traj_path)
     t2, x2, y2, th2, s2 = load_traj(map_traj_path)

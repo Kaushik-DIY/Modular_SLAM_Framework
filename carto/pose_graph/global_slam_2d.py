@@ -4,6 +4,7 @@ from typing import Optional
 import numpy as np
 
 from slam_core.common.types import Pose2
+from slam_core.matching.scan_to_submap import ScanToSubmapMatcher
 from carto.pose_graph.pose_graph_2d import PoseGraph2D
 from carto.pose_graph.constraint_builder_2d import (
     ConstraintBuilder2D,
@@ -12,18 +13,25 @@ from carto.pose_graph.constraint_builder_2d import (
 
 
 class CartoGlobalSlam2D:
+    """
+    Cartographer-style global SLAM wrapper.
+
+    Local SLAM and loop closure may use different scan-to-submap backends while
+    sharing the same submap builder and pose graph.
+    """
+
     def __init__(
         self,
-        matcher,
+        loop_matcher: ScanToSubmapMatcher,
         pose_graph: PoseGraph2D,
         config: Optional[ConstraintBuilder2DConfig] = None,
     ) -> None:
-        self.matcher = matcher
+        self.loop_matcher = loop_matcher
         self.pose_graph = pose_graph
         self.config = config or ConstraintBuilder2DConfig()
 
         self.constraint_builder = ConstraintBuilder2D(
-            matcher=self.matcher,
+            loop_matcher=self.loop_matcher,
             pose_graph=self.pose_graph,
             config=self.config,
         )
@@ -48,7 +56,7 @@ class CartoGlobalSlam2D:
 
         self.constraint_builder.maybe_add_constraints_for_new_node(int(node_id))
 
-        finished_ids = self.matcher.submap_builder.consume_newly_finished_ids()
+        finished_ids = self.loop_matcher.submap_builder.consume_newly_finished_ids()
         for sid in finished_ids:
             self.constraint_builder.maybe_add_constraints_for_finished_submap(int(sid))
 
