@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-def plot_map_and_traj(gridmap, trajectory, out_path="outputs/final_map_traj_fr079.png", title=None):
+def plot_map_and_traj(gridmap, trajectory, out_path="outputs/final_map_traj.png", title=None):
     p = gridmap.prob()
     traj = np.array(trajectory)
 

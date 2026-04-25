@@ -22,7 +22,7 @@ class MatchResult:
 
     refine_delta: Optional[np.ndarray] = None
     inliers: Optional[int] = None
-    debug_info: Optional[dict[str, Any]] = None
+    debug: Optional[dict[str, Any]] = None
 
 
 @dataclass

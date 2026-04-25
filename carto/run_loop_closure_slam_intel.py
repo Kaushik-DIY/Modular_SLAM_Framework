@@ -3,17 +3,13 @@ from __future__ import annotations
 import os
 import numpy as np
 
-from slam_core.dataio.carmen import read_carmen_log
+from slam_core.dataio.intel_carmen import read_intel_carmen_log
 from slam_core.common.types import Pose2
 
 from carto.map_reconstruction_adapter import CartoMapReconstructionAdapter
 from slam_core.map_reconstruction import ReconstructionConfig
 
 from carto.config import (
-    ANGLE_MIN,
-    ANGLE_INC,
-    RANGE_MIN,
-    RANGE_MAX,
     BEAM_STRIDE,
     SUBMAP_SIZE_METERS,
     SUBMAP_RESOLUTION,
@@ -43,20 +39,17 @@ from slam_core.matching.scan_to_submap import (
     ScanToSubmapBackendConfig,
     SubmapSearchWindow,
 )
-from slam_core.matching.scan_to_map import ScanToMapMatcher
 
 from carto.adapter import (
     CartoLocalSlamAdapter,
     make_motion_filter_from_expected_velocity,
 )
 from carto.pose_graph.global_slam_2d import CartoGlobalSlam2D
-from carto.pose_graph.constraint_builder_2d import ConstraintBuilder2DConfig
 from slam_core.loop_closure import LoopClosureConfig
 from carto.loop_closure_adapter import CartoLoopClosureAdapter
 
 
 def _format_delta(delta) -> str:
-    """Format pose-refinement delta for concise logging."""
     if delta is None:
         return "d=None"
     arr = np.asarray(delta, dtype=float).reshape(-1)
@@ -66,16 +59,12 @@ def _format_delta(delta) -> str:
 
 
 def _format_inliers(inliers) -> str:
-    """Format inlier count for concise logging."""
     if inliers is None:
         return "inl=None"
     return f"inl={int(inliers)}"
 
 
 def _write_optimized_outputs(pose_graph, out_prefix: str) -> None:
-    """
-    Write optimized node and submap trajectories to text files.
-    """
     optimized = pose_graph.get_optimized_poses()
     if not optimized:
         print("No optimized poses available.")
@@ -119,9 +108,6 @@ def _build_run_summary_lines(
     last_t: float,
     last_pose: Pose2 | None,
 ) -> list[str]:
-    """
-    Build a compact text summary of the current run state.
-    """
     lines: list[str] = []
 
     lines.append(f"RUN_NOTE: {note}")
@@ -164,6 +150,7 @@ def _build_run_summary_lines(
                 f"rejected_sampled_out={diag.get('rejected_sampled_out', 0)} "
                 f"rejected_matcher_failed={diag.get('rejected_matcher_failed', 0)} "
                 f"rejected_score_failed={diag.get('rejected_score_failed', 0)} "
+                f"rejected_geometry_failed={diag.get('rejected_geometry_failed', 0)} "
                 f"rejected_duplicate={diag.get('rejected_duplicate', 0)}"
             )
 
@@ -208,9 +195,6 @@ def _save_run_summary(
     last_t: float,
     last_pose: Pose2 | None,
 ) -> None:
-    """
-    Save a compact human-readable run summary.
-    """
     lines = _build_run_summary_lines(
         pose_graph=pose_graph,
         global_slam=global_slam,
@@ -237,9 +221,6 @@ def _save_checkpoint(
     last_t: float,
     last_pose: Pose2 | None,
 ) -> None:
-    """
-    Save partial optimized outputs and a compact summary.
-    """
     checkpoint_prefix = f"{out_prefix}_{tag}"
 
     try:
@@ -269,35 +250,31 @@ def _save_checkpoint(
 
 
 def main():
-    clf_path = "datasets/fr079/fr079.clf"
-    scans = read_carmen_log(clf_path)
+    clf_path = "datasets/intel/intel.clf"
+    scans = read_intel_carmen_log(clf_path)
 
     print("Loaded scans:", len(scans))
 
-    # ------------------------------------------------------------------
-    # Experiment configuration
-    # ------------------------------------------------------------------
-    MATCHER_TYPE = "scan_to_submap"   # loop closure is active only in this mode
-    MAX_SCANS = None                 # Full run
+    MATCHER_TYPE = "scan_to_submap"
+    MAX_SCANS = 7000
     VERBOSE_EVERY = 10
 
-    # CORRECT DATA PATH
-    LOG_PATH = "datasets/fr079/fr079.clf"
-
-    # Long-run safety and checkpoint settings.
     CHECKPOINT_EVERY_NODES = 1000
     FLUSH_EVERY_STEPS = 25
 
-    print("runner:", "carto_loop_closure")
+    print("runner:", "carto_loop_closure_intel")
     print("matcher_type:", MATCHER_TYPE)
 
     if MAX_SCANS is not None:
         scans = scans[:int(MAX_SCANS)]
         print("Using scans:", len(scans))
 
-    # ------------------------------------------------------------------
-    # Shared point-cloud preprocessing
-    # ------------------------------------------------------------------
+    # Intel scan geometry
+    INTEL_ANGLE_MIN = -np.pi / 2.0
+    INTEL_ANGLE_INC = np.pi / 180.0
+    INTEL_RANGE_MIN = 0.001
+    INTEL_RANGE_MAX = 50.0
+
     point_processor = PointCloudProcessor(
         PointCloudProcessorConfig(
             fixed_voxel_size=0.05,
@@ -308,9 +285,6 @@ def main():
         )
     )
 
-    # ------------------------------------------------------------------
-    # Submap builder
-    # ------------------------------------------------------------------
     submaps = SubmapBuilder2D(
         submap_size_m=SUBMAP_SIZE_METERS,
         resolution=SUBMAP_RESOLUTION,
@@ -323,120 +297,77 @@ def main():
         l_max=L_MAX,
     )
 
-    # ------------------------------------------------------------------
-    # Matcher configuration
-    # ------------------------------------------------------------------
+    # Local matcher: reuse the working Intel local settings.
     local_submap_backend_config = ScanToSubmapBackendConfig(
         backend_type="two_stage_bruteforce",
-        # min_score: Cartographer's canonical threshold after the submap lifecycle
-        # fix — the matching submap always has >=N/2 scans at match time, so
-        # scores are reliably 0.60-0.90 in well-covered corridor geometry.
-        # 0.45 is a small safety margin below the expected 0.60+ range to avoid
-        # FALLBACK on slight geometry ambiguities, while rejecting true mismatches.
-        min_score=0.60,
+        min_score=0.70,
         min_valid=20,
         precomp_levels=3,
         do_refine=True,
-        max_match_points=80,
-        refine_w_trans=10.0,
-        refine_w_rot=40.0,        # High rotational rigidity like Cartographer
+        max_match_points=60,
+        max_refine_points=180,
+        refine_min_points=20,
+        refine_w_trans=4.0,
+        refine_w_rot=2.0,
+        refine_iters=8,
+        refine_damping=1e-3,
+        refine_eps_stop=1e-6,
+        refine_step_clip_xy=0.10,
+        refine_step_clip_th=np.deg2rad(5.0),
+        refine_verbose=False,
         coarse=SubmapSearchWindow(
-            xy_window=0.15,       # Tight search window
-            theta_window=np.deg2rad(5.0),
-            xy_step=0.03,
-            theta_step=0.01,
+            xy_window=0.5,
+            theta_window=0.18,
+            xy_step=0.15,
+            theta_step=0.05,
             level=2,
         ),
         fine=SubmapSearchWindow(
-            xy_window=0.05,
-            theta_window=np.deg2rad(1.0),
-            xy_step=0.01,
-            theta_step=0.005,
+            xy_window=0.25,
+            theta_window=0.12,
+            xy_step=0.05,
+            theta_step=0.02,
             level=0,
         ),
     )
 
-    # --- FIX: Loop Closure (Global Alignment) ---
-    loop_params = dict(
-        min_score=0.45,           # Found 390+ loops in R3 experiments
-        min_valid=20,
+    # Loop matcher: broader than local, but still bounded.
+    loop_constrained_window = SubmapSearchWindow(
+        xy_window=1.5,
+        theta_window=np.deg2rad(12.0),
+        xy_step=0.05,
+        theta_step=0.02,
+        level=0,
     )
 
     loop_submap_backend_config = ScanToSubmapBackendConfig(
         backend_type="branch_and_bound",
-        # Cartographer pose_graph.lua: min_score=0.55, global_min=0.60
-        # Updated to 0.45 based on Round 3 strict optimization sweep.
-        min_score=0.45,
-        global_localization_min_score=0.45,
+        min_score=0.70,
+        global_localization_min_score=0.70,
         min_valid=20,
-        # branch_and_bound_depth = 7 in Cartographer
         precomp_levels=7,
         do_refine=True,
         max_match_points=80,
         max_refine_points=180,
         refine_min_points=20,
-        # Cartographer ceres_scan_matcher: occupied_space_weight=20, rotation_weight=1
-        refine_w_trans=20.0,
-        refine_w_rot=1.0,
-        coarse=SubmapSearchWindow(
-            # Cartographer: linear_search_window=7.0m, angular=30deg
-            xy_window=7.0,
-            theta_window=0.5236,   # math.rad(30)
-            xy_step=0.05,
-            theta_step=0.02,
-            level=0,
-        ),
+        refine_w_trans=10.0,
+        refine_w_rot=40.0,
+        coarse=loop_constrained_window,
         fine=None,
-        bnb_depth_limit=7,         # Cartographer: branch_and_bound_depth=7
+        bnb_depth_limit=7,
         bnb_min_rotational_step=0.02,
         bnb_branching=4,
     )
 
-    corr_params_map = dict(
-        gn_iters_per_level=[15, 12, 10, 8],
-        gn_damping=1e-3,
-        min_points=20,
-        min_inliers_accept=25,
-        min_score=0.45,
-        step_clip_xy=0.02,
-        step_clip_th=np.deg2rad(0.7),
+    local_matcher = ScanToSubmapMatcher(
+        submap_builder=submaps,
+        backend_config=local_submap_backend_config,
     )
-
-    # ------------------------------------------------------------------
-    # Matcher selection
-    # ------------------------------------------------------------------
-    if MATCHER_TYPE == "scan_to_submap":
-        local_matcher = ScanToSubmapMatcher(
-            submap_builder=submaps,
-            backend_config=local_submap_backend_config,
-        )
-        loop_matcher = ScanToSubmapMatcher(
-            submap_builder=submaps,
-            backend_config=loop_submap_backend_config,
-        )
-        matcher = local_matcher
-
-    elif MATCHER_TYPE == "scan_to_map":
-        map_params = dict(
-            base_res=SUBMAP_RESOLUTION,
-            size_m=80.0,
-            num_levels=4,
-            l0=L0,
-            l_min=L_MIN,
-            l_max=L_MAX,
-            l_free=L_FREE,
-            l_occ=L_OCC,
-            ray_steps=RAY_STEPS,
-        )
-
-        matcher = ScanToMapMatcher(
-            map_params=map_params,
-            corr_params=corr_params_map,
-        )
-        loop_matcher = None
-
-    else:
-        raise ValueError(f"Unsupported MATCHER_TYPE: {MATCHER_TYPE}")
+    loop_matcher = ScanToSubmapMatcher(
+        submap_builder=submaps,
+        backend_config=loop_submap_backend_config,
+    )
+    matcher = local_matcher
 
     matcher_manager = MatcherManager(
         active_matcher=matcher,
@@ -444,34 +375,23 @@ def main():
         min_buffer_for_switch=20,
     )
 
-    # ------------------------------------------------------------------
-    # Extrapolator
-    # ------------------------------------------------------------------
     extrap = PoseExtrapolatorCV(
         max_dt=EXTRAP_MAX_DT,
         init_vxy=EXTRAP_INIT_VXY,
         init_wz=EXTRAP_INIT_WZ,
+        pose_queue_duration_s=1.5,
+        odom_queue_duration_s=1.5,
+        odom_trust=0.35,
     )
 
-    # ------------------------------------------------------------------
-    # Motion filter — Cartographer-faithful thresholds (motion_filter.lua):
-    #   max_distance = 0.1m,  max_angle = ~0.5°,  max_time = 5.0s
-    # Our previous values (0.20m, 15°, 0.5s) were 2-65x too large:
-    #   - 40-60% of scans were skipped for slow indoor motion
-    #   - Submaps had half as many points → lower match scores
-    # With these tighter thresholds, almost every scan reaches the submap.
-    TARGET_INSERT_PERIOD_S = 5.0           # Cartographer: max_time_seconds=5.0
-    V_EXPECTED_MPS = 0.02                  # → dist = 0.02×5 = 0.10m ≈ Carto 0.1m
-    W_EXPECTED_RPS = np.deg2rad(0.1)       # → angle = very small, floor at 0.5°
+    TARGET_INSERT_PERIOD_S = 0.5
+    V_EXPECTED_MPS = 0.40
+    W_EXPECTED_RPS = np.deg2rad(30.0)
 
     motion_params = make_motion_filter_from_expected_velocity(
         target_insert_period_s=TARGET_INSERT_PERIOD_S,
         v_expected_mps=V_EXPECTED_MPS,
         w_expected_rps=W_EXPECTED_RPS,
-        min_dist=0.05,
-        min_ang=np.deg2rad(0.3),   # floor ~0.005 rad, close to Cartographer 0.004
-        max_dist=0.15,             # cap at 0.15m (previously 0.50m)
-        max_ang=np.deg2rad(2.0),   # cap at 2° (previously 10°)
     )
 
     print(
@@ -481,17 +401,11 @@ def main():
         f"angle={np.rad2deg(motion_params.max_angle_radians):.2f}deg",
     )
 
-    # ------------------------------------------------------------------
-    # Pose graph backend — Cartographer canonical configuration
-    # ------------------------------------------------------------------
     backend = PyCeresBackend2D(
-        # Cartographer pose_graph.lua: optimization_problem.huber_scale = 1e1
         huber_scale=1e1,
-        # AUTO: selects SPARSE_NORMAL_CHOLESKY for large graphs, DENSE_QR for small
         linear_solver_type="SPARSE_NORMAL_CHOLESKY",
         num_threads=1,
         minimizer_progress_to_stdout=False,
-        # Cartographer pose_graph.lua: local_slam_pose_*_weight = 1e5
         local_slam_pose_translation_weight=1e5,
         local_slam_pose_rotation_weight=1e5,
     )
@@ -500,76 +414,61 @@ def main():
 
     pg = PoseGraph2D(
         backend=backend,
-        # Pass the live submap builder so optimized poses are written back after solve
         submap_builder=submaps,
-        # Cartographer pose_graph.lua: matcher_translation/rotation_weight
         intra_translation_weight=5e2,
         intra_rotation_weight=1.6e3,
     )
 
-    # ------------------------------------------------------------------
-    # Global SLAM / loop closure
-    # ------------------------------------------------------------------
-    global_slam = None
-    if MATCHER_TYPE == "scan_to_submap":
-        loop_config = LoopClosureConfig(
-            min_score=0.55,
-            translation_weight=1.1e4,
-            rotation_weight=1e5,
-            min_node_index_separation=90,
-            spatial_search_radius=15.0,
-            max_candidate_targets_per_new_node=3,  # new_node_max_targets=3
-            historical_node_stride=3,              # finished_submap_node_stride=3
-            recent_finished_submap_exclusion=3,
-        )
-        global_slam = CartoGlobalSlam2D(
-            loop_closure_adapter=CartoLoopClosureAdapter(
-                matcher=loop_matcher,
-                pose_graph=pg,
-                config=loop_config,
-            ),
-            pose_graph=pg,
-            # Cartographer: optimize_every_n_nodes = 90
-            optimize_every_n_nodes=90,
-            # Will be wired to `adapter` below after it is constructed
-            adapter=None,
-            correction_alpha=0.5,
-        )
+    loop_config = LoopClosureConfig(
+        min_score=float(loop_submap_backend_config.min_score),
+        global_localization_min_score=float(loop_submap_backend_config.global_localization_min_score),
+        translation_weight=3.0e3,
+        rotation_weight=2.0e4,
+        optimize_every_n_nodes=120,
+        min_node_index_separation=140,
+        spatial_search_radius=6.0,
+        max_candidate_targets_per_new_node=1,
+        historical_node_stride=5,
+        max_candidate_nodes_per_finished_target=0,
+        recent_finished_submap_exclusion=3,
+        finished_submap_verification_budget_per_tick=12,
+        force_full_submap_for_finished_submap_search=False,
+        finished_submap_full_search_failure_threshold=3,
+        max_loop_translation_residual_m=1.0,
+        max_loop_rotation_residual_rad=0.20944,
+    )
 
-    # ------------------------------------------------------------------
-    # SLAM adapter
-    # ------------------------------------------------------------------
+    global_slam = CartoGlobalSlam2D(
+        loop_closure_adapter=CartoLoopClosureAdapter(
+            matcher=loop_matcher,
+            pose_graph=pg,
+            config=loop_config,
+        ),
+        pose_graph=pg,
+        optimize_every_n_nodes=120,
+        adapter=None,
+        correction_alpha=0.5,
+    )
+
     adapter = CartoLocalSlamAdapter(
         matcher_manager=matcher_manager,
         extrapolator=extrap,
         pose_graph=pg,
         motion_params=motion_params,
-        solve_every_n_nodes=20,     # More frequent global solves
+        solve_every_n_nodes=30,
         global_slam=global_slam,
-        heading_calibration_rad=np.deg2rad(-7.43),  # Found during deep analysis
-        odom_trust=0.3,                            # Hector-style robust fusion
     )
+    global_slam.set_adapter(adapter)
 
-    # Wire the adapter reference into global_slam so that post-solve
-    # extrapolator corrections can be applied (Work Item 8 & 9).
-    if global_slam is not None:
-        global_slam.set_adapter(adapter)
-
-    # ------------------------------------------------------------------
-    # Initialize
-    # ------------------------------------------------------------------
     first = scans[0]
     adapter.initialize_extrapolator(
         float(first["t"]),
         Pose2(*first["odom"]),
     )
 
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
     os.makedirs("carto_outputs", exist_ok=True)
 
-    out_prefix = f"carto_outputs/trajectory_{MATCHER_TYPE}_loop_{len(scans)}"
+    out_prefix = f"carto_outputs/trajectory_scan_to_submap_loop_intel_{len(scans)}"
     traj_path = f"{out_prefix}.txt"
     meta_path = f"{out_prefix}_debug.txt"
 
@@ -580,7 +479,7 @@ def main():
 
     with open(traj_path, "w") as f_traj, open(meta_path, "w") as f_meta:
         try:
-            f_meta.write(f"# matcher_type={MATCHER_TYPE}\n")
+            f_meta.write("# matcher_type=scan_to_submap\n")
             f_meta.write("# loop_closure_enabled=1\n")
             f_meta.write(
                 "k t x y theta score inliers dx dy dtheta do_insert did_insert "
@@ -589,19 +488,16 @@ def main():
                 "nodes submaps\n"
             )
 
-            # ----------------------------------------------------------
-            # Main loop
-            # ----------------------------------------------------------
             for k, s in enumerate(scans):
                 t = float(s["t"])
                 odom = Pose2(*s["odom"])
 
                 pts_raw = ranges_to_points(
                     s["ranges"],
-                    ANGLE_MIN,
-                    ANGLE_INC,
-                    RANGE_MIN,
-                    RANGE_MAX,
+                    INTEL_ANGLE_MIN,
+                    INTEL_ANGLE_INC,
+                    INTEL_RANGE_MIN,
+                    INTEL_RANGE_MAX,
                     stride=BEAM_STRIDE,
                 )
                 pts, proc_debug = point_processor.process(pts_raw)
@@ -610,7 +506,7 @@ def main():
                     t=t,
                     scan_points_local=pts,
                     odom_pose_world=odom,
-                    odom_alpha=0.2,
+                    odom_alpha=0.0,
                 )
 
                 last_k = int(k)
@@ -637,17 +533,11 @@ def main():
                 n_constraints_intra = constraint_counts["intra"]
                 n_constraints_loop = constraint_counts["loop"]
 
-                if global_slam is not None:
-                    lc_stats = global_slam.get_stats()
-                    loop_candidates = lc_stats["candidate_pairs"]
-                    loop_accepted = lc_stats["accepted_pairs"]
-                    loop_rejected = lc_stats["rejected_pairs"]
-                    loop_duplicates = lc_stats["duplicate_pairs"]
-                else:
-                    loop_candidates = 0
-                    loop_accepted = 0
-                    loop_rejected = 0
-                    loop_duplicates = 0
+                lc_stats = global_slam.get_stats()
+                loop_candidates = lc_stats["candidate_pairs"]
+                loop_accepted = lc_stats["accepted_pairs"]
+                loop_rejected = lc_stats["rejected_pairs"]
+                loop_duplicates = lc_stats["duplicate_pairs"]
 
                 n_nodes = len(pg.backend.nodes)
                 n_submaps = len(pg.backend.submaps)
@@ -696,9 +586,16 @@ def main():
                     dmsg = _format_delta(delta)
                     imsg = _format_inliers(inliers)
 
+                    debug_obj = getattr(result, "debug", None)
+                    extra = getattr(debug_obj, "extra", {}) if debug_obj is not None else {}
+                    init_mode = "pred" if extra.get("used_pred_initializer", False) else "coarse"
+                    pyceres_reason = extra.get("pyceres_reason", "na")
+                    coarse_valid = extra.get("coarse_trusted", extra.get("coarse_valid", None))
+                    pyceres_summary = extra.get("pyceres_summary", None)
+
                     print(
                         "motion:",
-                        f"matcher={motion_debug.get('matcher_name', MATCHER_TYPE)}",
+                        f"matcher={motion_debug.get('matcher_name', 'scan_to_submap')}",
                         f"dtrans={motion_debug.get('dtrans', 0.0):.3f}",
                         f"drot_deg={motion_debug.get('drot_deg', 0.0):.3f}",
                         f"dtime={motion_debug.get('dtime', 0.0):.3f}",
@@ -715,8 +612,12 @@ def main():
 
                     print(
                         f"k={k} {mode} pose=({pose.x:.2f},{pose.y:.2f},{pose.theta:.2f}) "
-                        f"score={score:.3f} {dmsg} {imsg}"
+                        f"score={score:.3f} init={init_mode} coarse_valid={coarse_valid} "
+                        f"pyceres={pyceres_reason} {dmsg} {imsg}"
                     )
+
+                    if (not result.success) and (pyceres_summary is not None):
+                        print("pyceres_summary:", pyceres_summary)
 
                     print(
                         "constraints:",
@@ -736,17 +637,25 @@ def main():
                     print("nodes:", n_nodes)
                     print("submaps:", n_submaps)
 
-                    if global_slam is not None:
-                        recent_events = global_slam.get_recent_events(3)
-                        for ev in recent_events:
-                            score_msg = "NA" if not np.isfinite(ev.score) else f"{ev.score:.3f}"
-                            print(
-                                "loop_event:",
-                                f"node={ev.node_id}",
-                                f"target={ev.target_id}",
-                                f"score={score_msg}",
-                                f"accepted={ev.accepted}",
-                            )
+                    recent_events = global_slam.get_recent_events(3)
+                    for ev in recent_events:
+                        score_msg = "NA" if not np.isfinite(ev.score) else f"{ev.score:.3f}"
+
+                        trans_msg = getattr(ev, "translation_residual_m", None)
+                        rot_msg = getattr(ev, "rotation_residual_rad", None)
+
+                        print(
+                            "loop_event:",
+                            f"node={ev.node_id}",
+                            f"target={ev.target_id}",
+                            f"score={score_msg}",
+                            f"accepted={ev.accepted}",
+                            f"status={ev.status}",
+                            f"source={ev.source}",
+                            f"full_submap={getattr(ev, 'used_full_submap', False)}",
+                            f"trans_res={trans_msg if trans_msg is not None else 'NA'}",
+                            f"rot_res_deg={np.rad2deg(rot_msg) if rot_msg is not None else 'NA'}",
+                        )
 
         except KeyboardInterrupt:
             print("\nRun interrupted by user. Saving partial results...")
@@ -784,9 +693,6 @@ def main():
             f_traj.flush()
             f_meta.flush()
 
-    # ------------------------------------------------------------------
-    # Finalize and save final outputs
-    # ------------------------------------------------------------------
     adapter.finalize()
     _write_optimized_outputs(pg, out_prefix)
 
@@ -798,72 +704,87 @@ def main():
             except Exception:
                 print("CERES_SUMMARY:", summary)
 
-    if MATCHER_TYPE == "scan_to_submap":
-        reconstructor = CartoMapReconstructionAdapter(
-            matcher=matcher,
-            pose_graph=pg,
-            config=ReconstructionConfig(
-                global_resolution=SUBMAP_RESOLUTION,
-                informative_evidence_threshold=0.05,
-                evidence_clip_min=-10.0,
-                evidence_clip_max=10.0,
-                tile_cell_stride=1,
-                map_margin_m=1.0,
-            ),
-        )
-        reconstructor.save_before_after_plot(out_prefix)
+    reconstructor = CartoMapReconstructionAdapter(
+        matcher=matcher,
+        pose_graph=pg,
+        config=ReconstructionConfig(
+            global_resolution=SUBMAP_RESOLUTION,
+            informative_evidence_threshold=0.05,
+            evidence_clip_min=-10.0,
+            evidence_clip_max=10.0,
+            tile_cell_stride=1,
+            map_margin_m=1.0,
+        ),
+    )
+    reconstructor.save_before_after_plot(out_prefix)
 
-    if global_slam is not None:
-        final_stats = global_slam.get_stats()
-        final_counts = pg.get_constraint_counts()
+    final_stats = global_slam.get_stats()
+    final_counts = pg.get_constraint_counts()
 
+    print(
+        "FINAL_LOOP_SUMMARY:",
+        f"candidates={final_stats['candidate_pairs']}",
+        f"accepted={final_stats['accepted_pairs']}",
+        f"rejected={final_stats['rejected_pairs']}",
+        f"duplicates={final_stats['duplicate_pairs']}",
+        f"intra_constraints={final_counts['intra']}",
+        f"loop_constraints={final_counts['loop']}",
+        f"total_constraints={final_counts['total']}",
+    )
+
+    if hasattr(global_slam, "get_diagnostics_summary"):
+        diag = global_slam.get_diagnostics_summary()
         print(
-            "FINAL_LOOP_SUMMARY:",
-            f"candidates={final_stats['candidate_pairs']}",
-            f"accepted={final_stats['accepted_pairs']}",
-            f"rejected={final_stats['rejected_pairs']}",
-            f"duplicates={final_stats['duplicate_pairs']}",
-            f"intra_constraints={final_counts['intra']}",
-            f"loop_constraints={final_counts['loop']}",
-            f"total_constraints={final_counts['total']}",
+            "FINAL_LOOP_DIAGNOSTICS:",
+            f"accepted_from_new_node_search={diag.get('accepted_from_new_node_search', 0)}",
+            f"accepted_from_finished_submap_search={diag.get('accepted_from_finished_submap_search', 0)}",
+            f"rejected_sampled_out={diag.get('rejected_sampled_out', 0)}",
+            f"rejected_matcher_failed={diag.get('rejected_matcher_failed', 0)}",
+            f"rejected_score_failed={diag.get('rejected_score_failed', 0)}",
+            f"rejected_geometry_failed={diag.get('rejected_geometry_failed', 0)}",
+            f"rejected_duplicate={diag.get('rejected_duplicate', 0)}",
         )
 
-        if hasattr(global_slam, "get_diagnostics_summary"):
-            diag = global_slam.get_diagnostics_summary()
+        if diag.get("accepted_score_count", 0) > 0:
             print(
-                "FINAL_LOOP_DIAGNOSTICS:",
-                f"accepted_from_new_node_search={diag.get('accepted_from_new_node_search', 0)}",
-                f"accepted_from_finished_submap_search={diag.get('accepted_from_finished_submap_search', 0)}",
-                f"rejected_sampled_out={diag.get('rejected_sampled_out', 0)}",
-                f"rejected_matcher_failed={diag.get('rejected_matcher_failed', 0)}",
-                f"rejected_score_failed={diag.get('rejected_score_failed', 0)}",
-                f"rejected_duplicate={diag.get('rejected_duplicate', 0)}",
+                "FINAL_LOOP_ACCEPTED_SCORES:",
+                f"count={diag['accepted_score_count']}",
+                f"min={diag['accepted_score_min']:.3f}",
+                f"mean={diag['accepted_score_mean']:.3f}",
+                f"median={diag['accepted_score_median']:.3f}",
+                f"max={diag['accepted_score_max']:.3f}",
+                f"near_min_score_count={diag['accepted_near_min_score_count']}",
             )
 
-            if diag.get("accepted_score_count", 0) > 0:
-                print(
-                    "FINAL_LOOP_ACCEPTED_SCORES:",
-                    f"count={diag['accepted_score_count']}",
-                    f"min={diag['accepted_score_min']:.3f}",
-                    f"mean={diag['accepted_score_mean']:.3f}",
-                    f"median={diag['accepted_score_median']:.3f}",
-                    f"max={diag['accepted_score_max']:.3f}",
-                    f"near_min_score_count={diag['accepted_near_min_score_count']}",
-                )
+        if diag.get("score_failed_count", 0) > 0:
+            print(
+                "FINAL_LOOP_SCORE_FAILED:",
+                f"count={diag['score_failed_count']}",
+                f"min={diag['score_failed_min']:.3f}",
+                f"mean={diag['score_failed_mean']:.3f}",
+                f"median={diag['score_failed_median']:.3f}",
+                f"max={diag['score_failed_max']:.3f}",
+            )
 
-            if diag.get("score_failed_count", 0) > 0:
-                print(
-                    "FINAL_LOOP_SCORE_FAILED:",
-                    f"count={diag['score_failed_count']}",
-                    f"min={diag['score_failed_min']:.3f}",
-                    f"mean={diag['score_failed_mean']:.3f}",
-                    f"median={diag['score_failed_median']:.3f}",
-                    f"max={diag['score_failed_max']:.3f}",
-                )
-
+    _save_run_summary(
+        path=f"{out_prefix}_summary.txt",
+        pose_graph=pg,
+        global_slam=global_slam,
+        note="completed",
+        last_k=last_k,
+        last_t=last_t,
+        last_pose=last_pose,
+    )
 
     print("Wrote:", traj_path)
     print("Wrote:", meta_path)
+
+    print("first odom:", scans[0]["odom"])
+    print("first laser_pose:", scans[0].get("laser_pose", None))
+    print("last odom:", scans[-1]["odom"])
+    print("last laser_pose:", scans[-1].get("laser_pose", None))
+    print("duration_s:", scans[-1]["t"] - scans[0]["t"])
+    print("num_beams_first_scan:", len(scans[0]["ranges"]))
 
 
 if __name__ == "__main__":

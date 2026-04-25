@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -73,6 +74,18 @@ def motion_filter_decision(
 
 
 class CartoLocalSlamAdapter:
+    """
+    Cartographer-like local SLAM adapter.
+
+    Responsibilities
+    ----------------
+    - provide odometry samples to the extrapolator
+    - obtain the pose prediction from the extrapolator
+    - call the active local matcher with that prediction
+    - update the extrapolator with the matched local pose
+    - apply motion filtering and insertion policy
+    """
+
     def __init__(
         self,
         matcher_manager: MatcherManager,
@@ -81,6 +94,8 @@ class CartoLocalSlamAdapter:
         motion_params: Optional[MotionFilterParams] = None,
         solve_every_n_nodes: int = 30,
         global_slam: Optional[Any] = None,
+        heading_calibration_rad: float = 0.0,
+        odom_trust: float = 1.0,
     ):
         self.matcher_manager = matcher_manager
         self.extrap = extrapolator
@@ -89,6 +104,14 @@ class CartoLocalSlamAdapter:
 
         self.motion_params = motion_params
         self.solve_every_n_nodes = int(solve_every_n_nodes)
+
+        # Heading calibration is retained as a framework hook, but odometry
+        # trust now belongs to the extrapolator, not adapter-side blending.
+        self.heading_calibration_rad = float(heading_calibration_rad)
+        self.odom_trust = float(np.clip(odom_trust, 0.0, 1.0))
+
+        if hasattr(self.extrap, "odom_trust"):
+            self.extrap.odom_trust = float(self.odom_trust)
 
         self.last_insert_pose: Optional[Pose2] = None
         self.last_insert_time: Optional[float] = None
@@ -100,20 +123,27 @@ class CartoLocalSlamAdapter:
         self._last_motion_debug: Optional[dict] = None
 
     def initialize_extrapolator(self, t0: float, pose0: Pose2) -> None:
-        self.extrap.update(float(t0), pose0)
+        if hasattr(self.extrap, "add_pose"):
+            self.extrap.add_pose(float(t0), pose0)
+        else:
+            self.extrap.update(float(t0), pose0)
 
-    def _predict_world_pose(self, t: float, odom_pose_world: Optional[Pose2], odom_alpha: float) -> Pose2:
-        pred_world = self.extrap.predict(t)
+    def _predict_world_pose(
+        self,
+        t: float,
+        odom_pose_world: Optional[Pose2],
+        odom_alpha: float,
+    ) -> Pose2:
+        """
+        Feed odometry into the extrapolator and request the prediction.
 
-        if odom_pose_world is not None and odom_alpha > 0.0:
-            pred_world = Pose2(
-                x=(1.0 - odom_alpha) * pred_world.x + odom_alpha * odom_pose_world.x,
-                y=(1.0 - odom_alpha) * pred_world.y + odom_alpha * odom_pose_world.y,
-                theta=wrap_angle(
-                    pred_world.theta + odom_alpha * wrap_angle(odom_pose_world.theta - pred_world.theta)
-                ),
-            )
-        return pred_world
+        The adapter no longer blends odometry itself. The extrapolator owns
+        the full prior-generation path.
+        """
+        if odom_pose_world is not None and hasattr(self.extrap, "add_odometry"):
+            self.extrap.add_odometry(float(t), odom_pose_world)
+
+        return self.extrap.predict(float(t))
 
     def process_scan(
         self,
@@ -163,7 +193,11 @@ class CartoLocalSlamAdapter:
         if not np.all(np.isfinite([final_pose.x, final_pose.y, final_pose.theta])):
             raise ValueError(f"Non-finite final pose from matcher: {final_pose}")
 
-        self.extrap.update(t, final_pose)
+        # The extrapolator tracks the matched local pose sequence.
+        if hasattr(self.extrap, "add_pose"):
+            self.extrap.add_pose(t, final_pose)
+        else:
+            self.extrap.update(t, final_pose)
 
         did_insert = False
 
@@ -187,7 +221,11 @@ class CartoLocalSlamAdapter:
             self.last_insert_pose = final_pose
             self.last_insert_time = t
 
-            if matcher_name != "scan_to_map" and self.pose_graph is not None:
+            # Only add to the pose graph when the scan matcher found a valid match.
+            # FALLBACK poses must not become pose-graph nodes.
+            scan_matched = bool(result.success)
+
+            if matcher_name != "scan_to_map" and self.pose_graph is not None and scan_matched:
                 if hasattr(active_matcher, "get_last_inserted_submaps"):
                     insertion_submaps = active_matcher.get_last_inserted_submaps()
                 elif hasattr(active_matcher, "get_active_submaps"):
@@ -220,6 +258,15 @@ class CartoLocalSlamAdapter:
             score=float(result.score),
         )
 
+        extrap_mode = "pose_velocity"
+        if hasattr(self.extrap, "_estimate_velocity_from_queue"):
+            has_pose_vel = self.extrap._estimate_velocity_from_queue(self.extrap._pose_queue) is not None
+            has_odom_vel = self.extrap._estimate_velocity_from_queue(self.extrap._odom_queue) is not None
+            if has_pose_vel and has_odom_vel:
+                extrap_mode = "blended_velocity"
+            elif has_odom_vel:
+                extrap_mode = "odom_velocity"
+
         self._last_motion_debug = {
             "dtrans": float(dtrans),
             "drot_deg": float(np.rad2deg(drot)),
@@ -228,6 +275,7 @@ class CartoLocalSlamAdapter:
             "did_insert": bool(did_insert),
             "matcher_name": matcher_name,
             "motion_filter_insert": bool(motion_insert),
+            "extrap_mode": extrap_mode,
         }
 
         return final_pose, result, bool(do_insert), bool(did_insert)
@@ -237,6 +285,58 @@ class CartoLocalSlamAdapter:
             self.global_slam.finalize()
         elif self.pose_graph is not None and self.node_count > 0:
             self.pose_graph.solve()
+
+    def apply_optimization_correction(
+        self,
+        optimized: dict,
+        last_node_id: int,
+        correction_alpha: float = 0.5,
+    ) -> None:
+        """
+        Nudge the extrapolator toward the most recently optimized node pose.
+
+        This is a best-effort live correction after pose-graph optimization.
+        """
+        node_key = ("node", int(last_node_id))
+        if node_key not in optimized:
+            return
+
+        if self.last_insert_time is None:
+            return
+
+        opt_pose = optimized[node_key]
+
+        if not hasattr(self, "extrap") or self.extrap is None:
+            return
+
+        try:
+            curr_pose = self.extrap.predict(float(self.last_insert_time))
+        except Exception:
+            return
+
+        alpha = float(np.clip(correction_alpha, 0.0, 1.0))
+        dx = float(opt_pose.x) - float(curr_pose.x)
+        dy = float(opt_pose.y) - float(curr_pose.y)
+        dth = wrap_angle(float(opt_pose.theta) - float(curr_pose.theta))
+
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6 and abs(dth) < 1e-6:
+            return
+
+        corrected = Pose2(
+            x=float(curr_pose.x) + alpha * dx,
+            y=float(curr_pose.y) + alpha * dy,
+            theta=wrap_angle(float(curr_pose.theta) + alpha * dth),
+        )
+
+        try:
+            if hasattr(self.extrap, "correct_pose"):
+                self.extrap.correct_pose(float(self.last_insert_time), corrected)
+            elif hasattr(self.extrap, "add_pose"):
+                self.extrap.add_pose(float(self.last_insert_time), corrected)
+            else:
+                self.extrap.update(float(self.last_insert_time), corrected)
+        except Exception:
+            pass
 
     def last_motion_debug(self) -> Optional[dict]:
         return self._last_motion_debug

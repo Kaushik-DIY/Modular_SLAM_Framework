@@ -456,24 +456,47 @@ class SubmapBuilder2D:
             self.active.append(self._new_submap(pose_world))
 
     def _maybe_finish_oldest(self, pose_world: Pose2) -> None:
-        while self.active and self.active[0].num_inserted >= self.scans_per_submap:
-            finished = self.active.pop(0)
-            finished.finished = True
-            self.finished_submaps.append(finished)
-            self._newly_finished_ids.append(int(finished.id))
+        """Cartographer-faithful submap rotation (mirrors active_submaps_2d.cc).
+
+        Keep the finished submap in active[] as the matching target until
+        active[1] has accumulated N/2 scans. Only then rotate.
+        This ensures active[0] (the match target) is always >=N/2 scans full.
+        """
+        # Step 1: Mark oldest as finished when full, but keep it in active[].
+        if (self.active
+                and not self.active[0].finished
+                and self.active[0].num_inserted >= self.scans_per_submap):
+            self.active[0].finished = True
+            self.finished_submaps.append(self.active[0])
+            self._newly_finished_ids.append(int(self.active[0].id))
+
+        # Step 2: Rotate only when second submap is mature (>=N/2 scans).
+        if (len(self.active) >= 2
+                and self.active[0].finished
+                and self.active[1].num_inserted >= self.scans_per_submap // 2):
+            self.active.pop(0)
             self.active.append(self._new_submap(pose_world))
+            # Handle startup simultaneous-fill edge case.
+            if (self.active
+                    and not self.active[0].finished
+                    and self.active[0].num_inserted >= self.scans_per_submap):
+                self.active[0].finished = True
+                self.finished_submaps.append(self.active[0])
+                self._newly_finished_ids.append(int(self.active[0].id))
 
     def insert_scan(self, pose_world: Pose2, scan_points_local: np.ndarray) -> bool:
         if not self._initialized:
             self._ensure_two_active(pose_world)
             self._initialized = True
 
-        inserted_into = list(self.active)
-        self._last_inserted_submaps = list(inserted_into)
+        # Only insert into non-finished submaps (Cartographer CHECK(!finished_)).
+        insertable = [sm for sm in self.active if not sm.finished]
+        # Return ALL active submaps for pose-graph intra-submap constraint tracking.
+        self._last_inserted_submaps = list(self.active)
 
         endpoints_world = transform_points_pose(pose_world, scan_points_local)
 
-        for sm in inserted_into:
+        for sm in insertable:
             T_ws_inv = inverse_pose(sm.pose_world)
 
             origin_sub = transform_points_pose(
@@ -628,7 +651,7 @@ class ScanToSubmapMatcher(ScanMatcherBase):
 
         active = self.submap_builder.get_active_submaps()
         if len(active) == 0:
-            fallback_pose = odom_pose_world if odom_pose_world is not None else predicted_pose_world
+            fallback_pose = predicted_pose_world
             return MatchResult(
                 pose_world=fallback_pose,
                 score=-1.0,
@@ -636,10 +659,13 @@ class ScanToSubmapMatcher(ScanMatcherBase):
                 method=self.name,
                 refine_delta=None,
                 inliers=None,
-                debug_info={"reason": "no_active_submaps"},
+                debug={"reason": "no_active_submaps"},
             )
 
-        target = active[-1]
+        # Cartographer: match against the OLDEST (richest) active submap — same fix as
+        # slam_core/matching/scan_to_submap/matcher.py. Using active[-1] (newest) causes
+        # systematic FALLBACKs while the new submap is sparse (0-45 scans per submap cycle).
+        target = active[0]
 
         T_ws_inv = inverse_pose(target.pose_world)
         pred_sub = pose_compose(T_ws_inv, predicted_pose_world)
@@ -676,7 +702,7 @@ class ScanToSubmapMatcher(ScanMatcherBase):
 
         min_score = float(self.corr_params.get("min_score", 0.52))
         if best_score < min_score:
-            fallback_pose = odom_pose_world if odom_pose_world is not None else predicted_pose_world
+            fallback_pose = predicted_pose_world
             return MatchResult(
                 pose_world=fallback_pose,
                 score=float(best_score),
@@ -684,7 +710,7 @@ class ScanToSubmapMatcher(ScanMatcherBase):
                 method=self.name,
                 refine_delta=None,
                 inliers=None,
-                debug_info={"reason": "score_below_threshold"},
+                debug={"reason": "score_below_threshold"},
             )
 
         refined_sub = best_sub
@@ -730,7 +756,7 @@ class ScanToSubmapMatcher(ScanMatcherBase):
             method=self.name,
             refine_delta=self._last_refine_delta,
             inliers=self._last_refine_inliers,
-            debug_info={"target_submap_id": int(target.id)},
+            debug={"target_submap_id": int(target.id)},
         )
 
     # --------------------------------------------------------

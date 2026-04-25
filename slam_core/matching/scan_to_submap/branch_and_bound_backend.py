@@ -310,17 +310,57 @@ def _branch_and_bound(
 
     return best_candidate
 
+def _score_pose_on_probability_grid(
+    grid,
+    prob_grid: np.ndarray,
+    points_local: np.ndarray,
+    pose_sub: Pose2,
+) -> float:
+    """
+    Compute a simple occupied-space consistency score at a given submap pose.
+
+    The score is the mean occupancy probability of transformed scan endpoints
+    that fall inside the submap grid. This provides a continuous post-search
+    score that is more interpretable than a hard thresholded search result.
+    """
+    if points_local.size == 0:
+        return -1.0
+
+    ca = math.cos(pose_sub.theta)
+    sa = math.sin(pose_sub.theta)
+
+    vals = []
+    for px, py in np.asarray(points_local, dtype=float):
+        x = ca * float(px) - sa * float(py) + float(pose_sub.x)
+        y = sa * float(px) + ca * float(py) + float(pose_sub.y)
+
+        gx, gy = grid.world_to_grid(x, y)
+        if grid.in_bounds(gx, gy):
+            vals.append(float(prob_grid[gy, gx]))
+
+    if len(vals) == 0:
+        return -1.0
+
+    return float(np.mean(vals))
+
 
 class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
     """
     Cartographer-style branch-and-bound scan-to-submap backend.
 
     This backend mirrors the original fast correlative matcher structure:
-      1. precompute forward-looking max grids,
+      1. precompute forward-looking max grids (cached per finished submap),
       2. generate rotated discrete scans,
       3. score lowest-resolution candidates,
       4. recursively branch-and-bound,
       5. optionally refine the best candidate continuously.
+
+    Precomputation grid caching:
+    Cartographer's ConstraintBuilder2D internally maintains a per-submap
+    scan matcher cache to avoid rebuilding the PrecomputationGridStack for
+    every loop-closure candidate. We implement the same concept here at the
+    backend level. Only *finished* submaps are cached (active submaps change
+    with every inserted scan).
     """
 
     def __init__(self, config: ScanToSubmapBackendConfig, refine_solver) -> None:
@@ -328,25 +368,76 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
         self.refine_solver = refine_solver
 
         self.search_window = config.coarse or SubmapSearchWindow(
-            xy_window=0.8,
-            theta_window=0.3,
+            xy_window=7.0,
+            theta_window=0.5236,  # 30 degrees — Cartographer default
             xy_step=0.05,
             theta_step=0.02,
             level=0,
         )
 
+        # Per-finished-submap PrecomputationGridStack2D cache.
+        # Key: submap.id (int)   Value: PrecomputationGridStack2D
+        self._precomp_cache: dict = {}
+
+    def _get_precomp_stack(self, submap) -> PrecomputationGridStack2D:
+        """
+        Return a PrecomputationGridStack2D for the given submap.
+
+        For finished submaps (stable grids), the stack is built once and
+        cached. For active submaps (changing every scan), it is rebuilt fresh.
+        This mirrors Cartographer's per-submap FastCorrelativeScanMatcher cache.
+        """
+        sid = int(submap.id)
+        is_finished = getattr(submap, "finished", False)
+
+        if is_finished and sid in self._precomp_cache:
+            return self._precomp_cache[sid]
+
+        prob_grid = submap.grid.probability().astype(np.float32)
+        stack = PrecomputationGridStack2D(
+            prob_grid=prob_grid,
+            branch_and_bound_depth=int(self.config.bnb_depth_limit),
+        )
+
+        if is_finished:
+            self._precomp_cache[sid] = stack
+
+        return stack
+
+    def invalidate_cache(self, submap_id: int) -> None:
+        """Evict a submap from the precomputation cache (e.g., after trimming)."""
+        self._precomp_cache.pop(int(submap_id), None)
+
     def match(self, request: SubmapMatchRequest) -> SubmapMatchResponse:
+        """
+        Perform branch-and-bound scan-to-submap matching.
+
+        The backend computes the best available candidate pose and returns an
+        interpretable score. Acceptance is intentionally left to the caller.
+        """
         submap = request.submap
         submap_pose_world = request.submap_pose_world
 
-        pred_sub = pose_compose(
-            inverse_pose(submap_pose_world),
-            request.predicted_pose_world,
-        )
+        # Select the search mode.
+        if bool(request.match_full_submap):
+            # Full-submap search: centre at submap origin, ±half-size × ±π
+            pred_sub = Pose2(0.0, 0.0, 0.0)
+            linear_search_window = 0.5 * float(submap.grid.size_m)
+            angular_search_window = math.pi
+            acceptance_score = float(self.config.global_localization_min_score)
+        else:
+            pred_sub = pose_compose(
+                inverse_pose(submap_pose_world),
+                request.predicted_pose_world,
+            )
+            linear_search_window = float(self.search_window.xy_window)
+            angular_search_window = float(self.search_window.theta_window)
+            acceptance_score = float(self.config.min_score)
 
         points_local = np.asarray(request.scan_points_local, dtype=float)
         n_input = int(points_local.shape[0])
 
+        # Limit the number of points used in the coarse search stage.
         max_match_pts = int(self.config.max_match_points)
         points_match = points_local
         if points_match.shape[0] > max_match_pts:
@@ -355,10 +446,8 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
 
         prob_grid = submap.grid.probability().astype(np.float32)
 
-        precomp_stack = PrecomputationGridStack2D(
-            prob_grid=prob_grid,
-            branch_and_bound_depth=int(self.config.bnb_depth_limit),
-        )
+        # Use cached precomputation stack for finished submaps.
+        precomp_stack = self._get_precomp_stack(submap)
 
         search_params = _make_search_parameters(
             points_local=points_match,
@@ -366,8 +455,8 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
             grid_shape=prob_grid.shape,
             origin_xy=np.asarray(submap.grid.origin_world, dtype=float),
             predicted_pose_sub=pred_sub,
-            linear_search_window=float(self.search_window.xy_window),
-            angular_search_window=float(self.search_window.theta_window),
+            linear_search_window=linear_search_window,
+            angular_search_window=angular_search_window,
             min_rotational_step=float(self.config.bnb_min_rotational_step),
         )
 
@@ -389,6 +478,7 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
             search_params=search_params,
             max_depth=precomp_stack.max_depth(),
         )
+
         _score_candidates(
             precomp_grid=precomp_stack.get(precomp_stack.max_depth()),
             discrete_scans=discrete_scans,
@@ -411,16 +501,20 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
                 debug=debug,
             )
 
+        # Diagnostic mode:
+        # search for the best candidate without using the acceptance threshold
+        # as a hard internal rejection gate.
         best_candidate = _branch_and_bound(
             precomp_stack=precomp_stack,
             discrete_scans=discrete_scans,
             search_params=search_params,
             candidates=lowest_resolution_candidates,
             candidate_depth=precomp_stack.max_depth(),
-            min_score=float(self.config.min_score),
+            min_score=0.0,
         )
 
         coarse_score = float(best_candidate.score)
+
         coarse_pose_sub = Pose2(
             float(pred_sub.x + best_candidate.x_index_offset * submap.grid.res),
             float(pred_sub.y + best_candidate.y_index_offset * submap.grid.res),
@@ -429,9 +523,9 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
 
         refined = False
         final_pose_sub = coarse_pose_sub
-        final_score = coarse_score
 
-        if bool(self.config.do_refine) and coarse_score >= float(self.config.min_score):
+        # Refinement is initialized from the coarse search estimate.
+        if bool(self.config.do_refine) and coarse_score >= 0.0:
             refine_points = points_local
             max_refine_pts = int(self.config.max_refine_points)
             if refine_points.shape[0] > max_refine_pts:
@@ -441,7 +535,10 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
             problem = CartoRefinementProblem(
                 grid=submap.grid,
                 pts_local=refine_points,
-                pred_pose_sub=np.array([pred_sub.x, pred_sub.y, pred_sub.theta], dtype=float),
+                pred_pose_sub=np.array(
+                    [coarse_pose_sub.x, coarse_pose_sub.y, coarse_pose_sub.theta],
+                    dtype=float,
+                ),
                 min_points=int(self.config.refine_min_points),
                 w_trans=float(self.config.refine_w_trans),
                 w_rot=float(self.config.refine_w_rot),
@@ -454,8 +551,15 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
             )
             refined = True
 
+        # Compute a continuous post-search score at the final pose for diagnostics.
+        refined_score = _score_pose_on_probability_grid(
+            grid=submap.grid,
+            prob_grid=prob_grid,
+            points_local=points_local,
+            pose_sub=final_pose_sub,
+        )
+
         final_pose_world = pose_compose(submap_pose_world, final_pose_sub)
-        success = bool(final_score >= float(self.config.min_score))
 
         debug = SubmapMatchDebug(
             backend_type="branch_and_bound",
@@ -464,6 +568,10 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
             num_points_match=int(points_match.shape[0]),
             num_points_refine=min(n_input, int(self.config.max_refine_points)),
             extra={
+                "match_full_submap": bool(request.match_full_submap),
+                "acceptance_score": float(acceptance_score),
+                "coarse_score": float(coarse_score),
+                "refined_score": float(refined_score),
                 "num_rotations": int(search_params.num_scans),
                 "max_depth": int(precomp_stack.max_depth()),
                 "best_scan_index": int(best_candidate.scan_index),
@@ -475,9 +583,14 @@ class BranchAndBoundSubmapBackend(IScanToSubmapBackend):
             },
         )
 
+        # success=True now means that the backend produced a finite coarse
+        # fast-correlative score and candidate pose. Threshold acceptance is
+        # handled by the caller using the coarse score semantics.
+        success = bool(np.isfinite(coarse_score) and coarse_score >= 0.0)
+
         return SubmapMatchResponse(
             success=success,
-            score=float(final_score),
+            score=float(coarse_score),
             pose_world=final_pose_world,
             debug=debug,
         )

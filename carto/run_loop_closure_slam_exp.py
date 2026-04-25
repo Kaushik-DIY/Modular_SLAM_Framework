@@ -50,7 +50,6 @@ from carto.adapter import (
     make_motion_filter_from_expected_velocity,
 )
 from carto.pose_graph.global_slam_2d import CartoGlobalSlam2D
-from carto.pose_graph.constraint_builder_2d import ConstraintBuilder2DConfig
 from slam_core.loop_closure import LoopClosureConfig
 from carto.loop_closure_adapter import CartoLoopClosureAdapter
 
@@ -278,11 +277,8 @@ def main():
     # Experiment configuration
     # ------------------------------------------------------------------
     MATCHER_TYPE = "scan_to_submap"   # loop closure is active only in this mode
-    MAX_SCANS = None                 # Full run
+    MAX_SCANS = 700                  # distinct save length
     VERBOSE_EVERY = 10
-
-    # CORRECT DATA PATH
-    LOG_PATH = "datasets/fr079/fr079.clf"
 
     # Long-run safety and checkpoint settings.
     CHECKPOINT_EVERY_NODES = 1000
@@ -333,41 +329,50 @@ def main():
         # scores are reliably 0.60-0.90 in well-covered corridor geometry.
         # 0.45 is a small safety margin below the expected 0.60+ range to avoid
         # FALLBACK on slight geometry ambiguities, while rejecting true mismatches.
-        min_score=0.60,
+        min_score=0.55,
         min_valid=20,
         precomp_levels=3,
         do_refine=True,
         max_match_points=80,
-        refine_w_trans=10.0,
-        refine_w_rot=40.0,        # High rotational rigidity like Cartographer
+        max_refine_points=200,
+        refine_min_points=20,
+        refine_w_trans=10.0,     # Cartographer ceres: translation_weight=10.0
+        refine_w_rot=40.0,       # Cartographer ceres: rotation_weight=40.0
         coarse=SubmapSearchWindow(
-            xy_window=0.15,       # Tight search window
-            theta_window=np.deg2rad(5.0),
-            xy_step=0.03,
-            theta_step=0.01,
+            # Search window narrowed from 2.5m to 0.8m now that the extrapolator
+            # is pure finite-difference (alpha=0.0) — no more 10-scan velocity lag.
+            # 0.8m covers ±4 scan periods of motion at 0.4m/s, which is generous.
+            xy_window=0.2,
+            theta_window=np.deg2rad(5.0),     # ~23 degrees
+            xy_step=0.05,
+            theta_step=0.03,
             level=2,
         ),
         fine=SubmapSearchWindow(
-            xy_window=0.05,
-            theta_window=np.deg2rad(1.0),
-            xy_step=0.01,
-            theta_step=0.005,
+            xy_window=0.2,
+            theta_window=np.deg2rad(5.0),
+            xy_step=0.02,
+            theta_step=0.01,
             level=0,
         ),
     )
 
-    # --- FIX: Loop Closure (Global Alignment) ---
-    loop_params = dict(
-        min_score=0.45,           # Found 390+ loops in R3 experiments
-        min_valid=20,
+    loop_constrained_window = SubmapSearchWindow(
+        # Runner-owned constrained loop-search window. Start from the
+        # Cartographer paper/reference example (7m / 30deg) and tune here
+        # per dataset instead of hardcoding inside matcher logic.
+        xy_window=7.0,
+        theta_window=np.deg2rad(30.0),
+        xy_step=0.05,
+        theta_step=0.02,
+        level=0,
     )
 
     loop_submap_backend_config = ScanToSubmapBackendConfig(
         backend_type="branch_and_bound",
         # Cartographer pose_graph.lua: min_score=0.55, global_min=0.60
-        # Updated to 0.45 based on Round 3 strict optimization sweep.
-        min_score=0.45,
-        global_localization_min_score=0.45,
+        min_score=0.55,
+        global_localization_min_score=0.60,
         min_valid=20,
         # branch_and_bound_depth = 7 in Cartographer
         precomp_levels=7,
@@ -375,17 +380,10 @@ def main():
         max_match_points=80,
         max_refine_points=180,
         refine_min_points=20,
-        # Cartographer ceres_scan_matcher: occupied_space_weight=20, rotation_weight=1
-        refine_w_trans=20.0,
-        refine_w_rot=1.0,
-        coarse=SubmapSearchWindow(
-            # Cartographer: linear_search_window=7.0m, angular=30deg
-            xy_window=7.0,
-            theta_window=0.5236,   # math.rad(30)
-            xy_step=0.05,
-            theta_step=0.02,
-            level=0,
-        ),
+        # Cartographer ceres_scan_matcher defaults
+        refine_w_trans=10.0,
+        refine_w_rot=40.0,
+        coarse=loop_constrained_window,
         fine=None,
         bnb_depth_limit=7,         # Cartographer: branch_and_bound_depth=7
         bnb_min_rotational_step=0.02,
@@ -488,7 +486,7 @@ def main():
         # Cartographer pose_graph.lua: optimization_problem.huber_scale = 1e1
         huber_scale=1e1,
         # AUTO: selects SPARSE_NORMAL_CHOLESKY for large graphs, DENSE_QR for small
-        linear_solver_type="SPARSE_NORMAL_CHOLESKY",
+        linear_solver_type="AUTO",
         num_threads=1,
         minimizer_progress_to_stdout=False,
         # Cartographer pose_graph.lua: local_slam_pose_*_weight = 1e5
@@ -513,14 +511,20 @@ def main():
     global_slam = None
     if MATCHER_TYPE == "scan_to_submap":
         loop_config = LoopClosureConfig(
-            min_score=0.55,
+            min_score=float(loop_submap_backend_config.min_score),
+            global_localization_min_score=float(loop_submap_backend_config.global_localization_min_score),
             translation_weight=1.1e4,
             rotation_weight=1e5,
+            optimize_every_n_nodes=90,
             min_node_index_separation=90,
             spatial_search_radius=15.0,
             max_candidate_targets_per_new_node=3,  # new_node_max_targets=3
             historical_node_stride=3,              # finished_submap_node_stride=3
+            max_candidate_nodes_per_finished_target=0,
             recent_finished_submap_exclusion=3,
+            finished_submap_verification_budget_per_tick=24,
+            force_full_submap_for_finished_submap_search=False,
+            finished_submap_full_search_failure_threshold=3,
         )
         global_slam = CartoGlobalSlam2D(
             loop_closure_adapter=CartoLoopClosureAdapter(
@@ -544,10 +548,8 @@ def main():
         extrapolator=extrap,
         pose_graph=pg,
         motion_params=motion_params,
-        solve_every_n_nodes=20,     # More frequent global solves
+        solve_every_n_nodes=30,
         global_slam=global_slam,
-        heading_calibration_rad=np.deg2rad(-7.43),  # Found during deep analysis
-        odom_trust=0.3,                            # Hector-style robust fusion
     )
 
     # Wire the adapter reference into global_slam so that post-solve
@@ -746,6 +748,9 @@ def main():
                                 f"target={ev.target_id}",
                                 f"score={score_msg}",
                                 f"accepted={ev.accepted}",
+                                f"status={getattr(ev, 'status', 'unknown')}",
+                                f"source={getattr(ev, 'source', 'unknown')}",
+                                f"full_submap={getattr(ev, 'used_full_submap', False)}",
                             )
 
         except KeyboardInterrupt:
@@ -861,6 +866,16 @@ def main():
                     f"max={diag['score_failed_max']:.3f}",
                 )
 
+
+    _save_run_summary(
+        path=f"{out_prefix}_summary.txt",
+        pose_graph=pg,
+        global_slam=global_slam,
+        note="completed",
+        last_k=last_k,
+        last_t=last_t,
+        last_pose=last_pose,
+    )
 
     print("Wrote:", traj_path)
     print("Wrote:", meta_path)

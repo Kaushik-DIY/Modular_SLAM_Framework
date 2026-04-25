@@ -10,7 +10,6 @@ from slam_core.matching.scan_to_submap.types import (
     ScanToSubmapBackendConfig,
     SubmapMatchRequest,
     SubmapMatchResponse,
-    response_to_match_result,
 )
 from slam_core.matching.scan_to_submap.backend_base import IScanToSubmapBackend
 from slam_core.matching.scan_to_submap.submaps import SubmapBuilder2D
@@ -30,6 +29,9 @@ class ScanToSubmapMatcher:
         self.submap_builder = submap_builder
         self.backend_config = backend_config
 
+        # Retained for compatibility with backends that still use the legacy
+        # refinement path. The active local path is now PyCeres-backed inside
+        # TwoStageBruteForceSubmapBackend.
         self.refine_solver = refine_solver or GaussNewtonLM(
             GNLMConfig(
                 iters=int(self.backend_config.refine_iters),
@@ -56,15 +58,37 @@ class ScanToSubmapMatcher:
                 config=self.backend_config,
                 refine_solver=self.refine_solver,
             )
+
         if self.backend_config.backend_type == "branch_and_bound":
             return BranchAndBoundSubmapBackend(
                 config=self.backend_config,
                 refine_solver=self.refine_solver,
             )
+
         raise ValueError(f"Unsupported backend type: {self.backend_config.backend_type}")
 
     def match_against_submap(self, request: SubmapMatchRequest) -> SubmapMatchResponse:
         return self.backend.match(request)
+
+    def _response_to_match_result(self, response: SubmapMatchResponse) -> MatchResult:
+        """
+        Convert backend response into the framework-level MatchResult while
+        preserving backend diagnostics for runner-level introspection.
+        """
+        extra = response.debug.extra if response.debug is not None else {}
+
+        refine_delta = extra.get("refine_delta", None)
+        refine_inliers = extra.get("refine_inliers", None)
+
+        return MatchResult(
+            method="scan_to_submap",
+            success=bool(response.success),
+            pose_world=response.pose_world,
+            score=float(response.score),
+            refine_delta=refine_delta,
+            inliers=refine_inliers,
+            debug=response.debug,
+        )
 
     def match(
         self,
@@ -82,9 +106,14 @@ class ScanToSubmapMatcher:
                 score=-1.0,
                 refine_delta=None,
                 inliers=None,
+                debug=None,
             )
 
-        target_submap = active_submaps[-1]
+        # Cartographer convention:
+        # match against the OLDEST active submap, not the newest one.
+        # The oldest active submap is richer because it has accumulated more
+        # scans and therefore provides the more reliable matching target.
+        target_submap = active_submaps[0]
 
         request = SubmapMatchRequest(
             scan_points_local=np.asarray(scan_points_local, dtype=float),
@@ -94,8 +123,9 @@ class ScanToSubmapMatcher:
             timestamp=float(t),
             odom_pose_world=odom_pose_world,
         )
+
         response = self.match_against_submap(request)
-        return response_to_match_result(response)
+        return self._response_to_match_result(response)
 
     def update_submaps(
         self,

@@ -307,6 +307,17 @@ def align_pose_gauss_newton(
 class ScanToMapMatcher(ScanMatcherBase):
     """
     Hector-style scan-to-map matcher with multi-resolution map pyramid.
+
+    Bootstrap mode
+    --------------
+    The standard single-scan bootstrap creates a nearly empty map whose gradient
+    field is too weak for GN to converge to meaningful poses.  The first N
+    accepted scans are therefore integrated at their dead-reckoned positions
+    (no GN) to build a map with sufficient evidence density before the first
+    real scan-to-map alignment attempt.
+
+    Set ``map_params["bootstrap_scans"]`` (default 1, i.e. original behaviour)
+    to a value >= 2 to enable multi-scan seeding.
     """
 
     def __init__(self, map_params: dict, corr_params: dict):
@@ -314,6 +325,11 @@ class ScanToMapMatcher(ScanMatcherBase):
 
         self.map_params = dict(map_params)
         self.corr_params = dict(corr_params)
+
+        # Number of scans to integrate before the first GN match attempt.
+        # bootstrap_scans=1 reproduces the original single-scan behaviour.
+        self._bootstrap_scans: int = max(1, int(self.map_params.get("bootstrap_scans", 1)))
+        self._bootstrap_count: int = 0
 
         self.pyr = MapPyramid.create(
             base_res=float(self.map_params["base_res"]),
@@ -345,6 +361,11 @@ class ScanToMapMatcher(ScanMatcherBase):
             l_min=float(self.map_params["l_min"]),
             l_max=float(self.map_params["l_max"]),
         )
+
+        # Reset bootstrap counter on re-initialization from rolling buffer.
+        # The buffer already contains well-matched scans so we can skip the
+        # bootstrap phase and go straight to GN matching.
+        self._bootstrap_count = self._bootstrap_scans
 
         self.initialized = False
         self._last_score = None
@@ -399,8 +420,46 @@ class ScanToMapMatcher(ScanMatcherBase):
         self._last_delta = None
         self._last_debug_info = None
 
+        # --------------------------------------------------------
+        # Bootstrap phase: integrate scans at dead-reckoned poses
+        # until we have enough map evidence for GN to be reliable.
+        # During bootstrap we return success=False so the adapter
+        # does NOT update the extrapolator from a zero-gradient pose.
+        # --------------------------------------------------------
+        if self._bootstrap_count < self._bootstrap_scans:
+            pose_arr = pose_pred.copy()
+            pts_world = _transform_points(pose_arr, scan_points_local)
+            for grid in self.pyr.levels:
+                grid.integrate_scan_simple(
+                    pose=pose_arr,
+                    pts_world=pts_world,
+                    l_free=self.l_free,
+                    l_occ=self.l_occ,
+                    ray_steps=self.ray_steps,
+                )
+            self.pose = pose_arr.copy()
+            self.initialized = True
+            self._is_initialized = True
+            self._bootstrap_count += 1
+
+            self._last_score = -1.0
+            self._last_inliers = 0
+            self._last_delta = np.zeros(3, dtype=float)
+            self._last_debug_info = {
+                "reason": "bootstrap_seeding",
+                "bootstrap_count": self._bootstrap_count,
+                "bootstrap_scans": self._bootstrap_scans,
+            }
+            return MatchResult(
+                pose_world=predicted_pose_world,
+                score=-1.0,
+                success=False,
+                method=self.name,
+                debug=self._last_debug_info,
+            )
+
         if not self.initialized:
-            fallback_pose = odom_pose_world if odom_pose_world is not None else predicted_pose_world
+            fallback_pose = predicted_pose_world
             self._last_score = -1.0
             self._last_inliers = 0
             self._last_delta = np.zeros(3, dtype=float)
@@ -410,7 +469,7 @@ class ScanToMapMatcher(ScanMatcherBase):
                 score=-1.0,
                 success=False,
                 method=self.name,
-                debug_info=self._last_debug_info,
+                debug=self._last_debug_info,
             )
 
         # ----------------------------------------------------
@@ -482,7 +541,18 @@ class ScanToMapMatcher(ScanMatcherBase):
         self._last_inliers = inliers
         self._last_delta = delta.copy()
 
-        success = (inliers >= min_inliers_accept) and (score >= min_score)
+        trans_jump = float(np.hypot(delta[0], delta[1]))
+        rot_jump = float(abs(wrap_angle(delta[2])))
+
+        max_translation_jump = float(self.corr_params.get("max_translation_jump", 0.25))
+        max_rotation_jump = float(self.corr_params.get("max_rotation_jump", np.deg2rad(12.0)))
+
+        success = (
+            (inliers >= min_inliers_accept)
+            and (score >= min_score)
+            and (trans_jump <= max_translation_jump)
+            and (rot_jump <= max_rotation_jump)
+        )
 
         self._last_debug_info = {
             "reason": "hector_scan_to_map" if success else "scan_to_map_rejected",
@@ -492,10 +562,14 @@ class ScanToMapMatcher(ScanMatcherBase):
             "score": float(score),
             "min_score": float(min_score),
             "min_inliers_accept": int(min_inliers_accept),
+            "trans_jump": float(trans_jump),
+            "rot_jump_deg": float(np.rad2deg(rot_jump)),
+            "max_translation_jump": float(max_translation_jump),
+            "max_rotation_jump_deg": float(np.rad2deg(max_rotation_jump)),
         }
 
         if not success:
-            fallback_pose = odom_pose_world if odom_pose_world is not None else predicted_pose_world
+            fallback_pose = predicted_pose_world
             return MatchResult(
                 pose_world=fallback_pose,
                 score=float(score),
@@ -503,7 +577,7 @@ class ScanToMapMatcher(ScanMatcherBase):
                 method=self.name,
                 refine_delta=delta.copy(),
                 inliers=int(inliers),
-                debug_info=self._last_debug_info,
+                debug=self._last_debug_info,
             )
 
         return MatchResult(
@@ -513,7 +587,7 @@ class ScanToMapMatcher(ScanMatcherBase):
             method=self.name,
             refine_delta=delta.copy(),
             inliers=int(inliers),
-            debug_info=self._last_debug_info,
+            debug=self._last_debug_info,
         )
 
     def update_target(
@@ -542,6 +616,7 @@ class ScanToMapMatcher(ScanMatcherBase):
         self.pyr.clear()
         self.initialized = False
         self._is_initialized = False
+        self._bootstrap_count = 0
         self._last_score = None
         self._last_inliers = None
         self._last_delta = None

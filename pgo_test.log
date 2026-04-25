@@ -1,0 +1,31 @@
+[pgo_lab] Trajectory: hector_outputs/trajectory_lab_run_2_raw_scan_to_submap_1052.txt
+[pgo_lab] Loaded 1002 accepted poses
+[pgo_lab] Loading scans ...
+[pgo_lab] Scans loaded: 1002, mean pts/scan = 204
+[pgo_lab] Loop closure search: 1002 poses, stride=15, radius=1.5m, min_gap=80
+[pgo_lab]   LC accepted: (9,90)  score=0.921  dxy=0.043m  dth=-0.2°
+[pgo_lab]   LC accepted: (8,90)  score=0.918  dxy=0.048m  dth=-0.2°
+[pgo_lab]   LC accepted: (7,90)  score=0.923  dxy=0.046m  dth=-0.1°
+[pgo_lab]   LC accepted: (24,105)  score=0.967  dxy=0.109m  dth=-0.0°
+[pgo_lab]   LC accepted: (23,105)  score=0.974  dxy=0.105m  dth=-0.2°
+[pgo_lab]   LC accepted: (22,105)  score=0.959  dxy=0.098m  dth=-0.2°
+[pgo_lab]   LC accepted: (37,120)  score=0.866  dxy=0.141m  dth=-0.1°
+[pgo_lab]   LC accepted: (39,120)  score=0.886  dxy=0.137m  dth=-0.1°
+[pgo_lab]   LC accepted: (38,120)  score=0.879  dxy=0.136m  dth=-0.2°
+[pgo_lab]   LC accepted: (1,135)  score=0.735  dxy=0.427m  dth=-2.5°
+[pgo_lab]   LC accepted: (2,135)  score=0.736  dxy=0.431m  dth=-2.4°
+[pgo_lab]   LC accepted: (3,135)  score=0.760  dxy=0.443m  dth=-2.5°
+[pgo_lab] Loop closures found: 12
+[pgo_lab] Optimising 1002 nodes, 1001 seq edges, 12 LC edges
+[pgo_lab] GN/LM: iters=30  damping=1.0e-06
+[pgo_lab]   iter   0: cost=375460.3770  |dx|=7.9586e+00
+[pgo_lab]   iter   5: cost=71.3319  |dx|=3.1258e-09
+[pgo_lab]   Converged at iter 5
+[pgo_lab] PGO pose correction: max=0.2789m  mean=0.2435m  std=0.0623m
+[pgo_lab] PGO trajectory saved: hector_outputs/trajectory_lab_run_2_raw_scan_to_submap_1052_pgo.txt
+[pgo_lab] Rebuilding map from PGO poses ...
+[pgo_lab] PGO map .npy saved: hector_outputs/map_trajectory_lab_run_2_raw_scan_to_submap_1052_pgo.npy
+[pgo_lab] Rebuilding before-PGO map for comparison ...
+[pgo_lab] Map PNG saved: hector_outputs/map_trajectory_lab_run_2_raw_scan_to_submap_1052_pgo.png
+[pgo_lab] PGO map stats: 4959 occupied, 30325 free, 604716 unknown  (0.05m res, 800x800)
+[pgo_lab] Done! PGO corrected 12 loop(s).

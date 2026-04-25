@@ -1,19 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Protocol
 import math
+
 import numpy as np
+
 from slam_core.common.se2 import pose_compose, pose_inverse
 from slam_core.common.types import Pose2
-# =============================================================================
-# Basic SE(2) pose utilities
-# =============================================================================
-# The loop-closure layer must remain self-contained and independent of any
-# specific SLAM backend implementation. For this reason, a lightweight SE(2)
-# pose container and a small set of helper functions are defined here.
-# If your project already exposes an equivalent SE(2) type in
-# slam_core.common.se2, this local dataclass can later be replaced cleanly.
 
 
 def pose_relative(from_pose: Pose2, to_pose: Pose2) -> Pose2:
@@ -22,50 +16,19 @@ def pose_relative(from_pose: Pose2, to_pose: Pose2) -> Pose2:
 
     The returned pose corresponds to:
         T_rel = T_from^{-1} * T_to
-
-    This is the standard Cartographer-style relation used for node-to-submap
-    loop-closure constraint construction.
     """
     return pose_compose(pose_inverse(from_pose), to_pose)
 
 
 def pose_translation_distance(a: Pose2, b: Pose2) -> float:
-    """
-    Euclidean distance between the translation parts of two planar poses.
-    """
+    """Euclidean distance between the translation parts of two planar poses."""
     return math.hypot(a.x - b.x, a.y - b.y)
-
-# =============================================================================
-# Loop-closure data structures
-# =============================================================================
 
 
 @dataclass
 class LoopNode:
-    """
-    Persistent node record used by the loop-closure layer.
+    """Persistent node record used by the loop-closure layer."""
 
-    A node corresponds to one accepted scan insertion event. The loop-closure
-    module stores the minimal information required for later geometric
-    verification against historical targets.
-
-    Attributes
-    ----------
-    node_id:
-        Unique node identifier in the current SLAM run.
-    scan_points:
-        2D scan points expressed in the node's local sensor / tracking frame.
-        Shape is expected to be (N, 2).
-    pose_guess_global:
-        Current estimated global pose of the node before loop-closure
-        verification.
-    timestamp:
-        Acquisition time of the node. This is useful for temporal gating.
-    local_target_ids:
-        IDs of targets into which the node was already inserted locally.
-        For Cartographer-style submap SLAM, this is typically the pair of
-        active submaps. These targets are excluded from loop-closure search.
-    """
     node_id: int
     scan_points: np.ndarray
     pose_guess_global: Pose2
@@ -78,92 +41,51 @@ class ClosureTarget:
     """
     Generic loop-closure target.
 
-    This abstraction is intentionally neutral. In Cartographer-style SLAM,
-    the target is a finished submap. In scan-to-map style SLAM, the target can
-    later be defined as a global map anchor or frozen map snapshot.
-
-    Attributes
-    ----------
-    target_id:
-        Unique target identifier.
-    target_type:
-        Semantic type of the target, e.g. "submap" or "global_map".
-    pose_global:
-        Global pose of the target frame.
-    is_finished:
-        Whether the target is eligible for loop closure.
-    is_fixed:
-        Whether the target pose is fixed in optimization.
-    map_view:
-        Opaque handle to the data structure required by the matcher.
-        This may be a submap grid, map query object, or other backend-specific
-        representation.
+    `match_full_submap` drives the verifier's search mode:
+      False -> constrained matching around the predicted pose
+      True  -> broad full-submap matching
     """
+
     target_id: str
     target_type: str
     pose_global: Pose2
     is_finished: bool
     is_fixed: bool
     map_view: Any
+    match_full_submap: bool = False
+    search_source: Optional[str] = None
 
 
 @dataclass
 class LoopMatchResult:
-    """
-    Result of geometric verification for one node-target pair.
+    """Result of geometric verification for one node-target pair."""
 
-    Attributes
-    ----------
-    success:
-        Whether the candidate passed the geometric verification stage.
-    score:
-        Matching quality score returned by the verifier.
-    matched_node_pose_global:
-        Refined node pose in the global frame after successful verification.
-    """
     success: bool
     score: float
     matched_node_pose_global: Optional[Pose2]
+    status: str = "matcher_failed"
+    used_full_submap: bool = False
+    translation_residual_m: Optional[float] = None
+    rotation_residual_rad: Optional[float] = None
 
 
 @dataclass
 class LoopConstraint:
     """
-    Generic loop-closure constraint.
-
-    The constraint is stored in target-relative form:
+    Generic loop-closure constraint stored in target-relative form:
         z_tj = T_t^{-1} * T_j
-
-    This exactly matches the Cartographer-style node-to-submap formulation.
-
-    Attributes
-    ----------
-    node_id:
-        Identifier of the constrained node.
-    target_id:
-        Identifier of the matched target.
-    target_type:
-        Semantic type of the matched target.
-    relative_pose:
-        Measured target-to-node relative pose.
-    translation_weight:
-        Weight assigned to translational residual components.
-    rotation_weight:
-        Weight assigned to rotational residual components.
-    constraint_kind:
-        Constraint label. "loop" is used here to distinguish these edges from
-        local insertion constraints.
-    is_fixed_target:
-        Indicates whether the target pose is fixed in the backend graph.
     """
+
     node_id: int
     target_id: str
     target_type: str
     relative_pose: Pose2
     translation_weight: float
     rotation_weight: float
+    match_score: float = 1.0
     constraint_kind: str = "loop"
     is_fixed_target: bool = False
+
 
 @dataclass
 class LoopClosureEvent:
@@ -171,6 +93,9 @@ class LoopClosureEvent:
     target_id: str
     score: float
     accepted: bool
+    status: str
+    source: str
+    used_full_submap: bool
 
 
 @dataclass
@@ -180,12 +105,13 @@ class LoopClosureStats:
     rejected_pairs: int = 0
     duplicate_pairs: int = 0
 
+
 @dataclass
 class LoopClosureConfig:
-    """
-    Configuration parameters governing loop-closure scheduling and gating.
-    """
+    """Configuration parameters governing loop-closure scheduling and gating."""
+
     min_score: float = 0.62
+    global_localization_min_score: float = 0.72
     translation_weight: float = 25.0
     rotation_weight: float = 200.0
     optimize_every_n_nodes: int = 30
@@ -196,21 +122,16 @@ class LoopClosureConfig:
     max_accepted_targets_per_new_node: int = 1
     recent_finished_submap_exclusion: int = 2
     historical_node_stride: int = 3
-
-
-# =============================================================================
-# Abstract provider / verifier / sink protocols
-# =============================================================================
-# These protocol classes define the minimal backend-specific hooks required by
-# the generic loop-closure manager. The goal is to preserve a single abstract
-# loop-closure implementation while allowing the target type to vary.
+    max_candidate_nodes_per_finished_target: int = 0
+    finished_submap_verification_budget_per_tick: int = 24
+    force_full_submap_for_finished_submap_search: bool = False
+    finished_submap_full_search_failure_threshold: int = 3
+    max_loop_translation_residual_m: float = 1.0
+    max_loop_rotation_residual_rad: float = 0.20944
 
 
 class TargetProvider(Protocol):
-    """
-    Backend-specific interface for exposing loop-closure targets and node
-    candidates to the abstract loop-closure manager.
-    """
+    """Backend-specific interface for exposing loop-closure targets."""
 
     def get_candidate_targets_for_node(
         self,
@@ -218,15 +139,9 @@ class TargetProvider(Protocol):
         all_nodes: Dict[int, LoopNode],
         config: LoopClosureConfig,
     ) -> List[ClosureTarget]:
-        """
-        Return eligible finished targets to be tested against a newly added node.
-        """
         ...
 
     def get_finished_target(self, target_id: str) -> ClosureTarget:
-        """
-        Return one finished target by identifier.
-        """
         ...
 
     def get_candidate_nodes_for_finished_target(
@@ -235,66 +150,41 @@ class TargetProvider(Protocol):
         all_nodes: Dict[int, LoopNode],
         config: LoopClosureConfig,
     ) -> List[LoopNode]:
-        """
-        Return historical nodes to be tested against a newly finished target.
-        """
         ...
 
 
 class LoopVerifier(Protocol):
-    """
-    Backend-specific geometric verification interface.
-
-    A verifier is responsible for running the actual node-to-target matching
-    procedure, which may include:
-        1. coarse correlative scan matching,
-        2. score-based rejection,
-        3. nonlinear refinement.
-    """
+    """Backend-specific geometric verification interface."""
 
     def verify(self, node: LoopNode, target: ClosureTarget) -> LoopMatchResult:
-        """
-        Geometrically verify a node-target pair.
-        """
         ...
 
 
 class ConstraintSink(Protocol):
-    """
-    Backend-specific constraint insertion and optimization scheduling interface.
-    """
+    """Backend-specific constraint insertion and optimization scheduling interface."""
 
     def add_loop_constraint(self, constraint: LoopConstraint) -> None:
-        """
-        Insert one accepted loop-closure constraint into the backend graph.
-        """
         ...
 
     def maybe_optimize(self, node_count: int, config: LoopClosureConfig) -> None:
-        """
-        Trigger batched optimization if the scheduling condition is satisfied.
-        """
         ...
 
 
-# =============================================================================
-# Generic loop-closure manager
-# =============================================================================
+@dataclass
+class _PendingFinishedTargetWork:
+    target_id: str
+    candidate_node_ids: List[int]
+    next_index: int = 0
+    consecutive_constrained_failures: int = 0
 
 
 class LoopClosureManager:
     """
     Generic loop-closure manager.
 
-    This class implements the abstract loop-closure policy and preserves the
-    Cartographer-style two-way search semantics:
-
-        1. new node  -> old finished targets
-        2. new target -> old nodes
-
-    Importantly, this manager does not know whether the target is a finished
-    submap or another map representation. That backend-specific knowledge is
-    delegated to the target provider and verifier.
+    This manager preserves Cartographer-style two-way search semantics:
+      1. new node -> old finished targets
+      2. new finished target -> old nodes
     """
 
     def __init__(
@@ -309,27 +199,16 @@ class LoopClosureManager:
         self.verifier = verifier
         self.sink = sink
 
-        # A lightweight archive of all nodes generated during the current run.
-        # This archive is essential for Cartographer-style two-way loop-closure
-        # search, where newly finished targets must be matched against older
-        # historical nodes.
         self.nodes: Dict[int, LoopNode] = {}
         self._accepted_pairs: set[tuple[int, str]] = set()
         self.stats = LoopClosureStats()
         self.events: List[LoopClosureEvent] = []
+        self._pending_finished_targets: List[_PendingFinishedTargetWork] = []
 
     def on_new_node(self, node: LoopNode) -> None:
-        """
-        Process a newly added node.
-
-        The function performs the first half of the Cartographer-style loop-
-        closure strategy:
-            new node -> old finished targets
-        """
+        """Process a newly added node against historical finished targets."""
         self.nodes[node.node_id] = node
 
-        # Loop-closure checks may be decimated if required. The default value
-        # of 1 means that every node is considered.
         processed_node_count = len(self.nodes)
         if (processed_node_count % self.config.check_every_n_nodes) != 0:
             return
@@ -342,11 +221,20 @@ class LoopClosureManager:
 
         successful_matches = []
         for target in candidate_targets:
+            pair_key = (node.node_id, target.target_id)
             self.stats.candidate_pairs += 1
 
-            pair_key = (node.node_id, target.target_id)
             if pair_key in self._accepted_pairs:
                 self.stats.duplicate_pairs += 1
+                self._record_event(
+                    node_id=node.node_id,
+                    target_id=target.target_id,
+                    score=float("nan"),
+                    accepted=False,
+                    status="duplicate",
+                    source=target.search_source or "new_node_search",
+                    used_full_submap=bool(target.match_full_submap),
+                )
                 continue
 
             match_result = self.verifier.verify(node=node, target=target)
@@ -357,6 +245,9 @@ class LoopClosureManager:
                     target_id=target.target_id,
                     score=float(match_result.score),
                     accepted=False,
+                    status=str(match_result.status),
+                    source=target.search_source or "new_node_search",
+                    used_full_submap=bool(match_result.used_full_submap),
                 )
                 continue
 
@@ -373,6 +264,9 @@ class LoopClosureManager:
                     target_id=target.target_id,
                     score=float(match_result.score),
                     accepted=False,
+                    status="accepted_limit",
+                    source=target.search_source or "new_node_search",
+                    used_full_submap=bool(match_result.used_full_submap),
                 )
                 continue
 
@@ -380,6 +274,7 @@ class LoopClosureManager:
                 node=node,
                 target=target,
                 matched_node_pose_global=match_result.matched_node_pose_global,
+                match_score=float(match_result.score),
             )
             self.sink.add_loop_constraint(constraint)
             self._accepted_pairs.add(pair_key)
@@ -389,20 +284,16 @@ class LoopClosureManager:
                 target_id=target.target_id,
                 score=float(match_result.score),
                 accepted=True,
+                status="accepted",
+                source=target.search_source or "new_node_search",
+                used_full_submap=bool(match_result.used_full_submap),
             )
 
         self.sink.maybe_optimize(node_count=len(self.nodes), config=self.config)
 
-    def on_target_finished(self, target_id: str) -> None:
-        """
-        Process a newly finished target.
-
-        This function implements the second half of the Cartographer-style
-        two-way search:
-            newly finished target -> old nodes
-        """
+    def enqueue_finished_target(self, target_id: str) -> None:
+        """Queue a newly finished target for bounded retrospective verification."""
         target = self.provider.get_finished_target(target_id=target_id)
-
         if not target.is_finished:
             return
 
@@ -411,58 +302,135 @@ class LoopClosureManager:
             all_nodes=self.nodes,
             config=self.config,
         )
+        if not candidate_nodes:
+            return
 
-        for node in candidate_nodes:
-            self.stats.candidate_pairs += 1
+        self._pending_finished_targets.append(
+            _PendingFinishedTargetWork(
+                target_id=str(target.target_id),
+                candidate_node_ids=[int(node.node_id) for node in candidate_nodes],
+            )
+        )
 
-            pair_key = (node.node_id, target.target_id)
-            if pair_key in self._accepted_pairs:
-                self.stats.duplicate_pairs += 1
+    def drain_pending_finished_targets(self, max_verifications: Optional[int] = None) -> int:
+        """
+        Drain bounded retrospective finished-target work.
+
+        Returns the number of candidate verifications consumed in this call.
+        """
+        if max_verifications is None:
+            remaining = None
+        else:
+            remaining = int(max_verifications)
+            if remaining <= 0:
+                return 0
+
+        processed = 0
+        threshold = int(self.config.finished_submap_full_search_failure_threshold)
+        force_full = bool(self.config.force_full_submap_for_finished_submap_search)
+
+        while self._pending_finished_targets and (remaining is None or remaining > 0):
+            work = self._pending_finished_targets[0]
+
+            if work.next_index >= len(work.candidate_node_ids):
+                self._pending_finished_targets.pop(0)
                 continue
 
-            match_result = self.verifier.verify(node=node, target=target)
+            target = self.provider.get_finished_target(target_id=work.target_id)
+            if not target.is_finished:
+                self._pending_finished_targets.pop(0)
+                continue
+
+            node_id = int(work.candidate_node_ids[work.next_index])
+            work.next_index += 1
+
+            node = self.nodes.get(node_id)
+            if node is None:
+                continue
+
+            use_full_submap = force_full or (
+                threshold > 0 and work.consecutive_constrained_failures >= threshold
+            )
+            target_for_match = replace(
+                target,
+                match_full_submap=bool(use_full_submap),
+                search_source="finished_submap_search",
+            )
+
+            pair_key = (node.node_id, target_for_match.target_id)
+            self.stats.candidate_pairs += 1
+            processed += 1
+            if remaining is not None:
+                remaining -= 1
+
+            if pair_key in self._accepted_pairs:
+                self.stats.duplicate_pairs += 1
+                self._record_event(
+                    node_id=node.node_id,
+                    target_id=target_for_match.target_id,
+                    score=float("nan"),
+                    accepted=False,
+                    status="duplicate",
+                    source="finished_submap_search",
+                    used_full_submap=bool(use_full_submap),
+                )
+                continue
+
+            match_result = self.verifier.verify(node=node, target=target_for_match)
             if (not match_result.success) or (match_result.matched_node_pose_global is None):
                 self.stats.rejected_pairs += 1
                 self._record_event(
                     node_id=node.node_id,
-                    target_id=target.target_id,
+                    target_id=target_for_match.target_id,
                     score=float(match_result.score),
                     accepted=False,
+                    status=str(match_result.status),
+                    source="finished_submap_search",
+                    used_full_submap=bool(match_result.used_full_submap),
                 )
+                if not use_full_submap and match_result.status in {"matcher_failed", "score_failed"}:
+                    work.consecutive_constrained_failures += 1
                 continue
 
             constraint = self._build_constraint(
                 node=node,
-                target=target,
+                target=target_for_match,
                 matched_node_pose_global=match_result.matched_node_pose_global,
+                match_score=float(match_result.score),
             )
             self.sink.add_loop_constraint(constraint)
             self._accepted_pairs.add(pair_key)
             self.stats.accepted_pairs += 1
             self._record_event(
                 node_id=node.node_id,
-                target_id=target.target_id,
+                target_id=target_for_match.target_id,
                 score=float(match_result.score),
                 accepted=True,
+                status="accepted",
+                source="finished_submap_search",
+                used_full_submap=bool(match_result.used_full_submap),
             )
+            if not use_full_submap:
+                work.consecutive_constrained_failures = 0
+
+            if work.next_index >= len(work.candidate_node_ids):
+                self._pending_finished_targets.pop(0)
 
         self.sink.maybe_optimize(node_count=len(self.nodes), config=self.config)
+        return processed
+
+    def finalize_pending_finished_targets(self) -> int:
+        """Drain all queued retrospective verification work."""
+        return self.drain_pending_finished_targets(max_verifications=None)
 
     def _build_constraint(
         self,
         node: LoopNode,
         target: ClosureTarget,
         matched_node_pose_global: Pose2,
+        match_score: float = 1.0,
     ) -> LoopConstraint:
-        """
-        Construct a target-relative loop-closure constraint.
-
-        This follows the same geometric form as Cartographer's 2D
-        node-to-submap constraint construction:
-            z_tj = T_t^{-1} * T_j
-
-        where T_t is the target pose and T_j is the refined node pose.
-        """
+        """Construct a target-relative loop-closure constraint."""
         relative_pose = pose_relative(
             from_pose=target.pose_global,
             to_pose=matched_node_pose_global,
@@ -475,16 +443,30 @@ class LoopClosureManager:
             relative_pose=relative_pose,
             translation_weight=self.config.translation_weight,
             rotation_weight=self.config.rotation_weight,
+            match_score=float(match_score),
             constraint_kind="loop",
             is_fixed_target=target.is_fixed,
         )
-    def _record_event(self, node_id: int, target_id: str, score: float, accepted: bool) -> None:
+
+    def _record_event(
+        self,
+        node_id: int,
+        target_id: str,
+        score: float,
+        accepted: bool,
+        status: str,
+        source: str,
+        used_full_submap: bool,
+    ) -> None:
         self.events.append(
             LoopClosureEvent(
                 node_id=int(node_id),
                 target_id=str(target_id),
                 score=float(score),
                 accepted=bool(accepted),
+                status=str(status),
+                source=str(source),
+                used_full_submap=bool(used_full_submap),
             )
         )
         if len(self.events) > 5000:
@@ -500,3 +482,70 @@ class LoopClosureManager:
 
     def get_recent_events(self, n: int = 20) -> List[LoopClosureEvent]:
         return list(self.events[-int(n):])
+
+    def get_diagnostics_summary(self) -> dict:
+        """Return compact diagnostics mirroring the legacy builder summary."""
+        accepted_events = [ev for ev in self.events if ev.accepted]
+        rejected_events = [ev for ev in self.events if not ev.accepted]
+
+        accepted_scores = np.asarray(
+            [ev.score for ev in accepted_events if np.isfinite(ev.score)],
+            dtype=float,
+        )
+        score_failed_scores = np.asarray(
+            [ev.score for ev in rejected_events if ev.status == "score_failed" and np.isfinite(ev.score)],
+            dtype=float,
+        )
+
+        def _count(events: List[LoopClosureEvent], **conds) -> int:
+            total = 0
+            for event in events:
+                if all(getattr(event, key) == value for key, value in conds.items()):
+                    total += 1
+            return total
+
+        summary = {
+            "accepted_from_new_node_search": _count(
+                accepted_events, source="new_node_search", status="accepted"
+            ),
+            "accepted_from_finished_submap_search": _count(
+                accepted_events, source="finished_submap_search", status="accepted"
+            ),
+            "rejected_sampled_out": _count(rejected_events, status="sampled_out"),
+            "rejected_matcher_failed": _count(rejected_events, status="matcher_failed"),
+            "rejected_score_failed": _count(rejected_events, status="score_failed"),
+            "rejected_duplicate": _count(rejected_events, status="duplicate"),
+            "retrospective_full_submap_attempts": _count(
+                self.events, source="finished_submap_search", used_full_submap=True
+            ),
+            "retrospective_constrained_attempts": _count(
+                self.events, source="finished_submap_search", used_full_submap=False
+            ),
+            "accepted_score_count": int(accepted_scores.size),
+            "score_failed_count": int(score_failed_scores.size),
+        }
+
+        if accepted_scores.size > 0:
+            summary.update(
+                {
+                    "accepted_score_min": float(np.min(accepted_scores)),
+                    "accepted_score_mean": float(np.mean(accepted_scores)),
+                    "accepted_score_median": float(np.median(accepted_scores)),
+                    "accepted_score_max": float(np.max(accepted_scores)),
+                    "accepted_near_min_score_count": int(
+                        np.sum(accepted_scores <= (float(self.config.min_score) + 1e-3))
+                    ),
+                }
+            )
+
+        if score_failed_scores.size > 0:
+            summary.update(
+                {
+                    "score_failed_min": float(np.min(score_failed_scores)),
+                    "score_failed_mean": float(np.mean(score_failed_scores)),
+                    "score_failed_median": float(np.median(score_failed_scores)),
+                    "score_failed_max": float(np.max(score_failed_scores)),
+                }
+            )
+
+        return summary

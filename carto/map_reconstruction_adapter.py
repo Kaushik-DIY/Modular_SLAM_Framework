@@ -36,9 +36,9 @@ class CartoTileProvider:
                 continue
             seen_ids.add(sm_id)
 
-            if use_optimized_poses:
-                pose = self.pose_graph.get_submap_pose(sm_id)
-            else:
+            try:
+                pose = self.pose_graph.get_submap_pose(sm_id, use_optimized=use_optimized_poses)
+            except (KeyError, AttributeError):
                 pose = sm.pose_world
 
             tiles.append(

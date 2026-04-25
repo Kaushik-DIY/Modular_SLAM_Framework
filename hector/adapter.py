@@ -177,21 +177,44 @@ class HectorLocalSlamAdapter:
         if not np.all(np.isfinite([final_pose.x, final_pose.y, final_pose.theta])):
             raise ValueError(f"Non-finite final pose from matcher: {final_pose}")
 
-        # Always continue prediction from accepted final pose
-        self.extrap.update(t, final_pose)
+        # Only update the extrapolator on a genuine successful match.
+        # Feeding fallback (extrapolated) poses back into the extrapolator causes
+        # the velocity estimate to grow unboundedly, eventually placing every
+        # prediction outside map bounds -> permanent zero-inlier failure.
+        if result.success:
+            self.extrap.update(t, final_pose)
 
         did_insert = False
 
         if matcher_name == "scan_to_map":
-            did_insert = self.matcher_manager.update_active_target(
-                pose_world=final_pose,
-                scan_points_local=scan_points_local,
-                t=t,
-            )
-            # For scan_to_map, reference follows every update
-            if did_insert:
-                self.last_insert_pose = final_pose
-                self.last_insert_time = t
+            # Bootstrap rule:
+            # The very first scan must seed the map, otherwise scan-to-map can never start.
+            # After initialization, only successful matches may be inserted.
+            active_matcher = self.matcher_manager.active_matcher
+            map_initialized = bool(getattr(active_matcher, "initialized", False))
+
+            if not map_initialized:
+                did_insert = self.matcher_manager.update_active_target(
+                    pose_world=final_pose,
+                    scan_points_local=scan_points_local,
+                    t=t,
+                )
+                if did_insert:
+                    self.last_insert_pose = final_pose
+                    self.last_insert_time = t
+
+            elif result.success:
+                did_insert = self.matcher_manager.update_active_target(
+                    pose_world=final_pose,
+                    scan_points_local=scan_points_local,
+                    t=t,
+                )
+                if did_insert:
+                    self.last_insert_pose = final_pose
+                    self.last_insert_time = t
+
+            else:
+                did_insert = False
 
         elif do_insert:
             did_insert = self.matcher_manager.update_active_target(

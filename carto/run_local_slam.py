@@ -69,7 +69,7 @@ def main():
     # Experiment config
     # ------------------------------------------------
     MATCHER_TYPE = "scan_to_map"     # "scan_to_submap" or "scan_to_map"
-    MAX_SCANS = 500                 # use None for full dataset later
+    MAX_SCANS = 700                 # use None for full dataset later
     VERBOSE_EVERY = 10                # print every scan for now
 
     print("runner:", "carto")

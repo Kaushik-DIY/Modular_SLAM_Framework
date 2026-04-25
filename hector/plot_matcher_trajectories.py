@@ -1,5 +1,9 @@
+import glob
+import os
 import numpy as np
 import matplotlib.pyplot as plt
+
+import hector.config as cfg
 
 
 def load_traj(path):
@@ -15,7 +19,7 @@ def load_traj(path):
 
 
 def load_debug(path):
-    data = np.loadtxt(path, comments="#", skiprows=2)
+    data = np.loadtxt(path, comments="#", skiprows=5)
     if data.ndim == 1:
         data = data[None, :]
     k = data[:, 0]
@@ -37,12 +41,27 @@ def wrap_angle(a):
     return (a + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def main():
-    submap_traj_path = "hector_outputs/trajectory_scan_to_submap_4934.txt"
-    map_traj_path = "hector_outputs/trajectory_scan_to_map_4934.txt"
+def _dataset_tag() -> str:
+    if cfg.DATASET_NAME == "lab_run_2":
+        return f"{cfg.DATASET_NAME}_{cfg.DATASET_SCAN_VARIANT}"
+    return cfg.DATASET_NAME
 
-    submap_dbg_path = "hector_outputs/trajectory_scan_to_submap_4934_debug.txt"
-    map_dbg_path = "hector_outputs/trajectory_scan_to_map_4934_debug.txt"
+
+def _latest(pattern: str) -> str:
+    matches = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if not matches:
+        raise FileNotFoundError(f"No files found for pattern: {pattern}")
+    return matches[-1]
+
+
+def main():
+    dataset_tag = _dataset_tag()
+
+    submap_traj_path = _latest(f"hector_outputs/trajectory_{dataset_tag}_scan_to_submap_*.txt")
+    map_traj_path = _latest(f"hector_outputs/trajectory_{dataset_tag}_scan_to_map_*.txt")
+
+    submap_dbg_path = _latest(f"hector_outputs/trajectory_{dataset_tag}_scan_to_submap_*_debug.txt")
+    map_dbg_path = _latest(f"hector_outputs/trajectory_{dataset_tag}_scan_to_map_*_debug.txt")
 
     _, x1, y1, th1, s1 = load_traj(submap_traj_path)
     _, x2, y2, th2, s2 = load_traj(map_traj_path)
@@ -60,129 +79,108 @@ def main():
     plt.plot(x2, y2, label="scan_to_map", color="tab:orange")
     plt.xlabel("x [m]")
     plt.ylabel("y [m]")
-    plt.title("Hector Orchestration: Trajectory Comparison")
+    plt.title(f"Hector Orchestration: Trajectory Comparison ({dataset_tag})")
     plt.legend()
     plt.axis("equal")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_xy.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_xy_{dataset_tag}.png", dpi=200)
     plt.show()
 
-    # ------------------------------------------------
-    # XY trajectory
-    # ------------------------------------------------
     plt.figure(figsize=(8, 6))
     plt.plot(x1, y1, label="scan_to_submap")
     plt.xlabel("x [m]")
     plt.ylabel("y [m]")
-    plt.title("Hector Orchestration: scan_to_submap Trajectory")
+    plt.title(f"Hector Orchestration: scan_to_submap Trajectory ({dataset_tag})")
     plt.legend()
     plt.axis("equal")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_xy_submap.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_xy_submap_{dataset_tag}.png", dpi=200)
     plt.show()
 
     plt.figure(figsize=(8, 6))
     plt.plot(x2, y2, label="scan_to_map", color="tab:orange")
     plt.xlabel("x [m]")
     plt.ylabel("y [m]")
-    plt.title("Hector Orchestration: scan_to_map Trajectory")
+    plt.title(f"Hector Orchestration: scan_to_map Trajectory ({dataset_tag})")
     plt.legend()
     plt.axis("equal")
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_xy_map.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_xy_map_{dataset_tag}.png", dpi=200)
     plt.show()
 
-    # ------------------------------------------------
-    # Score comparison
-    # ------------------------------------------------
     plt.figure(figsize=(8, 4))
     plt.plot(s1, label="scan_to_submap score")
     plt.plot(s2, label="scan_to_map score")
     plt.xlabel("scan index")
     plt.ylabel("score")
-    plt.title("Hector Orchestration: Matcher Score Comparison")
+    plt.title(f"Hector Orchestration: Matcher Score Comparison ({dataset_tag})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_score.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_score_{dataset_tag}.png", dpi=200)
     plt.show()
 
-    # ------------------------------------------------
-    # Inlier comparison
-    # ------------------------------------------------
     plt.figure(figsize=(8, 4))
     plt.plot(inl1, label="scan_to_submap inliers")
     plt.plot(inl2, label="scan_to_map inliers")
     plt.xlabel("scan index")
     plt.ylabel("inliers")
-    plt.title("Hector Orchestration: Matcher Inlier Comparison")
+    plt.title(f"Hector Orchestration: Matcher Inlier Comparison ({dataset_tag})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_inliers.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_inliers_{dataset_tag}.png", dpi=200)
     plt.show()
 
-    # ------------------------------------------------
-    # Heading comparison
-    # ------------------------------------------------
     plt.figure(figsize=(8, 4))
     plt.plot(th1_deg, label="scan_to_submap theta")
     plt.plot(th2_deg, label="scan_to_map theta")
     plt.xlabel("scan index")
     plt.ylabel("heading [deg]")
-    plt.title("Hector Orchestration: Heading Comparison")
+    plt.title(f"Hector Orchestration: Heading Comparison ({dataset_tag})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_theta.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_theta_{dataset_tag}.png", dpi=200)
     plt.show()
 
-    # ------------------------------------------------
-    # Delta X comparison
-    # ------------------------------------------------
     plt.figure(figsize=(8, 4))
     plt.plot(dx1, label="submap dx")
     plt.plot(dx2, label="map dx")
     plt.xlabel("scan index")
     plt.ylabel("dx [m]")
-    plt.title("Hector Orchestration: Delta X Comparison")
+    plt.title(f"Hector Orchestration: Delta X Comparison ({dataset_tag})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_dx.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_dx_{dataset_tag}.png", dpi=200)
     plt.show()
 
-    # ------------------------------------------------
-    # Delta Y comparison
-    # ------------------------------------------------
     plt.figure(figsize=(8, 4))
     plt.plot(dy1, label="submap dy")
     plt.plot(dy2, label="map dy")
     plt.xlabel("scan index")
     plt.ylabel("dy [m]")
-    plt.title("Hector Orchestration: Delta Y Comparison")
+    plt.title(f"Hector Orchestration: Delta Y Comparison ({dataset_tag})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_dy.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_dy_{dataset_tag}.png", dpi=200)
     plt.show()
 
-    # ------------------------------------------------
-    # Delta Theta comparison
-    # ------------------------------------------------
     plt.figure(figsize=(8, 4))
     plt.plot(dth1, label="submap dtheta")
     plt.plot(dth2, label="map dtheta")
     plt.xlabel("scan index")
     plt.ylabel("dtheta [deg]")
-    plt.title("Hector Orchestration: Delta Theta Comparison")
+    plt.title(f"Hector Orchestration: Delta Theta Comparison ({dataset_tag})")
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("hector_outputs/trajectory_compare_dtheta.png", dpi=200)
+    plt.savefig(f"hector_outputs/trajectory_compare_dtheta_{dataset_tag}.png", dpi=200)
     plt.show()
 
 

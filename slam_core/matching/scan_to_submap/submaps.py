@@ -118,24 +118,61 @@ class SubmapBuilder2D:
             self.active.append(self._new_submap(pose_world))
 
     def _maybe_finish_oldest(self, pose_world: Pose2) -> None:
-        while self.active and self.active[0].num_inserted >= self.scans_per_submap:
-            finished = self.active.pop(0)
-            finished.finished = True
-            self.finished_submaps.append(finished)
-            self._newly_finished_ids.append(int(finished.id))
+        """Cartographer-faithful submap rotation (active_submaps_2d.cc).
+
+        The original Cartographer invariant:
+          active[0] = ALWAYS a full/mature submap (>=N/2 scans).
+          active[1] = the currently-growing submap.
+
+        The finished submap stays in active[] as the matching target for an
+        entire second submap cycle (N/2 scans). It is only removed once
+        active[1] has accumulated N/2 scans, at which point active[1] becomes
+        the new reliable matching target and a fresh empty submap is appended.
+
+        Our previous code (pop immediately on reaching N) switched the matcher
+        to a 0-scan submap, causing systematic score=-1 FALLBACKs.
+        """
+        # Step 1: Mark the oldest active submap as finished when full.
+        # Do NOT remove it — it becomes the continued match target.
+        if (self.active
+                and not self.active[0].finished
+                and self.active[0].num_inserted >= self.scans_per_submap):
+            self.active[0].finished = True
+            self.finished_submaps.append(self.active[0])
+            self._newly_finished_ids.append(int(self.active[0].id))
+
+        # Step 2: Rotate ONLY when the second submap is mature (>=N/2 scans).
+        # This guarantees active[0] always has >=N/2 scans at match time.
+        if (len(self.active) >= 2
+                and self.active[0].finished
+                and self.active[1].num_inserted >= self.scans_per_submap // 2):
+            self.active.pop(0)
             self.active.append(self._new_submap(pose_world))
+            # Handle the startup simultaneous-fill edge case: if the new [0]
+            # also happens to be full (both submaps started at the same time),
+            # mark it finished immediately so the next rotate fires correctly.
+            if (self.active
+                    and not self.active[0].finished
+                    and self.active[0].num_inserted >= self.scans_per_submap):
+                self.active[0].finished = True
+                self.finished_submaps.append(self.active[0])
+                self._newly_finished_ids.append(int(self.active[0].id))
 
     def insert_scan(self, pose_world: Pose2, scan_points_local: np.ndarray) -> bool:
         if not self._initialized:
             self._ensure_two_active(pose_world)
             self._initialized = True
 
-        inserted_into = list(self.active)
-        self._last_inserted_submaps = list(inserted_into)
+        # Only insert range data into non-finished submaps.
+        # Cartographer's Submap2D::InsertRangeData asserts CHECK(!finished_).
+        insertable = [sm for sm in self.active if not sm.finished]
+        # _last_inserted_submaps returns ALL active submaps (including the
+        # finished match-target) for pose-graph intra-submap constraint tracking.
+        self._last_inserted_submaps = list(self.active)
 
         endpoints_world = transform_points_pose(pose_world, scan_points_local)
 
-        for sm in inserted_into:
+        for sm in insertable:
             T_ws_inv = inverse_pose(sm.pose_world)
 
             origin_sub = transform_points_pose(

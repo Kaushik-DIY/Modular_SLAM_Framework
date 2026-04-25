@@ -14,6 +14,7 @@ class CartoRefinementProblem:
         self.min_points = int(min_points)
         self.w_trans = float(w_trans)
         self.w_rot = float(w_rot)
+        self.last_num_valid = 0
 
     def _interp_prob_and_grad(self, x, y):
         gx = (x - self.grid.origin_world[0]) / self.grid.res
@@ -73,7 +74,9 @@ class CartoRefinementProblem:
 
         p, dpx, dpy, valid = self._interp_prob_and_grad(qx, qy)
 
-        if int(np.count_nonzero(valid)) < self.min_points:
+        self.last_num_valid = int(np.count_nonzero(valid))
+
+        if self.last_num_valid < self.min_points:
             r = np.array([10.0], dtype=float)
             J = np.zeros((1, 3), dtype=float)
             return r, J

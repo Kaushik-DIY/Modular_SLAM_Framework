@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 from carto.common.types import Pose2
 
 
@@ -11,6 +12,11 @@ class PoseGraphNode:
     id: int
     time: float
     pose: Pose2
+    # local_pose: pose of this node in its primary insertion submap's local frame.
+    # Equivalent to NodeSpec2D.local_pose_2d in optimization_problem_2d.cc.
+    # Used for local trajectory regularization: z_ij = local_i^{-1} * local_j
+    # between consecutive nodes. Fixed measurement — never optimized.
+    local_pose: Optional[Pose2] = None
 
 
 @dataclass

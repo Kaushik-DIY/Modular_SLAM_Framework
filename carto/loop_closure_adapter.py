@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional
+
 import numpy as np
 
 from slam_core.common.types import Pose2
@@ -17,13 +18,30 @@ from slam_core.loop_closure import (
     TargetProvider,
     pose_translation_distance,
 )
-from slam_core.matching.scan_to_submap import (
-    CartoRefinementProblem,
-    ScanToSubmapMatcher,
-    Submap2D,
-    correlative_match_two_stage,
-)
+from slam_core.matching.scan_to_submap import ScanToSubmapMatcher, Submap2D
+from slam_core.matching.scan_to_submap.types import SubmapMatchRequest
+
 from carto.pose_graph.pose_graph_2d import PoseGraph2D
+
+
+def _relative_pose(from_pose: Pose2, to_pose: Pose2) -> Pose2:
+    """
+    Compute T_from^{-1} * T_to.
+    """
+    return pose_compose(inverse_pose(from_pose), to_pose)
+
+
+def _pose_residual(pred_rel: Pose2, match_rel: Pose2) -> tuple[float, float]:
+    """
+    Residual between two relative poses in SE(2).
+
+    Returns:
+        translation_residual_m, rotation_residual_rad
+    """
+    delta = _relative_pose(pred_rel, match_rel)
+    trans_residual = float(np.hypot(delta.x, delta.y))
+    rot_residual = float(abs(wrap_angle(delta.theta)))
+    return trans_residual, rot_residual
 
 
 class CartoTargetProvider(TargetProvider):
@@ -37,7 +55,7 @@ class CartoTargetProvider(TargetProvider):
         all_nodes: Dict[int, LoopNode],
         config: LoopClosureConfig,
     ) -> List[ClosureTarget]:
-        if len(all_nodes) <= config.min_node_index_separation:
+        if len(all_nodes) <= int(config.min_node_index_separation):
             return []
 
         finished_submaps = self.matcher.submap_builder.get_finished_submaps()
@@ -53,19 +71,23 @@ class CartoTargetProvider(TargetProvider):
 
             if submap_id in node.local_target_ids:
                 continue
-
             if (newest_finished_id - submap_id_int) < int(config.recent_finished_submap_exclusion):
+                continue
+            if getattr(submap, "num_inserted", 0) < 20:
                 continue
 
             target_pose = self.pose_graph.get_submap_pose(submap_id_int)
             dist = pose_translation_distance(node.pose_guess_global, target_pose)
-            if dist > config.spatial_search_radius:
+            if dist > float(config.spatial_search_radius):
                 continue
 
             ranked.append((dist, submap, target_pose))
 
-        ranked.sort(key=lambda x: float(x[0]))
-        ranked = ranked[: int(config.max_candidate_targets_per_new_node)]
+        ranked.sort(key=lambda item: float(item[0]))
+
+        max_targets = int(config.max_candidate_targets_per_new_node)
+        if max_targets > 0:
+            ranked = ranked[:max_targets]
 
         targets: List[ClosureTarget] = []
         for _, submap, target_pose in ranked:
@@ -77,9 +99,10 @@ class CartoTargetProvider(TargetProvider):
                     is_finished=True,
                     is_fixed=False,
                     map_view=submap,
+                    match_full_submap=False,
+                    search_source="new_node_search",
                 )
             )
-
         return targets
 
     def get_finished_target(self, target_id: str) -> ClosureTarget:
@@ -92,6 +115,8 @@ class CartoTargetProvider(TargetProvider):
             is_finished=True,
             is_fixed=False,
             map_view=submap,
+            match_full_submap=False,
+            search_source="finished_submap_search",
         )
 
     def get_candidate_nodes_for_finished_target(
@@ -111,97 +136,137 @@ class CartoTargetProvider(TargetProvider):
 
             if target.target_id in node.local_target_ids:
                 continue
-            if (latest_node_id - node.node_id) < config.min_node_index_separation:
+            if (latest_node_id - node.node_id) < int(config.min_node_index_separation):
                 continue
-            if pose_translation_distance(node.pose_guess_global, target.pose_global) > config.spatial_search_radius:
+
+            dist = pose_translation_distance(node.pose_guess_global, target.pose_global)
+            if dist > float(config.spatial_search_radius):
                 continue
 
             filtered.append(node)
 
+        filtered.sort(
+            key=lambda node: (
+                pose_translation_distance(node.pose_guess_global, target.pose_global),
+                int(node.node_id),
+            )
+        )
+
         stride = max(1, int(config.historical_node_stride))
-        return filtered[::stride]
+        filtered = filtered[::stride]
+
+        max_candidates = int(config.max_candidate_nodes_per_finished_target)
+        if max_candidates > 0:
+            filtered = filtered[:max_candidates]
+
+        return filtered
 
 
 class CartoLoopVerifier(LoopVerifier):
-    def __init__(self, matcher: ScanToSubmapMatcher, min_score: float) -> None:
+    """
+    Geometric verification of loop-closure candidates via the active matcher backend.
+
+    Acceptance order:
+      1. matcher success
+      2. score threshold
+      3. geometric consistency w.r.t. current graph estimate
+    """
+
+    def __init__(self, matcher: ScanToSubmapMatcher, config: LoopClosureConfig) -> None:
         self.matcher = matcher
-        self.min_score = float(min_score)
+        self.config = config
 
     def verify(self, node: LoopNode, target: ClosureTarget) -> LoopMatchResult:
-        submap: Submap2D = target.map_view
-        pred_sub = pose_compose(inverse_pose(target.pose_global), node.pose_guess_global)
-
-        pts_match = node.scan_points
-        max_match_pts = int(self.matcher.corr_params.get("max_match_points", 60))
-        if pts_match.shape[0] > max_match_pts:
-            stride = max(1, pts_match.shape[0] // max_match_pts)
-            pts_match = pts_match[::stride]
-
-        prob_img = submap.grid.probability()
-
-        best_sub, best_score = correlative_match_two_stage(
-            prob_img=prob_img,
-            grid_origin_xy=submap.grid.origin_world,
-            res=submap.grid.res,
-            points_local=pts_match,
-            initial_submap_pose=pred_sub,
-            min_valid=int(self.matcher.corr_params.get("min_valid", 20)),
-            precomp_levels=int(self.matcher.corr_params.get("precomp_levels", 3)),
-            coarse_level=int(self.matcher.corr_params.get("coarse_level", 2)),
-            coarse_xy_window=float(self.matcher.corr_params.get("coarse_xy_window", 0.8)),
-            coarse_th_window=float(self.matcher.corr_params.get("coarse_th_window", 0.3)),
-            coarse_xy_step=float(self.matcher.corr_params.get("coarse_xy_step", 0.20)),
-            coarse_th_step=float(self.matcher.corr_params.get("coarse_th_step", 0.08)),
-            fine_level=int(self.matcher.corr_params.get("fine_level", 0)),
-            fine_xy_window=float(self.matcher.corr_params.get("fine_xy_window", 0.25)),
-            fine_th_window=float(self.matcher.corr_params.get("fine_th_window", 0.12)),
-            fine_xy_step=float(self.matcher.corr_params.get("fine_xy_step", 0.05)),
-            fine_th_step=float(self.matcher.corr_params.get("fine_th_step", 0.02)),
+        request = SubmapMatchRequest(
+            scan_points_local=np.asarray(node.scan_points, dtype=float),
+            predicted_pose_world=node.pose_guess_global,
+            submap_pose_world=target.pose_global,
+            submap=target.map_view,
+            timestamp=float(node.timestamp),
+            match_full_submap=bool(target.match_full_submap),
         )
 
-        if best_score < self.min_score:
+        try:
+            response = self.matcher.match_against_submap(request)
+        except Exception:
             return LoopMatchResult(
                 success=False,
-                score=float(best_score),
+                score=0.0,
                 matched_node_pose_global=None,
+                status="matcher_failed",
+                used_full_submap=bool(target.match_full_submap),
+                translation_residual_m=None,
+                rotation_residual_rad=None,
             )
 
-        refined_sub = best_sub
-
-        do_refine = self.matcher.corr_params.get("do_refine", True)
-        if isinstance(do_refine, str):
-            do_refine = do_refine.lower() in ("1", "true", "yes", "y")
-        do_refine = bool(do_refine)
-
-        if do_refine:
-            x0 = np.array([best_sub.x, best_sub.y, best_sub.theta], dtype=float)
-            xpred = np.array([pred_sub.x, pred_sub.y, pred_sub.theta], dtype=float)
-
-            refine_pts = node.scan_points
-            max_refine_pts = int(self.matcher.corr_params.get("max_refine_points", 180))
-            if refine_pts.shape[0] > max_refine_pts:
-                stride = max(1, refine_pts.shape[0] // max_refine_pts)
-                refine_pts = refine_pts[::stride]
-
-            problem = CartoRefinementProblem(
-                grid=submap.grid,
-                pts_local=refine_pts,
-                pred_pose_sub=xpred,
-                min_points=int(self.matcher.corr_params.get("refine_min_points", 20)),
-                w_trans=float(self.matcher.corr_params.get("refine_w_trans", 1.0)),
-                w_rot=float(self.matcher.corr_params.get("refine_w_rot", 1.0)),
+        score = float(response.score)
+        if not response.success:
+            return LoopMatchResult(
+                success=False,
+                score=score,
+                matched_node_pose_global=None,
+                status="matcher_failed",
+                used_full_submap=bool(target.match_full_submap),
+                translation_residual_m=None,
+                rotation_residual_rad=None,
             )
 
-            x_opt = self.matcher.refine_solver.solve(x0, problem.compute_r_J).reshape(3)
-            x_opt[2] = wrap_angle(x_opt[2])
-            refined_sub = Pose2(float(x_opt[0]), float(x_opt[1]), float(x_opt[2]))
+        required_score = (
+            float(self.config.global_localization_min_score)
+            if target.match_full_submap
+            else float(self.config.min_score)
+        )
+        if score < required_score:
+            return LoopMatchResult(
+                success=False,
+                score=score,
+                matched_node_pose_global=None,
+                status="score_failed",
+                used_full_submap=bool(target.match_full_submap),
+                translation_residual_m=None,
+                rotation_residual_rad=None,
+            )
 
-        matched_world = pose_compose(target.pose_global, refined_sub)
+        matched_pose_global = response.pose_world
+
+        # --------------------------------------------------------------
+        # Geometry-consistency gate
+        # --------------------------------------------------------------
+        pred_rel = _relative_pose(target.pose_global, node.pose_guess_global)
+        match_rel = _relative_pose(target.pose_global, matched_pose_global)
+
+        trans_residual_m, rot_residual_rad = _pose_residual(pred_rel, match_rel)
+
+        if trans_residual_m > float(self.config.max_loop_translation_residual_m):
+            return LoopMatchResult(
+                success=False,
+                score=score,
+                matched_node_pose_global=None,
+                status="geometry_failed",
+                used_full_submap=bool(target.match_full_submap),
+                translation_residual_m=trans_residual_m,
+                rotation_residual_rad=rot_residual_rad,
+            )
+
+        if rot_residual_rad > float(self.config.max_loop_rotation_residual_rad):
+            return LoopMatchResult(
+                success=False,
+                score=score,
+                matched_node_pose_global=None,
+                status="geometry_failed",
+                used_full_submap=bool(target.match_full_submap),
+                translation_residual_m=trans_residual_m,
+                rotation_residual_rad=rot_residual_rad,
+            )
 
         return LoopMatchResult(
             success=True,
-            score=float(best_score),
-            matched_node_pose_global=matched_world,
+            score=score,
+            matched_node_pose_global=matched_pose_global,
+            status="accepted",
+            used_full_submap=bool(target.match_full_submap),
+            translation_residual_m=trans_residual_m,
+            rotation_residual_rad=rot_residual_rad,
         )
 
 
@@ -216,13 +281,15 @@ class CartoConstraintSink(ConstraintSink):
             relative_pose=constraint.relative_pose,
             translation_weight=constraint.translation_weight,
             rotation_weight=constraint.rotation_weight,
+            match_score=float(getattr(constraint, "match_score", 1.0)),
         )
 
     def maybe_optimize(self, node_count: int, config: LoopClosureConfig) -> None:
-        if node_count <= 0:
-            return
-        if (node_count % int(config.optimize_every_n_nodes)) == 0:
-            self.pose_graph.solve()
+        _ = node_count, config
+        # Optimization scheduling is owned by CartoGlobalSlam2D so that every
+        # solve is followed by synchronized submap write-back and live-state
+        # correction. The active loop path therefore never solves directly here.
+        return
 
 
 class CartoLoopClosureAdapter:
@@ -237,7 +304,7 @@ class CartoLoopClosureAdapter:
         self.config = config or LoopClosureConfig()
 
         provider = CartoTargetProvider(matcher=self.matcher, pose_graph=self.pose_graph)
-        verifier = CartoLoopVerifier(matcher=self.matcher, min_score=self.config.min_score)
+        verifier = CartoLoopVerifier(matcher=self.matcher, config=self.config)
         sink = CartoConstraintSink(pose_graph=self.pose_graph)
 
         self.manager = LoopClosureManager(
@@ -257,7 +324,7 @@ class CartoLoopClosureAdapter:
     ) -> None:
         node = LoopNode(
             node_id=int(node_id),
-            scan_points=scan_points,
+            scan_points=np.asarray(scan_points, dtype=float),
             pose_guess_global=pose_guess_global,
             timestamp=float(timestamp),
             local_target_ids=list(local_submap_ids or []),
@@ -265,15 +332,25 @@ class CartoLoopClosureAdapter:
         self.manager.on_new_node(node)
 
     def on_submap_finished(self, submap_id: int | str) -> None:
-        self.manager.on_target_finished(str(submap_id))
+        self.manager.enqueue_finished_target(str(submap_id))
 
-    def process_finished_submaps(self) -> None:
+    def process_finished_submaps(self) -> int:
         finished_ids = self.matcher.submap_builder.consume_newly_finished_ids()
         for submap_id in finished_ids:
             self.on_submap_finished(submap_id)
+
+        return self.manager.drain_pending_finished_targets(
+            max_verifications=int(self.config.finished_submap_verification_budget_per_tick)
+        )
+
+    def finalize(self) -> int:
+        return self.manager.finalize_pending_finished_targets()
 
     def get_stats(self):
         return self.manager.get_stats()
 
     def get_recent_events(self, n: int = 20):
         return self.manager.get_recent_events(n)
+
+    def get_diagnostics_summary(self) -> dict:
+        return self.manager.get_diagnostics_summary()

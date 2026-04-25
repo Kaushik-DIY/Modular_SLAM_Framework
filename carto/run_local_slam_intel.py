@@ -1,7 +1,7 @@
 import os
 import numpy as np
 
-from slam_core.dataio.carmen import read_carmen_log
+from slam_core.dataio.intel_carmen import read_intel_carmen_log
 from slam_core.common.types import Pose2
 
 from carto.config import (
@@ -28,8 +28,9 @@ from carto.local_slam.range_to_points import ranges_to_points
 from carto.local_slam.pose_extrapolator import PoseExtrapolatorCV
 
 from carto.pose_graph.pose_graph_2d import PoseGraph2D
-from carto.pose_graph.backends.scipy_backend_2d import SciPyBackend2D
+from carto.pose_graph.backends.pyceres_backend_2d import PyCeresBackend2D
 
+from slam_core.dataio.intel_carmen import read_intel_carmen_log
 from slam_core.matching.preprocessing import PointCloudProcessor, PointCloudProcessorConfig
 from slam_core.matching.core import MatcherManager
 from slam_core.matching.scan_to_submap import (
@@ -62,8 +63,8 @@ def _format_inliers(inliers) -> str:
 
 
 def main():
-    clf_path = "datasets/fr079/fr079.clf"
-    scans = read_carmen_log(clf_path)
+    clf_path = "datasets/intel/intel.clf"
+    scans = read_intel_carmen_log(clf_path)
 
     print("Loaded scans:", len(scans))
 
@@ -83,6 +84,12 @@ def main():
     if MAX_SCANS is not None:
         scans = scans[:int(MAX_SCANS)]
         print("Using scans:", len(scans))
+
+    # Intel Parameters
+    INTEL_ANGLE_MIN = -np.pi / 2.0
+    INTEL_ANGLE_INC = np.pi / 180.0
+    INTEL_RANGE_MIN = 0.001
+    INTEL_RANGE_MAX = 50.0
 
     # ------------------------------------------------
     # Shared point-cloud preprocessing
@@ -117,7 +124,7 @@ def main():
     # ------------------------------------------------
     local_submap_backend_config = ScanToSubmapBackendConfig(
         backend_type=SUBMAP_BACKEND_TYPE,
-        min_score=0.52 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 0.66,
+        min_score=0.70 if SUBMAP_BACKEND_TYPE == "two_stage_bruteforce" else 0.66,
         min_valid=20,
         precomp_levels=8 if SUBMAP_BACKEND_TYPE == "branch_and_bound" else 3,
         do_refine=True,
@@ -236,7 +243,12 @@ def main():
     # ------------------------------------------------
     # Pose graph
     # ------------------------------------------------
-    backend = SciPyBackend2D(huber_scale=1.0)
+    backend = PyCeresBackend2D(
+        huber_scale=1.0,
+        linear_solver_type="SPARSE_NORMAL_CHOLESKY",
+        num_threads=1,
+        minimizer_progress_to_stdout=False,
+    )
     backend.set_fixed("submap", 0)
 
     pg = PoseGraph2D(
@@ -296,10 +308,10 @@ def main():
 
             pts_raw = ranges_to_points(
                 s["ranges"],
-                ANGLE_MIN,
-                ANGLE_INC,
-                RANGE_MIN,
-                RANGE_MAX,
+                INTEL_ANGLE_MIN,
+                INTEL_ANGLE_INC,
+                INTEL_RANGE_MIN,
+                INTEL_RANGE_MAX,
                 stride=BEAM_STRIDE,
             )
             pts, proc_debug = point_processor.process(pts_raw)
@@ -354,6 +366,17 @@ def main():
                 dmsg = _format_delta(delta)
                 imsg = _format_inliers(inliers)
 
+                debug_obj = getattr(result, "debug", None)
+                extra = getattr(debug_obj, "extra", {}) if debug_obj is not None else {}
+
+                init_mode = "pred" if extra.get("used_pred_initializer", False) else "coarse"
+                pyceres_reason = extra.get("pyceres_reason", "na")
+                pyceres_summary = extra.get("pyceres_summary", None)
+                coarse_valid = extra.get("coarse_valid", None)
+                summary_brief = extra.get("pyceres_summary", None)
+                if summary_brief is not None and not result.success:
+                    print("pyceres_summary:", summary_brief)
+
                 print(
                     "motion:",
                     f"matcher={motion_debug.get('matcher_name', MATCHER_TYPE)}",
@@ -373,8 +396,13 @@ def main():
 
                 print(
                     f"k={k} {mode} pose=({pose.x:.2f},{pose.y:.2f},{pose.theta:.2f}) "
-                    f"score={score:.3f} {dmsg} {imsg}"
+                    f"score={score:.3f} init={init_mode} coarse_valid={coarse_valid} "
+                    f"pyceres={pyceres_reason} {dmsg} {imsg}"
                 )
+
+                if (not result.success) and (pyceres_summary is not None):
+                    print("pyceres_summary:", pyceres_summary)
+
 
                 print(
                     "constraints:",
@@ -395,6 +423,7 @@ def main():
     print("last odom:", scans[-1]["odom"])
     print("last laser_pose:", scans[-1].get("laser_pose", None))
     print("duration_s:", scans[-1]["t"] - scans[0]["t"])
+    print("num_beams_first_scan:", len(scans[0]["ranges"]))
 
 
 if __name__ == "__main__":
