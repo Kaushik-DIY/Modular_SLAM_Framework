@@ -4,6 +4,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+import hector.config as cfg
+
 from slam_core.common.types import Pose2
 from slam_core.common.se2 import wrap_angle
 from slam_core.matching.core import MatcherManager, MatchResult
@@ -13,7 +15,8 @@ from slam_core.matching.core import MatcherManager, MatchResult
 class MotionFilterParams:
     """
     Generic local-SLAM motion filter thresholds in tracking/world frame.
-    In Hector orchestration, scan_to_map will ignore sparse insertion and update every scan.
+    In Hector orchestration, scan_to_map can override sparse insertion
+    with its own throttled occupancy-map update cadence.
     """
     max_time_seconds: float
     max_distance_meters: float
@@ -97,13 +100,16 @@ class HectorLocalSlamAdapter:
         matcher_manager: MatcherManager,
         extrapolator,
         motion_params: Optional[MotionFilterParams] = None,
+        use_extrapolator: bool = True,
     ):
         self.matcher_manager = matcher_manager
         self.extrap = extrapolator
         self.motion_params = motion_params
+        self.use_extrapolator = use_extrapolator
 
         self.last_insert_pose: Optional[Pose2] = None
         self.last_insert_time: Optional[float] = None
+        self._last_match_pose: Optional[Pose2] = None
 
         self._last_match_result: Optional[MatchResult] = None
         self._last_do_insert: bool = False
@@ -114,6 +120,14 @@ class HectorLocalSlamAdapter:
         self.extrap.update(float(t0), pose0)
 
     def _predict_world_pose(self, t: float, odom_pose_world: Optional[Pose2], odom_alpha: float) -> Pose2:
+        if not self.use_extrapolator:
+            # Original Hector behaviour: raw odom when available, else last matched pose.
+            if odom_pose_world is not None:
+                return odom_pose_world
+            if self._last_match_pose is not None:
+                return self._last_match_pose
+            return Pose2(0.0, 0.0, 0.0)
+
         pred_world = self.extrap.predict(t)
 
         if odom_pose_world is not None and odom_alpha > 0.0:
@@ -128,12 +142,14 @@ class HectorLocalSlamAdapter:
 
     def process_scan(
         self,
+        k: int,
         t: float,
         scan_points_local: np.ndarray,
         odom_pose_world: Optional[Pose2] = None,
         *,
         odom_alpha: float = 0.0,
     ) -> Tuple[Pose2, MatchResult, bool, bool]:
+        k = int(k)
         t = float(t)
 
         self.matcher_manager.maybe_activate_pending()
@@ -155,10 +171,11 @@ class HectorLocalSlamAdapter:
             )
 
         # Hector-style policy:
-        # - scan_to_map updates every scan
+        # - scan_to_map can throttle occupancy-map insertions
         # - scan_to_submap still uses sparse insertion/update
         if matcher_name == "scan_to_map":
-            do_insert = True
+            map_update_every = max(1, int(getattr(cfg, "MAP_UPDATE_EVERY", 1)))
+            do_insert = ((k % map_update_every) == 0)
         else:
             do_insert = bool(motion_insert)
 
@@ -177,44 +194,46 @@ class HectorLocalSlamAdapter:
         if not np.all(np.isfinite([final_pose.x, final_pose.y, final_pose.theta])):
             raise ValueError(f"Non-finite final pose from matcher: {final_pose}")
 
-        # Only update the extrapolator on a genuine successful match.
-        # Feeding fallback (extrapolated) poses back into the extrapolator causes
-        # the velocity estimate to grow unboundedly, eventually placing every
-        # prediction outside map bounds -> permanent zero-inlier failure.
+        # Track last matched pose for use as GN prior when extrapolator is off.
         if result.success:
-            self.extrap.update(t, final_pose)
+            self._last_match_pose = final_pose
+            if self.use_extrapolator:
+                self.extrap.update(t, final_pose)
 
         did_insert = False
 
         if matcher_name == "scan_to_map":
-            # Bootstrap rule:
-            # The very first scan must seed the map, otherwise scan-to-map can never start.
-            # After initialization, only successful matches may be inserted.
-            active_matcher = self.matcher_manager.active_matcher
-            map_initialized = bool(getattr(active_matcher, "initialized", False))
+            # The scan_to_map matcher handles bootstrap insertions internally
+            # inside its own match() call.  The adapter must NOT call
+            # update_active_target for bootstrap scans or they are double-inserted.
+            is_bootstrap = (result.debug or {}).get("reason") == "bootstrap_seeding"
 
-            if not map_initialized:
-                did_insert = self.matcher_manager.update_active_target(
-                    pose_world=final_pose,
-                    scan_points_local=scan_points_local,
-                    t=t,
-                )
-                if did_insert:
-                    self.last_insert_pose = final_pose
-                    self.last_insert_time = t
-
-            elif result.success:
-                did_insert = self.matcher_manager.update_active_target(
-                    pose_world=final_pose,
-                    scan_points_local=scan_points_local,
-                    t=t,
-                )
-                if did_insert:
-                    self.last_insert_pose = final_pose
-                    self.last_insert_time = t
-
-            else:
+            if is_bootstrap:
                 did_insert = False
+
+            elif do_insert:
+                # Insert at matched pose on success; at predicted pose (dead-reckoning)
+                # on failure.
+                #
+                # WHY dead-reckoning on failure: without it, the map stagnates at the
+                # bootstrap region.  The GN gradient then always pulls pose estimates
+                # back to that stale region (often 1+ m away in long corridors),
+                # causing every subsequent scan to fail — cascade permanent failure.
+                # Inserting at the predicted pose (extrapolator + odom blend) keeps
+                # the map growing along the robot's actual path so GN has local
+                # context to converge against.
+                did_insert = self.matcher_manager.update_active_target(
+                    pose_world=final_pose,
+                    scan_points_local=scan_points_local,
+                    t=t,
+                )
+                if did_insert:
+                    self.last_insert_pose = final_pose
+                    self.last_insert_time = t
+
+                if not result.success and did_insert:
+                    if self.use_extrapolator:
+                        self.extrap.update(t, final_pose)
 
         elif do_insert:
             did_insert = self.matcher_manager.update_active_target(

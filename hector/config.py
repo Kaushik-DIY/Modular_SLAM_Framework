@@ -1,161 +1,387 @@
+"""
+Modular SLAM configuration for the Hector SLAM runner.
+
+How to use
+----------
+Set DATASET_NAME (and DATASET_SCAN_VARIANT for lab_run_2) at the top of
+this file, or override from the command line:
+
+    python -m hector.run_local_slam_new --dataset fr079 --max-scans 1000
+
+All SLAM tuning parameters are loaded automatically from the per-dataset
+profile below.  Only the three constants at the top need user attention.
+
+Supported datasets
+------------------
+  "lab_run_2"  Custom lab recording with JetRacer + YD LiDAR G4 + IMU.
+               Full 360° FOV, 16 m range, NO wheel odometry, slow robot.
+               Two scan variants:
+                 "raw" — 909 beams, maximum detail (default)
+                 "360" — 360 beams, lower compute cost
+
+  "fr079"      Freiburg FR079 corridor benchmark (CARMEN log).
+               SICK LMS, 180° FOV, 360 beams, 30 m range.
+               Wheel odometry embedded in the FLASER records.
+
+  "intel"      Intel Research Lab benchmark (CARMEN log).
+               SICK LMS, 180° FOV, 180 beams at 1°, 30 m range.
+               Wheel odometry embedded in the FLASER records.
+"""
+
 import numpy as np
 
-# =========================
-# Dataset selection
-# =========================
-# Supported values:
-#   - "fr079"
-#   - "intel"
-#   - "lab_run_2"
-DATASET_NAME = "lab_run_2"
+# ==============================================================
+# >>> USER SELECTION — edit these three lines <<<
+# ==============================================================
+DATASET_NAME         = "lab_run_2"      # "lab_run_2" | "fr079" | "intel"
+DATASET_SCAN_VARIANT = "raw"            # lab_run_2 only: "raw" | "360"
+MATCHER_TYPE         = "scan_to_map" # "scan_to_submap" | "scan_to_map"
+MAX_SCANS            = None             # None → all scans; int → cap for testing
+VERBOSE_EVERY        = 10
 
-# Used only by the lab dataset.
-#   - "raw"  -> 909 beams, maximum scan detail
-#   - "360"  -> 360 beams, lower compute cost
-DATASET_SCAN_VARIANT = "raw"
+# ==============================================================
+# Per-dataset parameter profiles
+# ==============================================================
+# Each profile must define every parameter key listed below.
+# Keys are injected as module-level attributes so the runner can
+# continue to use `cfg.XXX` style access unchanged.
 
-# =========================
-# Runtime / logging
-# =========================
-MATCHER_TYPE = "scan_to_submap"   # "scan_to_map" or "scan_to_submap"
-MAX_SCANS = None               # None = use all scans (1087 for lab_run_2)
-VERBOSE_EVERY = 50
+_PROFILES: dict = {
 
-# Odometry blending for datasets that provide odometry.
-# Keep this at 0.0 for LiDAR-only lab experiments.
-ODOM_ALPHA = 0.0
+    # ----------------------------------------------------------
+    # lab_run_2 — JetRacer AI + YD LiDAR G4 in a lab room.
+    #
+    # Notable characteristics:
+    #   • Full 360° field of view (vs. 180° half-scan on SICK datasets)
+    #   • 909 raw beams per scan → voxel filtering is necessary
+    #   • NO wheel odometry; IMU available but not fused in Hector mode
+    #   • Slow robot (≤ 1 m/s) → dense scan coverage per metre of travel
+    #   • Small indoor environment (~8 × 6 m lab room)
+    #   • Range limited to 16 m (G4 sensor spec)
+    # ----------------------------------------------------------
+    "lab_run_2": dict(
 
-# Initial pose used when the dataset has no odometry prior.
-INITIAL_POSE_X = 0.0
-INITIAL_POSE_Y = 0.0
-INITIAL_POSE_THETA = 0.0
+        # --- Odometry / initial pose ---
+        ODOM_ALPHA         = 0.0,   # no wheel odometry for this dataset
+        INITIAL_POSE_X     = 0.0,
+        INITIAL_POSE_Y     = 0.0,
+        INITIAL_POSE_THETA = 0.0,
 
-# =========================
-# Shared scan handling
-# =========================
-# Subsample every k-th beam after dataset geometry is applied.
-BEAM_STRIDE = 1
+        # --- Scan handling ---
+        BEAM_STRIDE     = 1,
+        LIDAR_MIN_RANGE = 0.10,
+        LIDAR_MAX_RANGE = 16.0,
 
-# Conservative LiDAR limits. Dataset-specific geometry is resolved separately.
-# Note: for lab_run_2 range_max=16m is used directly from the dataset profile.
-LIDAR_MIN_RANGE = 0.10
-LIDAR_MAX_RANGE = 30.0  # conservative upper bound; profile.range_max takes precedence
+        # --- Voxel pre-processing ---
+        # Enabled: 909 raw beams produce more points than the GN solver
+        # benefits from.  Voxel filtering also removes motion-blur
+        # artefacts from beam clustering near close obstacles.
+        VOXEL_FILTER_ENABLED      = True,
+        VOXEL_FIXED_SIZE          = 0.03,
+        VOXEL_ADAPTIVE_MAX_SIZE   = 0.10,
+        VOXEL_ADAPTIVE_MIN_POINTS = 200,
+        VOXEL_ADAPTIVE_ITERS      = 6,
 
-# =========================
-# Map parameters
-# =========================
-MAP_RESOLUTION = 0.05      # meters per cell (5cm — good match for 16m-range lab LiDAR)
-MAP_SIZE_METERS = 40.0     # lab room fits within 40x40m; reduces out-of-bounds risk
+        # --- Global map (scan_to_map mode) ---
+        MAP_RESOLUTION  = 0.05,
+        MAP_SIZE_METERS = 40.0,     # lab room comfortably fits in 40 × 40 m
 
-# =========================
-# Submap matcher parameters (scan_to_submap)
-# =========================
-# Submap physical size — must be large enough to contain all scan endpoints
-# from all poses that belong to the submap.  For the lab LiDAR (range_max=16 m)
-# the worst-case footprint radius from the submap origin is:
-#   max_traverse + range_max  ≈  travel_per_submap + 16 m.
-# 20 m is a comfortable fit for traversals up to ~4 m and still keeps the grid
-# compact (400×400 cells at 5 cm).
-SUBMAP_RESOLUTION   = 0.05
-SUBMAP_SIZE_METERS  = 20.0
+        # --- Submap (scan_to_submap mode) ---
+        SUBMAP_RESOLUTION  = 0.05,
+        SUBMAP_SIZE_METERS = 20.0,
+        # Slow robot at ~10 Hz → ~0.03 m/scan → 500 scans ≈ 15 m traversal
+        # giving 2–3 finished submaps for the full ~34 m lab path.
+        SCANS_PER_SUBMAP   = 500,
 
-# === Distance-based submap rotation ===
-# Strategy: rotate submaps every ~17 m of path,  so that each submap covers
-# one major segment of the environment.  This is expressed as a scan count
-# via the observed scan density:
-#
-#   lab_run_2 stats (scan_to_map reference trajectory):
-#     total path ≈  34.3 m, 1087 accepted scans → mean step ≈ 0.032 m/scan
-#     ⇒ ~5 m traversal is  ~160 scans
-#     ⇒ ~17 m traversal is ~530 scans
-#
-# With SCANS_PER_SUBMAP = 500 the Cartographer rotation logic gives:
-#   submap-0 finished at scan 500, rotated out at scan 750  → 2 finished submaps
-#   submap-1 finished at scan 750, still active at scan 1087
-#   ⇒ total ≥ 2 finished + 1 active  (3 submaps total for the lab)
-#
-# For a larger dataset (e.g., intel = 13k scans, ~800 m path) the same setting
-# gives ~26 submaps — good coverage without being excessively fine.
-SCANS_PER_SUBMAP    = 500
+        # Correlative coarse search — wide window because there is no
+        # odometry prior; the extrapolator alone can lag at sharp turns.
+        SUBMAP_COARSE_XY_WINDOW = 1.0,
+        SUBMAP_COARSE_XY_STEP   = 0.10,
+        SUBMAP_COARSE_TH_WINDOW = 0.40,   # ~23 deg
+        SUBMAP_COARSE_TH_STEP   = 0.05,
 
-# Correlative coarse search window (in submap frame).
-# Wider than default to recover from extrapolator lag at corners/turns.
-SUBMAP_COARSE_XY_WINDOW  = 1.0    # metres
-SUBMAP_COARSE_XY_STEP    = 0.10   # 2x finer than default 0.20 → better init
-SUBMAP_COARSE_TH_WINDOW  = 0.40   # ~23 deg, enough for sharp lab turns
-SUBMAP_COARSE_TH_STEP    = 0.05
+        # Correlative fine search
+        SUBMAP_FINE_XY_WINDOW = 0.25,
+        SUBMAP_FINE_XY_STEP   = 0.05,
+        SUBMAP_FINE_TH_WINDOW = 0.12,
+        SUBMAP_FINE_TH_STEP   = 0.02,
 
-# Correlative fine search window.
-SUBMAP_FINE_XY_WINDOW    = 0.25
-SUBMAP_FINE_XY_STEP      = 0.05
-SUBMAP_FINE_TH_WINDOW    = 0.12
-SUBMAP_FINE_TH_STEP      = 0.02
+        # Match / refine caps
+        # After voxel filtering we have ~200 pts/scan; use all of them.
+        SUBMAP_MAX_MATCH_POINTS  = 200,
+        SUBMAP_MAX_REFINE_POINTS = 200,
+        SUBMAP_MIN_VALID         = 30,
+        SUBMAP_MIN_SCORE         = 0.50,
+        SUBMAP_REFINE_W_TRANS    = 0.1,
+        SUBMAP_REFINE_W_ROT      = 1.0,
+        SUBMAP_REFINE_MIN_POINTS = 30,
 
-# Match/refine point caps.
-# After voxel filtering we have ~204 pts/scan; use 200 for the correlative
-# stage (covers the full preprocessed cloud) and all for refinement.
-SUBMAP_MAX_MATCH_POINTS  = 200    # was 60 — too few for 909-beam scanner
-SUBMAP_MAX_REFINE_POINTS = 200
-SUBMAP_MIN_VALID         = 30     # min in-submap points to score a candidate
-SUBMAP_MIN_SCORE         = 0.50   # correlative score threshold
+        # scan_to_map GN correlative params
+        CORR_MAP_MIN_POINTS     = 60,
+        CORR_MAP_MIN_INLIERS    = 60,
+        CORR_MAP_MIN_SCORE      = 0.10,
+        CORR_MAP_STEP_CLIP_XY   = 0.03,   # original Hector Python: ±0.03 m/iter
 
-# Refinement priors.  Loose translation prior allows GN to move freely within
-# the scan-matched window; tighter rotation prior keeps heading stable.
-SUBMAP_REFINE_W_TRANS    = 0.1
-SUBMAP_REFINE_W_ROT      = 1.0
-SUBMAP_REFINE_MIN_POINTS = 30
+        # --- Log-odds occupancy model ---
+        P_OCC     = 0.75,
+        P_FREE    = 0.40,
+        L_OCC     = 1.0,    # stronger update — solid lab walls are reliable
+        L_FREE    = -0.1,
+        L_MIN     = -5.0,
+        L_MAX     = 5.0,
+        RAY_STEPS = 20,     # 5 cm resolution → 20 steps adequate
 
-# =========================
-# Log-odds parameters
-# =========================
+        # --- GN scan-to-map solver ---
+        PYRAMID_LEVELS     = 3,
+        GN_ITERS_PER_LEVEL = [20, 15, 10],
+        GN_DAMPING         = 1e-4,
+        N_BOOTSTRAP_SCANS  = 1,
+
+        # --- Pose extrapolator ---
+        USE_EXTRAPOLATOR = False,
+        EXTRAP_MAX_DT   = 0.5,
+        EXTRAP_INIT_VXY = 0.0,
+        EXTRAP_INIT_WZ  = 0.0,
+
+        # --- Motion filter — slow robot at 10 Hz ---
+        TARGET_INSERT_PERIOD_S = 0.10,
+        V_EXPECTED_MPS         = 1.0,
+        W_EXPECTED_RPS         = np.deg2rad(45.0),
+
+        # --- Pose graph / PGO ---
+        KEYFRAME_STRIDE = 10,
+        ODOM_SIGMA_XY   = 0.10,
+        ODOM_SIGMA_TH   = np.deg2rad(5.0),
+        PGO_ITERS       = 15,
+        PGO_DAMPING     = 1e-6,
+    ),
+
+    # ----------------------------------------------------------
+    # fr079 — Freiburg FR079 corridor dataset (CARMEN log).
+    #
+    # Notable characteristics:
+    #   • SICK LMS laser, 180° FOV (half-scan), 360 beams, 30 m range
+    #   • Reliable wheel odometry embedded in the FLASER log records
+    #   • Purpose-built mobile robot, faster than JetRacer
+    #   • Corridor environment, ~60 m total path
+    # ----------------------------------------------------------
+    "fr079": dict(
+
+        # --- Odometry / initial pose ---
+        # Blend 50% odometry with extrapolator prediction.
+        # Initial pose comes from the first FLASER odom record.
+        ODOM_ALPHA         = 0.5,
+        INITIAL_POSE_X     = 0.0,
+        INITIAL_POSE_Y     = 0.0,
+        INITIAL_POSE_THETA = 0.0,
+
+        # --- Scan handling ---
+        BEAM_STRIDE     = 2,
+        LIDAR_MIN_RANGE = 0.10,
+        LIDAR_MAX_RANGE = 30.0,
+        MAP_UPDATE_EVERY = 5,
+
+        # --- Voxel pre-processing ---
+        # Disabled: only 360 beams — no benefit from further thinning.
+        VOXEL_FILTER_ENABLED      = False,
+        VOXEL_FIXED_SIZE          = 0.05,
+        VOXEL_ADAPTIVE_MAX_SIZE   = 0.15,
+        VOXEL_ADAPTIVE_MIN_POINTS = 150,
+        VOXEL_ADAPTIVE_ITERS      = 6,
+
+        # --- Global map (scan_to_map mode) ---
+        MAP_RESOLUTION  = 0.05,
+        MAP_SIZE_METERS = 80.0,     # corridor reaches ~31 m from origin; 80 m gives safe margin
+
+        # --- Submap (scan_to_submap mode) ---
+        SUBMAP_RESOLUTION  = 0.05,
+        SUBMAP_SIZE_METERS = 20.0,
+        # Faster robot at ~10 Hz → ~0.05 m/scan → 90 scans ≈ 4.5 m traversal.
+        # Matches the carto runner's value for this dataset.
+        SCANS_PER_SUBMAP   = 90,
+
+        # Correlative coarse search — tighter than lab because odometry
+        # already provides a good initial guess.
+        SUBMAP_COARSE_XY_WINDOW = 0.30,
+        SUBMAP_COARSE_XY_STEP   = 0.05,
+        SUBMAP_COARSE_TH_WINDOW = 0.20,   # ~11 deg
+        SUBMAP_COARSE_TH_STEP   = 0.05,
+
+        SUBMAP_FINE_XY_WINDOW = 0.15,
+        SUBMAP_FINE_XY_STEP   = 0.03,
+        SUBMAP_FINE_TH_WINDOW = 0.08,
+        SUBMAP_FINE_TH_STEP   = 0.02,
+
+        SUBMAP_MAX_MATCH_POINTS  = 300,   # use all 360 beams
+        SUBMAP_MAX_REFINE_POINTS = 300,
+        SUBMAP_MIN_VALID         = 20,
+        SUBMAP_MIN_SCORE         = 0.52,
+        SUBMAP_REFINE_W_TRANS    = 0.2,
+        SUBMAP_REFINE_W_ROT      = 1.0,
+        SUBMAP_REFINE_MIN_POINTS = 20,
+
+        # scan_to_map GN correlative params
+        CORR_MAP_MIN_POINTS     = 30,
+        CORR_MAP_MIN_INLIERS    = 30,
+        CORR_MAP_MIN_SCORE      = 0.35,
+        CORR_MAP_STEP_CLIP_XY   = 0.03,   # original Hector Python: ±0.03 m/iter
+
+        # --- Log-odds occupancy model ---
+        P_OCC     = 0.70,
+        P_FREE    = 0.40,
+        L_OCC     = 0.85,
+        L_FREE    = -0.1,
+        L_MIN     = -5.0,
+        L_MAX     = 5.0,
+        RAY_STEPS = 40,     # more ray steps for longer-range sensor
+
+        # --- GN scan-to-map solver ---
+        PYRAMID_LEVELS     = 3,
+        GN_ITERS_PER_LEVEL = [2, 2, 1],
+        GN_DAMPING         = 2e-2,
+        N_BOOTSTRAP_SCANS  = 1,
+
+        # --- Pose extrapolator ---
+        USE_EXTRAPOLATOR = False,
+        EXTRAP_MAX_DT   = 1.0,   # longer window for variable CARMEN timestamps
+        EXTRAP_INIT_VXY = 0.0,
+        EXTRAP_INIT_WZ  = 0.0,
+
+        # --- Motion filter — benchmark robot at ~10 Hz ---
+        TARGET_INSERT_PERIOD_S = 0.10,
+        V_EXPECTED_MPS         = 0.5,
+        W_EXPECTED_RPS         = np.deg2rad(30.0),
+
+        # --- Pose graph / PGO ---
+        KEYFRAME_STRIDE = 10,
+        ODOM_SIGMA_XY   = 0.05,
+        ODOM_SIGMA_TH   = np.deg2rad(3.0),
+        PGO_ITERS       = 15,
+        PGO_DAMPING     = 1e-6,
+    ),
+
+    # ----------------------------------------------------------
+    # intel — Intel Research Lab dataset (CARMEN log).
+    #
+    # Notable characteristics:
+    #   • SICK LMS, 180° FOV, 180 beams at 1° angular resolution
+    #   • Sparser angular coverage than fr079 (1° vs ~0.5°)
+    #   • Wheel odometry available but has known drift over long runs
+    #   • Large office building environment (~800 m full path)
+    # ----------------------------------------------------------
+    "intel": dict(
+
+        # --- Odometry / initial pose ---
+        # Lower odometry trust than fr079: intel odometry accumulates
+        # more drift, so we rely more heavily on the scan matcher.
+        ODOM_ALPHA         = 0.35,
+        INITIAL_POSE_X     = 0.0,
+        INITIAL_POSE_Y     = 0.0,
+        INITIAL_POSE_THETA = 0.0,
+
+        # --- Scan handling ---
+        BEAM_STRIDE     = 1,
+        LIDAR_MIN_RANGE = 0.10,
+        LIDAR_MAX_RANGE = 30.0,
+
+        # --- Voxel pre-processing ---
+        # Disabled: only 180 beams.
+        VOXEL_FILTER_ENABLED      = False,
+        VOXEL_FIXED_SIZE          = 0.05,
+        VOXEL_ADAPTIVE_MAX_SIZE   = 0.15,
+        VOXEL_ADAPTIVE_MIN_POINTS = 100,
+        VOXEL_ADAPTIVE_ITERS      = 6,
+
+        # --- Global map (scan_to_map mode) ---
+        MAP_RESOLUTION  = 0.05,
+        MAP_SIZE_METERS = 80.0,
+
+        # --- Submap (scan_to_submap mode) ---
+        SUBMAP_RESOLUTION  = 0.05,
+        SUBMAP_SIZE_METERS = 20.0,
+        SCANS_PER_SUBMAP   = 90,
+
+        # Correlative coarse search — tight, odometry provides good prior
+        SUBMAP_COARSE_XY_WINDOW = 0.30,
+        SUBMAP_COARSE_XY_STEP   = 0.05,
+        SUBMAP_COARSE_TH_WINDOW = 0.20,
+        SUBMAP_COARSE_TH_STEP   = 0.05,
+
+        SUBMAP_FINE_XY_WINDOW = 0.15,
+        SUBMAP_FINE_XY_STEP   = 0.03,
+        SUBMAP_FINE_TH_WINDOW = 0.08,
+        SUBMAP_FINE_TH_STEP   = 0.02,
+
+        # Lower point caps to match the sparser 180-beam scanner
+        SUBMAP_MAX_MATCH_POINTS  = 150,
+        SUBMAP_MAX_REFINE_POINTS = 150,
+        SUBMAP_MIN_VALID         = 15,
+        SUBMAP_MIN_SCORE         = 0.60,
+        SUBMAP_REFINE_W_TRANS    = 0.2,
+        SUBMAP_REFINE_W_ROT      = 1.0,
+        SUBMAP_REFINE_MIN_POINTS = 15,
+
+        # scan_to_map GN correlative params
+        CORR_MAP_MIN_POINTS     = 20,
+        CORR_MAP_MIN_INLIERS    = 20,
+        CORR_MAP_MIN_SCORE      = 0.10,
+        CORR_MAP_STEP_CLIP_XY   = 0.03,   # original Hector Python: ±0.03 m/iter
+
+        # --- Log-odds occupancy model ---
+        P_OCC     = 0.70,
+        P_FREE    = 0.40,
+        L_OCC     = 0.85,
+        L_FREE    = -0.1,
+        L_MIN     = -5.0,
+        L_MAX     = 5.0,
+        RAY_STEPS = 40,
+
+        # --- GN scan-to-map solver ---
+        PYRAMID_LEVELS     = 3,
+        GN_ITERS_PER_LEVEL = [15, 10, 8],
+        GN_DAMPING         = 1e-4,
+        N_BOOTSTRAP_SCANS  = 1,
+
+        # --- Pose extrapolator ---
+        USE_EXTRAPOLATOR = False,
+        EXTRAP_MAX_DT   = 1.0,
+        EXTRAP_INIT_VXY = 0.0,
+        EXTRAP_INIT_WZ  = 0.0,
+
+        # --- Motion filter ---
+        TARGET_INSERT_PERIOD_S = 0.10,
+        V_EXPECTED_MPS         = 0.5,
+        W_EXPECTED_RPS         = np.deg2rad(30.0),
+
+        # --- Pose graph / PGO ---
+        KEYFRAME_STRIDE = 10,
+        ODOM_SIGMA_XY   = 0.05,
+        ODOM_SIGMA_TH   = np.deg2rad(3.0),
+        PGO_ITERS       = 15,
+        PGO_DAMPING     = 1e-6,
+    ),
+}
+
+
+def _apply_profile(dataset_name: str) -> None:
+    """Inject all profile keys for *dataset_name* as module-level attributes."""
+    import sys
+    mod = sys.modules[__name__]
+    if dataset_name not in _PROFILES:
+        raise ValueError(
+            f"Unknown DATASET_NAME={dataset_name!r}. "
+            f"Supported: {', '.join(_PROFILES)}"
+        )
+    for key, value in _PROFILES[dataset_name].items():
+        setattr(mod, key, value)
+
+
+# Apply the active profile immediately at import time so that every
+# cfg.XXX attribute reflects the chosen dataset.
+_apply_profile(DATASET_NAME)
+
+# ==============================================================
+# Derived constants (dataset-independent)
+# ==============================================================
 P0 = 0.5
-L0 = np.log(P0 / (1.0 - P0))  # = 0
-
-P_OCC = 0.75   # stronger occupied confidence for lab walls
-P_FREE = 0.40
-
-L_FREE = -0.1
-L_OCC = 1.0    # stronger log-odds update per hit (was 0.85)
-
-L_MIN = -5.0
-L_MAX = 5.0
-
-# Mapping update speed: 20 ray steps adequate for 5cm resolution, 2x faster than 40
-RAY_STEPS = 20
-
-# =========================
-# Hector scan matcher params
-# =========================
-PYRAMID_LEVELS = 3
-# Per-level GN iterations from coarse to fine.
-# Each level: [coarse, mid, fine].  More iters = better convergence, more CPU.
-GN_ITERS_PER_LEVEL = [20, 15, 10]  # proper multi-resolution schedule
-GN_DAMPING = 1e-4                   # lower damping = sharper, faster convergence
-
-# Number of scans to integrate at dead-reckoned positions before GN matching starts.
-# Multi-scan seeding gives the map enough evidence density for GN gradients to be
-# meaningful, eliminating the degenerate single-scan bootstrap failure.
-N_BOOTSTRAP_SCANS = 5
-
-# -------------------------
-# Pose extrapolator
-# -------------------------
-EXTRAP_MAX_DT = 0.5  # seconds
-EXTRAP_INIT_VXY = 0.0
-EXTRAP_INIT_WZ = 0.0
-
-# -------------------------
-# Motion filter tuning
-# -------------------------
-TARGET_INSERT_PERIOD_S = 0.10   # update map every scan (10 Hz lab scan rate)
-V_EXPECTED_MPS = 1.0            # walking human in lab ~1 m/s
-W_EXPECTED_RPS = np.deg2rad(45.0)   # faster turns in tight lab space
-
-# -------------------------
-# Pose-graph / Loop closure
-# -------------------------
-KEYFRAME_STRIDE = 10
-ODOM_SIGMA_XY = 0.10
-ODOM_SIGMA_TH = np.deg2rad(5.0)
-PGO_ITERS = 15
-PGO_DAMPING = 1e-6
+L0 = float(np.log(P0 / (1.0 - P0)))   # always 0.0; kept for downstream compat

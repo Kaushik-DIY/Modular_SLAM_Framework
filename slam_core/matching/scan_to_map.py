@@ -544,15 +544,13 @@ class ScanToMapMatcher(ScanMatcherBase):
         trans_jump = float(np.hypot(delta[0], delta[1]))
         rot_jump = float(abs(wrap_angle(delta[2])))
 
-        max_translation_jump = float(self.corr_params.get("max_translation_jump", 0.25))
-        max_rotation_jump = float(self.corr_params.get("max_rotation_jump", np.deg2rad(12.0)))
-
-        success = (
-            (inliers >= min_inliers_accept)
-            and (score >= min_score)
-            and (trans_jump <= max_translation_jump)
-            and (rot_jump <= max_rotation_jump)
-        )
+        # Original Hector SLAM has NO inlier gate and NO jump gates at the
+        # acceptance level.  min_points inside align_pose_gauss_newton is only
+        # an early-exit from the GN loop — the pose is always returned.
+        # The C++ matchData() also returns unconditionally.
+        # Only the score guard remains (min_score=0.10) to block truly
+        # degenerate results where GN drove all endpoints into strong free-space.
+        success = (score >= min_score)
 
         self._last_debug_info = {
             "reason": "hector_scan_to_map" if success else "scan_to_map_rejected",
@@ -564,8 +562,6 @@ class ScanToMapMatcher(ScanMatcherBase):
             "min_inliers_accept": int(min_inliers_accept),
             "trans_jump": float(trans_jump),
             "rot_jump_deg": float(np.rad2deg(rot_jump)),
-            "max_translation_jump": float(max_translation_jump),
-            "max_rotation_jump_deg": float(np.rad2deg(max_rotation_jump)),
         }
 
         if not success:
