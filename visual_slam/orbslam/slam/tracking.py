@@ -603,9 +603,24 @@ class Tracking:
 
         return num_created >= Parameters.kInitializerNumMinTriangulatedPointsStereo
 
-    def track(self, img, depth=None, timestamp=None, img_id=None, img_right=None):
+    def track(
+        self,
+        img,
+        img_right=None,
+        depth=None,
+        img_id=None,
+        timestamp=None,
+        mask=None,
+        mask_right=None,
+    ):
         """
-        Minimal pySLAM-style tracking entry point for RGB-D/stereo testing.
+        pySLAM-style tracking entry point.
+
+        Signature follows pySLAM:
+            track(img, img_right, depth, img_id, timestamp, mask, mask_right)
+
+        The mask arguments are accepted for API compatibility and are reserved
+        for the later masked feature-extraction path.
         """
         f_cur = Frame(
             camera=self.camera,

@@ -32,6 +32,7 @@ from visual_slam.orbslam.slam.tracking_core import TrackingCore
 from visual_slam.orbslam.slam.tracking import TrackingHistory, Tracking
 from visual_slam.orbslam.slam.local_mapping_core import LocalMappingCore
 from visual_slam.orbslam.slam.local_mapping import LocalMapping
+from visual_slam.orbslam.slam.slam import Slam, SlamMode
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -78,6 +79,8 @@ __all__ = [
     "Tracking",
     "LocalMappingCore",
     "LocalMapping",
+    "Slam",
+    "SlamMode",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",
