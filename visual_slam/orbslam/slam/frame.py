@@ -1,0 +1,491 @@
+"""
+=============================================================================
+visual_slam/orbslam/slam/frame.py
+
+pySLAM-aligned FrameBase and Frame subset for ORB/RGB-D SLAM.
+
+Reference:
+- pySLAM: pyslam/slam/frame.py
+
+Scope:
+- Keep pySLAM's Tcw pose convention through CameraPose.
+- Keep projection/visibility helpers.
+- Keep ORB feature extraction via FeatureTrackerShared.
+- Keep RGB-D depth association and virtual stereo coordinate uR.
+- Keep map-point association containers needed by tracking/local mapping.
+
+Excluded for now:
+- semantic fields
+- JSON serialization
+- threaded matching
+- Sim3/PnP solver preparation
+- full stereo correlation matching
+=============================================================================
+"""
+
+from __future__ import annotations
+
+from threading import Lock
+from typing import Any, Optional
+
+import cv2
+import g2o
+import numpy as np
+
+from visual_slam.orbslam.slam.camera import Camera
+from visual_slam.orbslam.slam.camera_pose import CameraPose
+from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
+from visual_slam.orbslam.slam.config_parameters import Parameters
+
+
+kMinDepth = Parameters.kMinDepth
+
+
+def detect_and_compute(img: np.ndarray, left: bool = True, mask=None):
+    """Feature extraction through the shared feature tracker, like pySLAM."""
+    if left:
+        if FeatureTrackerShared.feature_tracker is None:
+            raise RuntimeError("FeatureTrackerShared.feature_tracker is not set.")
+        return FeatureTrackerShared.feature_tracker.detectAndCompute(img, mask)
+
+    if FeatureTrackerShared.feature_tracker_right is None:
+        raise RuntimeError("FeatureTrackerShared.feature_tracker_right is not set.")
+    return FeatureTrackerShared.feature_tracker_right.detectAndCompute(img, mask)
+
+
+def _as_points_array(points_or_map_points) -> np.ndarray:
+    pts = []
+    for p in points_or_map_points:
+        if p is None:
+            continue
+        if hasattr(p, "pt") and callable(p.pt):
+            pts.append(np.asarray(p.pt(), dtype=np.float64).reshape(3))
+        elif hasattr(p, "position"):
+            pts.append(np.asarray(p.position, dtype=np.float64).reshape(3))
+        elif hasattr(p, "position_world"):
+            pts.append(np.asarray(p.position_world, dtype=np.float64).reshape(3))
+        else:
+            pts.append(np.asarray(p, dtype=np.float64).reshape(3))
+    if len(pts) == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.ascontiguousarray(pts, dtype=np.float64)
+
+
+class FrameBase:
+    """Base object for camera intrinsics, pose, projection, and visibility."""
+
+    _id = 0
+    _id_lock = Lock()
+
+    def __init__(
+        self,
+        camera: Camera,
+        pose=None,
+        id: Optional[int] = None,
+        timestamp: Optional[float] = None,
+        img_id: Optional[int] = None,
+    ):
+        self._lock_pose = Lock()
+        self.camera = camera
+
+        if pose is None:
+            self._pose = CameraPose()
+        else:
+            self._pose = CameraPose(pose)
+
+        if id is not None:
+            self.id = int(id)
+        else:
+            with FrameBase._id_lock:
+                self.id = FrameBase._id
+                FrameBase._id += 1
+
+        self.timestamp = timestamp
+        self.img_id = img_id
+        self.median_depth = -1.0
+        self.fov_center_c = None
+        self.fov_center_w = None
+
+    def __hash__(self):
+        return self.id
+
+    def __eq__(self, rhs):
+        return isinstance(rhs, FrameBase) and self.id == rhs.id
+
+    def __lt__(self, rhs):
+        return self.id < rhs.id
+
+    def __le__(self, rhs):
+        return self.id <= rhs.id
+
+    @staticmethod
+    def next_id() -> int:
+        with FrameBase._id_lock:
+            return FrameBase._id
+
+    @staticmethod
+    def set_id(id_value: int) -> None:
+        with FrameBase._id_lock:
+            FrameBase._id = int(id_value)
+
+    @property
+    def width(self):
+        return self.camera.width
+
+    @property
+    def height(self):
+        return self.camera.height
+
+    def isometry3d(self):
+        with self._lock_pose:
+            return self._pose.isometry3d
+
+    def Tcw(self) -> np.ndarray:
+        with self._lock_pose:
+            return self._pose.Tcw.copy()
+
+    def Twc(self) -> np.ndarray:
+        with self._lock_pose:
+            return self._pose.get_inverse_matrix().copy()
+
+    def Rcw(self) -> np.ndarray:
+        with self._lock_pose:
+            return self._pose.Rcw.copy()
+
+    def Rwc(self) -> np.ndarray:
+        with self._lock_pose:
+            return self._pose.Rwc.copy()
+
+    def tcw(self) -> np.ndarray:
+        with self._lock_pose:
+            return self._pose.tcw.copy()
+
+    def Ow(self) -> np.ndarray:
+        with self._lock_pose:
+            return self._pose.Ow.copy()
+
+    def pose(self) -> np.ndarray:
+        return self.Tcw()
+
+    def quaternion(self):
+        with self._lock_pose:
+            return self._pose.quaternion
+
+    def orientation(self):
+        with self._lock_pose:
+            return self._pose.orientation
+
+    def position(self):
+        with self._lock_pose:
+            return self._pose.position
+
+    def update_pose(self, pose) -> None:
+        with self._lock_pose:
+            self._pose.set(pose)
+            self._update_fov_center_world_no_lock()
+
+    def update_translation(self, tcw: np.ndarray) -> None:
+        with self._lock_pose:
+            self._pose.set_translation(tcw)
+            self._update_fov_center_world_no_lock()
+
+    def update_rotation_and_translation(self, Rcw: np.ndarray, tcw: np.ndarray) -> None:
+        with self._lock_pose:
+            self._pose.set_from_rotation_and_translation(Rcw, tcw)
+            self._update_fov_center_world_no_lock()
+
+    def _update_fov_center_world_no_lock(self) -> None:
+        if self.fov_center_c is not None:
+            self.fov_center_w = (
+                self._pose.Rwc @ np.asarray(self.fov_center_c, dtype=np.float64).reshape(3, 1)
+                + self._pose.Ow.reshape(3, 1)
+            )
+
+    def transform_point(self, pw: np.ndarray) -> np.ndarray:
+        with self._lock_pose:
+            pw = np.asarray(pw, dtype=np.float64).reshape(3)
+            return (self._pose.Rcw @ pw) + self._pose.tcw
+
+    def transform_points(self, points: np.ndarray) -> np.ndarray:
+        with self._lock_pose:
+            points = np.ascontiguousarray(points, dtype=np.float64).reshape(-1, 3)
+            return (self._pose.Rcw @ points.T + self._pose.tcw.reshape(3, 1)).T
+
+    def project_points(self, points: np.ndarray, do_stereo_project: bool = False):
+        pcs = self.transform_points(points)
+        if do_stereo_project:
+            return self.camera.project_stereo(pcs)
+        return self.camera.project(pcs)
+
+    def project_map_points(self, map_points, do_stereo_project: bool = False):
+        points = _as_points_array(map_points)
+        if len(points) == 0:
+            if do_stereo_project:
+                return np.empty((0, 3), dtype=np.float64), np.empty((0,), dtype=np.float64)
+            return np.empty((0, 2), dtype=np.float64), np.empty((0,), dtype=np.float64)
+        return self.project_points(points, do_stereo_project=do_stereo_project)
+
+    def project_point(self, pw: np.ndarray, do_stereo_project: bool = False):
+        pc = self.transform_point(pw)
+        if do_stereo_project:
+            proj, zs = self.camera.project_stereo(pc.reshape(1, 3))
+        else:
+            proj, zs = self.camera.project(pc.reshape(1, 3))
+        return proj.reshape(-1), float(zs[0])
+
+    def is_in_image(self, uv: np.ndarray, z: float) -> bool:
+        return bool(self.camera.is_in_image(uv, z))
+
+    def are_in_image(self, uvs: np.ndarray, zs: np.ndarray) -> np.ndarray:
+        return self.camera.are_in_image(uvs, zs)
+
+
+class Frame(FrameBase):
+    """
+    pySLAM-like frame object for ORB/RGB-D SLAM.
+
+    Important fields preserved for later porting:
+    - kps / kpsu
+    - des
+    - depths
+    - uRs
+    - points
+    - outliers
+    - idxs
+    - kd placeholder
+    """
+
+    def __init__(
+        self,
+        camera: Camera,
+        img: Optional[np.ndarray] = None,
+        depth_img: Optional[np.ndarray] = None,
+        pose=None,
+        id: Optional[int] = None,
+        timestamp: Optional[float] = None,
+        img_id: Optional[int] = None,
+        img_right: Optional[np.ndarray] = None,
+        mask=None,
+    ):
+        super().__init__(camera=camera, pose=pose, id=id, timestamp=timestamp, img_id=img_id)
+
+        self.img = img
+        self.img_right = img_right
+        self.depth_img = depth_img
+        self.mask = mask
+
+        self.kps: list[cv2.KeyPoint] = []
+        self.kpsu: list[cv2.KeyPoint] = []
+        self.des: np.ndarray = np.empty((0, 32), dtype=np.uint8)
+
+        self.kps_r: list[cv2.KeyPoint] = []
+        self.des_r: np.ndarray = np.empty((0, 32), dtype=np.uint8)
+
+        self.depths: np.ndarray = np.empty((0,), dtype=np.float32)
+        self.uRs: np.ndarray = np.empty((0,), dtype=np.float32)
+
+        self.points: list[Any | None] = []
+        self.outliers: np.ndarray = np.empty((0,), dtype=bool)
+        self.idxs: np.ndarray = np.empty((0,), dtype=np.int32)
+
+        self.kd = None
+        self._is_deleted = False
+
+        if img is not None:
+            self.extract_features(mask=mask)
+
+        if depth_img is not None and len(self.kps) > 0:
+            self.set_depth_img(depth_img)
+
+    @property
+    def num_kps(self) -> int:
+        return len(self.kps)
+
+    @property
+    def keypoints(self):
+        return self.kps
+
+    @property
+    def descriptors(self):
+        return self.des
+
+    def ensure_contiguous_arrays(self) -> None:
+        self.des = np.ascontiguousarray(self.des)
+        self.depths = np.ascontiguousarray(self.depths)
+        self.uRs = np.ascontiguousarray(self.uRs)
+        self.outliers = np.ascontiguousarray(self.outliers)
+        self.idxs = np.ascontiguousarray(self.idxs)
+
+    def extract_features(self, mask=None) -> None:
+        kps, des = detect_and_compute(self.img, left=True, mask=mask)
+        self.kps = list(kps)
+        self.kpsu = list(kps)
+        self.des = des if des is not None else np.empty((0, 32), dtype=np.uint8)
+
+        n = len(self.kps)
+        self.depths = np.full(n, -1.0, dtype=np.float32)
+        self.uRs = np.full(n, -1.0, dtype=np.float32)
+        self.points = [None] * n
+        self.outliers = np.zeros(n, dtype=bool)
+        self.idxs = np.arange(n, dtype=np.int32)
+        self.ensure_contiguous_arrays()
+
+    def set_img_right(self, img_right: np.ndarray, mask=None) -> None:
+        self.img_right = img_right
+        kps_r, des_r = detect_and_compute(img_right, left=False, mask=mask)
+        self.kps_r = list(kps_r)
+        self.des_r = des_r if des_r is not None else np.empty((0, 32), dtype=np.uint8)
+
+    def set_depth_img(self, depth_img: np.ndarray) -> None:
+        self.depth_img = depth_img
+        self.compute_depths_from_depth_img()
+
+    def compute_depths_from_depth_img(self) -> None:
+        n = len(self.kps)
+        self.depths = np.full(n, -1.0, dtype=np.float32)
+        self.uRs = np.full(n, -1.0, dtype=np.float32)
+
+        if self.depth_img is None or n == 0:
+            return
+
+        h, w = self.depth_img.shape[:2]
+
+        for i, kp in enumerate(self.kps):
+            u = int(round(kp.pt[0]))
+            v = int(round(kp.pt[1]))
+
+            if u < 0 or u >= w or v < 0 or v >= h:
+                continue
+
+            raw_depth = float(self.depth_img[v, u])
+            depth_m = raw_depth * float(self.camera.depth_factor)
+
+            if not np.isfinite(depth_m) or depth_m <= kMinDepth:
+                continue
+
+            self.depths[i] = depth_m
+
+            if self.camera.bf is not None:
+                self.uRs[i] = float(kp.pt[0] - self.camera.bf / depth_m)
+
+        self.ensure_contiguous_arrays()
+
+    def get_point_match(self, idx: int):
+        return self.points[idx]
+
+    def set_point_match(self, p, idx: int) -> None:
+        self.points[idx] = p
+
+    def remove_point_match(self, idx: int) -> None:
+        self.points[idx] = None
+
+    def replace_point_match(self, old_point, new_point) -> int:
+        count = 0
+        for i, p in enumerate(self.points):
+            if p is old_point:
+                self.points[i] = new_point
+                count += 1
+        return count
+
+    def remove_point(self, point) -> int:
+        count = 0
+        for i, p in enumerate(self.points):
+            if p is point:
+                self.points[i] = None
+                count += 1
+        return count
+
+    def reset_points(self) -> None:
+        self.points = [None] * len(self.kps)
+        self.outliers = np.zeros(len(self.kps), dtype=bool)
+
+    def get_points(self):
+        return [p for p in self.points if p is not None]
+
+    def get_matched_points(self):
+        return [p for p in self.points if p is not None]
+
+    def get_matched_points_idxs(self) -> np.ndarray:
+        return np.array([i for i, p in enumerate(self.points) if p is not None], dtype=np.int32)
+
+    def get_unmatched_points_idxs(self) -> np.ndarray:
+        return np.array([i for i, p in enumerate(self.points) if p is None], dtype=np.int32)
+
+    def get_matched_good_points(self):
+        return [p for i, p in enumerate(self.points) if p is not None and not self.outliers[i]]
+
+    def get_matched_good_points_idxs(self) -> np.ndarray:
+        return np.array(
+            [i for i, p in enumerate(self.points) if p is not None and not self.outliers[i]],
+            dtype=np.int32,
+        )
+
+    def get_matched_inlier_points(self):
+        return self.get_matched_good_points()
+
+    def get_matched_good_points_and_idxs(self):
+        idxs = self.get_matched_good_points_idxs()
+        return [self.points[i] for i in idxs], idxs
+
+    def delete(self) -> None:
+        self._is_deleted = True
+        self.img = None
+        self.img_right = None
+        self.depth_img = None
+        self.kd = None
+
+    def __repr__(self) -> str:
+        return f"Frame(id={self.id}, t={self.timestamp}, kps={len(self.kps)})"
+
+
+def are_map_points_visible_in_frame(
+    frame: FrameBase,
+    map_points,
+    do_stereo_project: bool = False,
+    check_positive_depth: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Project map points into a frame and return visibility mask, projections, depths.
+    """
+    if len(map_points) == 0:
+        dim = 3 if do_stereo_project else 2
+        return (
+            np.empty((0,), dtype=bool),
+            np.empty((0, dim), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+        )
+
+    projs, depths = frame.project_map_points(map_points, do_stereo_project=do_stereo_project)
+    visible = frame.are_in_image(projs[:, :2], depths)
+
+    if check_positive_depth:
+        visible &= depths > kMinDepth
+
+    return visible, projs, depths
+
+
+def are_map_points_visible(frame: FrameBase, map_points, **kwargs):
+    return are_map_points_visible_in_frame(frame, map_points, **kwargs)
+
+
+def match_frames(frame_ref: Frame, frame_cur: Frame, ratio_test: float | None = None):
+    """
+    Minimal descriptor matching helper.
+
+    Full pySLAM frame matching includes geometric filtering and threading. This
+    subset delegates to the shared ORB matcher and returns index arrays.
+    """
+    if FeatureTrackerShared.feature_matcher is None:
+        raise RuntimeError("FeatureTrackerShared.feature_matcher is not set.")
+
+    ratio = Parameters.kFeatureMatchDefaultRatioTest if ratio_test is None else ratio_test
+
+    return FeatureTrackerShared.feature_matcher.match(
+        frame_ref.img,
+        frame_cur.img,
+        frame_ref.des,
+        frame_cur.des,
+        frame_ref.kps,
+        frame_cur.kps,
+        ratio_test=ratio,
+    )
