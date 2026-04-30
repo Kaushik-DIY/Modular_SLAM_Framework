@@ -40,6 +40,60 @@ from visual_slam.orbslam.slam.config_parameters import Parameters
 
 kMinDepth = Parameters.kMinDepth
 
+class SimpleKDTree:
+    """Small query_ball_point-compatible fallback for scipy.spatial.cKDTree."""
+
+    def __init__(self, points):
+        self.points = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+
+    def query_ball_point(self, x, r):
+        x = np.asarray(x, dtype=np.float64)
+
+        if x.ndim == 1:
+            rr = float(r)
+            d = np.linalg.norm(self.points - x.reshape(1, 2), axis=1)
+            return list(np.flatnonzero(d <= rr))
+
+        if np.isscalar(r):
+            radii = np.full(len(x), float(r), dtype=np.float64)
+        else:
+            radii = np.asarray(r, dtype=np.float64).reshape(-1)
+
+        results = []
+        for xi, ri in zip(x, radii):
+            d = np.linalg.norm(self.points - xi.reshape(1, 2), axis=1)
+            results.append(list(np.flatnonzero(d <= ri)))
+        return results
+
+
+def make_kdtree_from_keypoints(kps):
+    pts = np.array([kp.pt for kp in kps], dtype=np.float64).reshape(-1, 2)
+    if len(pts) == 0:
+        pts = np.empty((0, 2), dtype=np.float64)
+
+    try:
+        from scipy.spatial import cKDTree
+        return cKDTree(pts)
+    except Exception:
+        return SimpleKDTree(pts)
+
+
+def ensure_frame_feature_arrays(frame) -> None:
+    kps = getattr(frame, "kps", getattr(frame, "keypoints", []))
+
+    if not hasattr(frame, "octaves") or len(getattr(frame, "octaves", [])) != len(kps):
+        frame.octaves = np.array([max(0, int(getattr(kp, "octave", 0))) for kp in kps], dtype=np.int32)
+
+    if not hasattr(frame, "angles") or len(getattr(frame, "angles", [])) != len(kps):
+        frame.angles = np.array([float(getattr(kp, "angle", -1.0)) for kp in kps], dtype=np.float32)
+
+    if not hasattr(frame, "kps_ur"):
+        frame.kps_ur = getattr(frame, "uRs", np.full(len(kps), -1.0, dtype=np.float32))
+
+    if getattr(frame, "kd", None) is None:
+        frame.kd = make_kdtree_from_keypoints(kps)
+
+
 
 def detect_and_compute(img: np.ndarray, left: bool = True, mask=None):
     """Feature extraction through the shared feature tracker, like pySLAM."""
@@ -239,6 +293,16 @@ class FrameBase:
     def are_in_image(self, uvs: np.ndarray, zs: np.ndarray) -> np.ndarray:
         return self.camera.are_in_image(uvs, zs)
 
+    def are_visible(self, map_points, do_stereo_project: bool = False):
+        projs, depths = self.project_map_points(map_points, do_stereo_project=do_stereo_project)
+        pts = _as_points_array(map_points)
+        if len(pts) == 0:
+            return np.empty((0,), dtype=bool), projs, depths, np.empty((0,), dtype=np.float64)
+        Ow = self.Ow()
+        dists = np.linalg.norm(pts - Ow.reshape(1, 3), axis=1)
+        visible = self.are_in_image(projs[:, :2], depths) & (depths > kMinDepth)
+        return visible, projs, depths, dists
+
 
 class Frame(FrameBase):
     """
@@ -328,6 +392,10 @@ class Frame(FrameBase):
         self.points = [None] * n
         self.outliers = np.zeros(n, dtype=bool)
         self.idxs = np.arange(n, dtype=np.int32)
+        self.octaves = np.array([max(0, int(getattr(kp, 'octave', 0))) for kp in self.kps], dtype=np.int32)
+        self.angles = np.array([float(getattr(kp, 'angle', -1.0)) for kp in self.kps], dtype=np.float32)
+        self.kps_ur = self.uRs
+        self.kd = make_kdtree_from_keypoints(self.kps)
         self.ensure_contiguous_arrays()
 
     def set_img_right(self, img_right: np.ndarray, mask=None) -> None:

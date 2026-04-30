@@ -25,6 +25,9 @@ from visual_slam.orbslam.slam.map_point import MapPointBase, MapPoint
 from visual_slam.orbslam.slam.keyframe import KeyFrameGraph, KeyFrame
 from visual_slam.orbslam.slam.map import Map, LocalCovisibilityMap, OrderedSetLite, MapStateData
 from visual_slam.orbslam.slam.optimizer_g2o import OptimizerResult, pose_optimization, bundle_adjustment, local_bundle_adjustment, global_bundle_adjustment
+from visual_slam.orbslam.slam.motion_model import MotionModelBase, MotionModel, MotionModelDamping
+from visual_slam.orbslam.slam.rotation_histogram import RotationHistogram
+from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher, EpipolarMatcher
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -60,6 +63,12 @@ __all__ = [
     "bundle_adjustment",
     "local_bundle_adjustment",
     "global_bundle_adjustment",
+    "MotionModelBase",
+    "MotionModel",
+    "MotionModelDamping",
+    "RotationHistogram",
+    "ProjectionMatcher",
+    "EpipolarMatcher",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",

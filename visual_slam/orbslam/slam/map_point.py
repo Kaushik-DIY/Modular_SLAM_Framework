@@ -626,6 +626,33 @@ class MapPoint(MapPointBase):
         replacement.update_info()
         self.set_bad()
 
+
+    def min_des_distance(self, descriptor: np.ndarray) -> float:
+        """Minimum descriptor distance to this point's distinctive descriptor."""
+        if self.des is None:
+            return float("inf")
+
+        descriptor_distance = FeatureTrackerShared.descriptor_distance
+        if descriptor_distance is None:
+            descriptor_distance = lambda a, b: cv2.norm(a, b, cv2.NORM_HAMMING)
+
+        return float(descriptor_distance(self.des, np.asarray(descriptor, dtype=np.uint8)))
+
+    @staticmethod
+    def predict_detection_levels(points, dists) -> np.ndarray:
+        feature_manager = FeatureTrackerShared.feature_manager
+        if feature_manager is None:
+            return np.zeros(len(points), dtype=np.int32)
+
+        levels = []
+        for point, dist in zip(points, dists):
+            if point is None:
+                levels.append(0)
+            else:
+                levels.append(point.predict_scale(float(dist), None))
+
+        return np.asarray(levels, dtype=np.int32)
+
     def get_replaced(self):
         with self._lock_features:
             return self.replacement
