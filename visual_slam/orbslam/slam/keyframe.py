@@ -26,7 +26,7 @@ Excluded for now:
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
-from threading import Lock
+from threading import RLock, Lock
 from typing import Optional
 
 import numpy as np
@@ -40,6 +40,7 @@ class KeyFrameGraph:
     """pySLAM-like graph container for a keyframe."""
 
     def __init__(self):
+        self._lock_features = RLock()
         self._lock_connections = Lock()
 
         # Spanning tree
@@ -274,6 +275,8 @@ class KeyFrame(Frame, KeyFrameGraph):
 
     def init_observations(self) -> None:
         """Associate all currently matched map points as keyframe observations."""
+        if not hasattr(self, "_lock_features"):
+            self._lock_features = RLock()
         with self._lock_features:
             points = list(self.points)
 

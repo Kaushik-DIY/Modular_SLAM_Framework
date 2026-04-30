@@ -354,6 +354,10 @@ class Frame(FrameBase):
 
         self.kd = None
         self._is_deleted = False
+        self.is_keyframe = False
+        self.kf_ref = None
+        self.is_blurry = False
+        self.laplacian_var = None
 
         if img is not None:
             self.extract_features(mask=mask)
@@ -468,6 +472,54 @@ class Frame(FrameBase):
     def reset_points(self) -> None:
         self.points = [None] * len(self.kps)
         self.outliers = np.zeros(len(self.kps), dtype=bool)
+
+    def remove_frame_views(self, idxs=None) -> int:
+        if idxs is None:
+            idxs = range(len(self.points))
+        idxs = list(np.asarray(idxs, dtype=np.int32).reshape(-1))
+
+        count = 0
+        for idx in idxs:
+            if idx < 0 or idx >= len(self.points):
+                continue
+            p = self.points[idx]
+            if p is not None:
+                try:
+                    p.remove_frame_view(self, idx)
+                except Exception:
+                    self.points[idx] = None
+                count += 1
+        return count
+
+    def clean_outlier_map_points(self) -> int:
+        num_valid = 0
+
+        for idx, p in enumerate(list(self.points)):
+            if p is None:
+                continue
+
+            is_outlier = idx < len(self.outliers) and bool(self.outliers[idx])
+            is_bad = hasattr(p, "is_bad") and p.is_bad()
+
+            if is_outlier or is_bad:
+                try:
+                    p.remove_frame_view(self, idx)
+                except Exception:
+                    self.points[idx] = None
+            else:
+                num_valid += 1
+
+        return num_valid
+
+    def clean_bad_map_points(self) -> int:
+        removed = 0
+
+        for idx, p in enumerate(list(self.points)):
+            if p is not None and hasattr(p, "is_bad") and p.is_bad():
+                self.points[idx] = None
+                removed += 1
+
+        return removed
 
     def get_points(self):
         return [p for p in self.points if p is not None]

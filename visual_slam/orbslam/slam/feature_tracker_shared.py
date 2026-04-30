@@ -32,15 +32,18 @@ class SlamFeatureManagerInfo:
     def __init__(self, slam=None, feature_manager: "FeatureManager | None" = None):
         self.feature_descriptor_type = None
         self.feature_descriptor_norm_type = None
+        self.max_descriptor_distance = None
 
         if slam is not None:
             assert slam.feature_tracker is not None
             assert slam.feature_tracker.feature_manager is not None
             self.feature_descriptor_type = slam.feature_tracker.feature_manager.descriptor_type
             self.feature_descriptor_norm_type = slam.feature_tracker.feature_manager.norm_type
+            self.max_descriptor_distance = slam.feature_tracker.feature_manager.max_descriptor_distance
         elif feature_manager is not None:
             self.feature_descriptor_type = feature_manager.descriptor_type
             self.feature_descriptor_norm_type = feature_manager.norm_type
+            self.max_descriptor_distance = feature_manager.max_descriptor_distance
 
 
 class FeatureTrackerShared:
@@ -71,7 +74,10 @@ class FeatureTrackerShared:
         FeatureTrackerShared.descriptor_distances = feature_tracker.feature_manager.descriptor_distances
         FeatureTrackerShared.oriented_features = feature_tracker.feature_manager.oriented_features
 
-        Parameters.kMaxDescriptorDistance = 100
+        if hasattr(FeatureTrackerShared.feature_manager, "max_descriptor_distance"):
+            Parameters.kMaxDescriptorDistance = int(FeatureTrackerShared.feature_manager.max_descriptor_distance)
+        else:
+            Parameters.kMaxDescriptorDistance = 100
 
     @staticmethod
     def set_feature_tracker_right(feature_tracker, force: bool = False) -> None:

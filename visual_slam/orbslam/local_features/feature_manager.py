@@ -59,6 +59,24 @@ def hamming_distances(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
+def _default_max_descriptor_distance(descriptor_type) -> int:
+    """
+    pySLAM/ORB-SLAM-style descriptor acceptance threshold.
+
+    ORB/ORB2 uses Hamming distance. ORB-SLAM commonly uses TH_HIGH=100 and
+    TH_LOW=50. pySLAM uses the feature manager to initialize the global
+    Parameters.kMaxDescriptorDistance at runtime.
+    """
+    name = getattr(descriptor_type, "name", str(descriptor_type)).upper()
+
+    if "ORB" in name or "BRISK" in name or "AKAZE" in name:
+        return 100
+
+    # Conservative fallback for float descriptors; not used for ORB/RGB-D target.
+    return 0
+
+
+
 class FeatureManager:
     def __init__(
         self,
@@ -81,6 +99,7 @@ class FeatureManager:
         self.sigma_level0 = float(sigma_level0)
         self.detector_type = detector_type
         self.descriptor_type = descriptor_type
+        self.max_descriptor_distance = _default_max_descriptor_distance(descriptor_type)
         self.norm_type = cv2.NORM_HAMMING
         self.oriented_features = FeatureInfo.is_oriented_features(detector_type)
         self.deterministic = bool(deterministic)

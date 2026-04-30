@@ -29,6 +29,7 @@ from visual_slam.orbslam.slam.motion_model import MotionModelBase, MotionModel, 
 from visual_slam.orbslam.slam.rotation_histogram import RotationHistogram
 from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher, EpipolarMatcher
 from visual_slam.orbslam.slam.tracking_core import TrackingCore
+from visual_slam.orbslam.slam.tracking import TrackingHistory, Tracking
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -71,6 +72,8 @@ __all__ = [
     "ProjectionMatcher",
     "EpipolarMatcher",
     "TrackingCore",
+    "TrackingHistory",
+    "Tracking",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",
