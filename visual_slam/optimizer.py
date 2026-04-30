@@ -179,6 +179,190 @@ def motion_only_ba(
     return optimized_pose
 
 
+
+
+# ===========================================================================
+# ORB-SLAM-style Motion-Only Bundle Adjustment
+# ===========================================================================
+
+def motion_only_ba_orbslam_style(
+    frame: Frame,
+    camera: CameraIntrinsics,
+    iterations: int = 10,
+    min_edges: int = 10,
+    outlier_chi2: float = 5.991,
+    remove_outliers: bool = True,
+) -> Optional[Pose3D]:
+    """
+    ORB-SLAM/pySLAM-style motion-only BA with the workspace g2o API.
+
+    Important pose convention:
+    - frame.pose_world is T_world_from_camera (Twc), used by the current
+      tracking code.
+    - g2o reprojection edges use T_camera_from_world (Tcw).
+    - Therefore this function optimizes Tcw internally and returns Twc.
+
+    This function is intentionally separate from motion_only_ba() so that it
+    can be tested and integrated incrementally.
+    """
+    if g2o is None:
+        print("ERROR: g2o not available for motion_only_ba_orbslam_style")
+        return None
+
+    if frame.pose_world is None:
+        print("ERROR: Frame has no initial pose")
+        return None
+
+    if not hasattr(frame, "map_point_matches") or not hasattr(frame, "keypoints"):
+        print("ERROR: Frame missing map_point_matches/keypoints")
+        return None
+
+    from visual_slam.g2o_compat import (
+        G2OCamera,
+        add_camera_parameters,
+        add_mono_edge,
+        add_point_vertex,
+        add_pose_vertex,
+        make_optimizer,
+        optimize,
+    )
+
+    # Your current frame pose convention is Twc.
+    Twc_init = np.asarray(frame.pose_world.matrix(), dtype=np.float64)
+    if Twc_init.shape != (4, 4) or not np.all(np.isfinite(Twc_init)):
+        print("ERROR: Invalid initial frame pose")
+        return None
+
+    # g2o projection edges expect Tcw.
+    Tcw_init = np.linalg.inv(Twc_init)
+
+    bf = float(getattr(camera, "bf", 0.0) or 0.0)
+    g2o_cam = G2OCamera(
+        fx=float(camera.fx),
+        fy=float(camera.fy),
+        cx=float(camera.cx),
+        cy=float(camera.cy),
+        bf=bf,
+    )
+
+    optimizer = make_optimizer(verbose=False)
+    add_camera_parameters(optimizer, g2o_cam, parameter_id=0)
+
+    pose_vertex = add_pose_vertex(
+        optimizer=optimizer,
+        vertex_id=0,
+        Tcw=Tcw_init,
+        fixed=False,
+    )
+
+    edges = []
+    vertex_id = 1
+    edge_id = 0
+
+    n = min(len(frame.map_point_matches), len(frame.keypoints))
+
+    for i in range(n):
+        mp = frame.map_point_matches[i]
+        if mp is None or getattr(mp, "is_bad", False):
+            continue
+
+        point_w = np.asarray(mp.position_world, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(point_w)):
+            continue
+
+        kp = frame.keypoints[i]
+        uv = np.array([kp.pt[0], kp.pt[1]], dtype=np.float64)
+        if not np.all(np.isfinite(uv)):
+            continue
+
+        octave = int(getattr(kp, "octave", 0))
+        octave = max(octave, 0)
+
+        # Temporary ORB-SLAM-like scale weighting.
+        # Later this should come from FeatureTrackerShared.feature_manager.
+        scale_factor = 1.2
+        sigma2 = scale_factor ** (2.0 * octave)
+        inv_sigma2 = 1.0 / sigma2
+
+        point_vertex = add_point_vertex(
+            optimizer=optimizer,
+            vertex_id=vertex_id,
+            point_w=point_w,
+            fixed=True,
+            marginalized=True,
+        )
+
+        edge = add_mono_edge(
+            optimizer=optimizer,
+            edge_id=edge_id,
+            point_vertex=point_vertex,
+            pose_vertex=pose_vertex,
+            uv=uv,
+            inv_sigma2=inv_sigma2,
+            parameter_id=0,
+            huber_delta=np.sqrt(outlier_chi2),
+        )
+
+        edges.append((edge, i))
+        vertex_id += 1
+        edge_id += 1
+
+    if len(edges) < min_edges:
+        print(
+            f"WARNING: Not enough reprojection edges for "
+            f"motion_only_ba_orbslam_style: {len(edges)} < {min_edges}"
+        )
+        return None
+
+    try:
+        optimize(optimizer, iterations=iterations, verbose=False)
+    except Exception as exc:
+        print(f"ERROR: motion_only_ba_orbslam_style optimization failed: {exc}")
+        return None
+
+    # Basic outlier classification after optimization.
+    inliers = []
+    outliers = []
+
+    for edge, idx in edges:
+        chi2 = float(edge.chi2())
+        if np.isfinite(chi2) and chi2 <= outlier_chi2:
+            inliers.append((edge, idx))
+        else:
+            outliers.append((edge, idx))
+
+    if len(inliers) < min_edges:
+        print(
+            f"WARNING: Not enough inliers after "
+            f"motion_only_ba_orbslam_style: {len(inliers)} < {min_edges}"
+        )
+        return None
+
+    if remove_outliers:
+        for _, idx in outliers:
+            if idx < len(frame.map_point_matches):
+                frame.map_point_matches[idx] = None
+
+    se3_opt = pose_vertex.estimate()
+
+    Tcw_opt = np.eye(4, dtype=np.float64)
+    Tcw_opt[:3, :3] = se3_opt.rotation().matrix()
+    Tcw_opt[:3, 3] = se3_opt.translation()
+
+    if not np.all(np.isfinite(Tcw_opt)):
+        print("ERROR: Optimized Tcw has NaN/Inf")
+        return None
+
+    # Return Twc, because the rest of your visual_slam tracking uses Twc.
+    Twc_opt = np.linalg.inv(Tcw_opt)
+
+    if not np.all(np.isfinite(Twc_opt)):
+        print("ERROR: Optimized Twc has NaN/Inf")
+        return None
+
+    return g2o.Isometry3d(Twc_opt)
+
+
 # ===========================================================================
 # Local Bundle Adjustment
 # ===========================================================================
