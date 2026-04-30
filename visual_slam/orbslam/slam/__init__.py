@@ -24,6 +24,7 @@ from visual_slam.orbslam.slam.frame import FrameBase, Frame, detect_and_compute,
 from visual_slam.orbslam.slam.map_point import MapPointBase, MapPoint
 from visual_slam.orbslam.slam.keyframe import KeyFrameGraph, KeyFrame
 from visual_slam.orbslam.slam.map import Map, LocalCovisibilityMap, OrderedSetLite, MapStateData
+from visual_slam.orbslam.slam.optimizer_g2o import OptimizerResult, pose_optimization, bundle_adjustment, local_bundle_adjustment, global_bundle_adjustment
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -54,6 +55,11 @@ __all__ = [
     "LocalCovisibilityMap",
     "OrderedSetLite",
     "MapStateData",
+    "OptimizerResult",
+    "pose_optimization",
+    "bundle_adjustment",
+    "local_bundle_adjustment",
+    "global_bundle_adjustment",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",
