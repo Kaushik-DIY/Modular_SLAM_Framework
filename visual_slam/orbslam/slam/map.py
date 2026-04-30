@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Iterable, Optional
 
+import numpy as np
+
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.frame import Frame
 from visual_slam.orbslam.slam.keyframe import KeyFrame
@@ -399,6 +401,37 @@ class Map:
         return self.local_map.get_points()
 
     # ------------------------------------------------------------------
+
+    def add_stereo_points(self, pts3d, pts3d_mask, f, kf, idxs, img=None) -> int:
+        """
+        pySLAM-compatible helper used by TrackingCore.
+
+        Creates RGB-D/stereo map points from valid 3D coordinates and attaches
+        them to the new keyframe observations.
+        """
+        count = 0
+        idxs = list(np.asarray(idxs, dtype=np.int32).reshape(-1))
+
+        for p, is_valid, idx in zip(pts3d, pts3d_mask, idxs):
+            if not bool(is_valid):
+                continue
+            if idx < 0 or idx >= len(kf.points):
+                continue
+
+            existing = kf.points[idx]
+            if existing is not None and existing.num_observations() > 0:
+                continue
+
+            mp = MapPoint(np.asarray(p, dtype=np.float64).reshape(3), keyframe=kf, idx=int(idx))
+            self.add_point(mp)
+
+            if f is not None and hasattr(f, "points") and idx < len(f.points):
+                f.points[idx] = mp
+
+            mp.update_info()
+            count += 1
+
+        return count
 
     def __repr__(self) -> str:
         return (

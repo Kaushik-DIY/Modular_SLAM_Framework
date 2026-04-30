@@ -394,6 +394,8 @@ class Frame(FrameBase):
         self.idxs = np.arange(n, dtype=np.int32)
         self.octaves = np.array([max(0, int(getattr(kp, 'octave', 0))) for kp in self.kps], dtype=np.int32)
         self.angles = np.array([float(getattr(kp, 'angle', -1.0)) for kp in self.kps], dtype=np.float32)
+        pts = np.array([kp.pt for kp in self.kps], dtype=np.float64).reshape(-1, 2)
+        self.kpsn = self.camera.unproject_points(pts) if len(pts) > 0 else np.empty((0, 2), dtype=np.float64)
         self.kps_ur = self.uRs
         self.kd = make_kdtree_from_keypoints(self.kps)
         self.ensure_contiguous_arrays()
@@ -494,6 +496,45 @@ class Frame(FrameBase):
     def get_matched_good_points_and_idxs(self):
         idxs = self.get_matched_good_points_idxs()
         return [self.points[i] for i in idxs], idxs
+
+    def unproject_points(self, idxs):
+        idxs = np.asarray(idxs, dtype=np.int32).reshape(-1)
+        pts = np.array([self.kpsu[int(i)].pt for i in idxs], dtype=np.float64).reshape(-1, 2)
+        return self.camera.unproject_points(pts)
+
+    def unproject_points_3d(self, idxs, transform_in_world: bool = True):
+        idxs = np.asarray(idxs, dtype=np.int32).reshape(-1)
+
+        pts3d = np.zeros((len(idxs), 3), dtype=np.float64)
+        valid = np.zeros(len(idxs), dtype=bool)
+
+        if len(idxs) == 0:
+            return pts3d, valid
+
+        for out_i, idx in enumerate(idxs):
+            if idx < 0 or idx >= len(self.kpsu):
+                continue
+            if idx >= len(self.depths):
+                continue
+
+            depth = float(self.depths[idx])
+            if not np.isfinite(depth) or depth <= kMinDepth:
+                continue
+
+            uv = np.array(self.kpsu[idx].pt, dtype=np.float64)
+            pc = self.camera.unproject_3d(uv, depth)
+
+            if transform_in_world:
+                Rwc = self.Rwc()
+                Ow = self.Ow()
+                pw = Rwc @ pc.reshape(3) + Ow.reshape(3)
+                pts3d[out_i] = pw
+            else:
+                pts3d[out_i] = pc.reshape(3)
+
+            valid[out_i] = True
+
+        return pts3d, valid
 
     def delete(self) -> None:
         self._is_deleted = True
