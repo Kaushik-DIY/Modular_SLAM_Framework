@@ -21,6 +21,7 @@ from visual_slam.orbslam.slam.camera_pose import CameraPose
 from visual_slam.orbslam.slam.camera import CameraType, CameraUtils, Camera, PinholeCamera, fov2focal, focal2fov
 from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared, SlamFeatureManagerInfo
 from visual_slam.orbslam.slam.frame import FrameBase, Frame, detect_and_compute, match_frames, are_map_points_visible_in_frame
+from visual_slam.orbslam.slam.map_point import MapPointBase, MapPoint
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -43,6 +44,8 @@ __all__ = [
     "detect_and_compute",
     "match_frames",
     "are_map_points_visible_in_frame",
+    "MapPointBase",
+    "MapPoint",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",
