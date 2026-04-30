@@ -22,6 +22,7 @@ from visual_slam.orbslam.slam.camera import CameraType, CameraUtils, Camera, Pin
 from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared, SlamFeatureManagerInfo
 from visual_slam.orbslam.slam.frame import FrameBase, Frame, detect_and_compute, match_frames, are_map_points_visible_in_frame
 from visual_slam.orbslam.slam.map_point import MapPointBase, MapPoint
+from visual_slam.orbslam.slam.keyframe import KeyFrameGraph, KeyFrame
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -46,6 +47,8 @@ __all__ = [
     "are_map_points_visible_in_frame",
     "MapPointBase",
     "MapPoint",
+    "KeyFrameGraph",
+    "KeyFrame",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",
