@@ -19,6 +19,7 @@ from visual_slam.orbslam.slam.slam_commons import SlamState
 from visual_slam.orbslam.slam.config_parameters import Parameters, OrbSlamSettings
 from visual_slam.orbslam.slam.camera_pose import CameraPose
 from visual_slam.orbslam.slam.camera import CameraType, CameraUtils, Camera, PinholeCamera, fov2focal, focal2fov
+from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared, SlamFeatureManagerInfo
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -34,6 +35,8 @@ __all__ = [
     "PinholeCamera",
     "fov2focal",
     "focal2fov",
+    "FeatureTrackerShared",
+    "SlamFeatureManagerInfo",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",
