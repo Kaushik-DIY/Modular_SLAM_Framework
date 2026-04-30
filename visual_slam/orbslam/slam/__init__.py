@@ -30,6 +30,8 @@ from visual_slam.orbslam.slam.rotation_histogram import RotationHistogram
 from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher, EpipolarMatcher
 from visual_slam.orbslam.slam.tracking_core import TrackingCore
 from visual_slam.orbslam.slam.tracking import TrackingHistory, Tracking
+from visual_slam.orbslam.slam.local_mapping_core import LocalMappingCore
+from visual_slam.orbslam.slam.local_mapping import LocalMapping
 
 __all__ = [
     "DatasetEnvironmentType",
@@ -74,6 +76,8 @@ __all__ = [
     "TrackingCore",
     "TrackingHistory",
     "Tracking",
+    "LocalMappingCore",
+    "LocalMapping",
     "get_sensor_type",
     "is_depth_available",
     "is_monocular",

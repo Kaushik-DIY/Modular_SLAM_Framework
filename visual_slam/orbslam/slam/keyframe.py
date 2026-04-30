@@ -409,3 +409,61 @@ class KeyFrame(Frame, KeyFrameGraph):
 
     def __repr__(self) -> str:
         return f"KeyFrame(kid={self.kid}, frame_id={self.id}, kps={len(self.kps)}, bad={self._is_bad})"
+
+    def get_matched_good_points_and_idxs(self):
+        """
+        Return pySLAM-compatible matched good point/index pairs.
+
+        pySLAM LocalMappingCore expects:
+            for p, idx in keyframe.get_matched_good_points_and_idxs():
+                ...
+
+        Therefore this method must return a list of (MapPoint, keypoint_idx)
+        tuples, not a tuple of separate lists.
+        """
+        pairs = []
+
+        points = self.get_points() if hasattr(self, "get_points") else getattr(self, "points", [])
+        outliers = getattr(self, "outliers", None)
+
+        for idx, p in enumerate(points):
+            if p is None:
+                continue
+            if hasattr(p, "is_bad") and p.is_bad():
+                continue
+            if outliers is not None and idx < len(outliers) and bool(outliers[idx]):
+                continue
+            pairs.append((p, idx))
+
+        return pairs
+
+
+    def get_matched_good_points(self):
+        """Return non-bad matched map points, pySLAM-compatible."""
+        return [p for p, _ in self.get_matched_good_points_and_idxs()]
+
+
+    def get_matched_good_points_idxs(self):
+        """Return indices of non-bad matched map points, pySLAM-compatible."""
+        return [idx for _, idx in self.get_matched_good_points_and_idxs()]
+
+
+    def num_tracked_points(self, min_num_observations=0):
+        """
+        Count tracked map points with at least min_num_observations.
+
+        This is required by pySLAM LocalMappingCore.local_BA().
+        """
+        count = 0
+
+        for p, _ in self.get_matched_good_points_and_idxs():
+            if p is None:
+                continue
+            if hasattr(p, "is_bad") and p.is_bad():
+                continue
+            if min_num_observations > 0 and p.num_observations() < min_num_observations:
+                continue
+            count += 1
+
+        return count
+

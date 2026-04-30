@@ -35,6 +35,7 @@ from visual_slam.orbslam.slam.frame import (
 from visual_slam.orbslam.slam.keyframe import KeyFrame
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.rotation_histogram import RotationHistogram
+from visual_slam.orbslam.utilities.geom_2views import computeF12, check_dist_epipolar_line
 
 
 kCheckFeaturesOrientation = Parameters.kCheckFeaturesOrientation
@@ -80,8 +81,111 @@ class ProjectionMatcher:
 
 class EpipolarMatcher:
     @staticmethod
-    def search_frame_for_triangulation(*args, **kwargs):
-        raise NotImplementedError("Epipolar triangulation matcher is ported with tracking/local mapping.")
+    def search_frame_for_triangulation(
+        f1,
+        f2,
+        idxs1=None,
+        idxs2=None,
+        max_descriptor_distance=None,
+        is_monocular=True,
+    ):
+        """
+        pySLAM-aligned epipolar matcher used by local mapping triangulation.
+
+        It returns only matches where both keypoints currently have no assigned
+        map point, which is the intended local-mapping triangulation input.
+        """
+        ensure_frame_feature_arrays(f1)
+        ensure_frame_feature_arrays(f2)
+
+        max_descriptor_distance = _max_descriptor_distance(max_descriptor_distance)
+
+        candidate1 = np.array(
+            [i for i, p in enumerate(f1.points) if p is None],
+            dtype=np.int32,
+        )
+        candidate2 = np.array(
+            [i for i, p in enumerate(f2.points) if p is None],
+            dtype=np.int32,
+        )
+
+        if idxs1 is not None and idxs2 is not None:
+            idxs1 = np.asarray(idxs1, dtype=np.int32).reshape(-1)
+            idxs2 = np.asarray(idxs2, dtype=np.int32).reshape(-1)
+
+            if len(idxs1) != len(idxs2):
+                return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+
+            pair_candidates = [
+                (int(i1), int(i2))
+                for i1, i2 in zip(idxs1, idxs2)
+                if i1 in set(candidate1) and i2 in set(candidate2)
+            ]
+        else:
+            if len(candidate1) == 0 or len(candidate2) == 0:
+                return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+
+            matches = FeatureTrackerShared.feature_matcher.match(
+                f1.img,
+                f2.img,
+                f1.des[candidate1],
+                f2.des[candidate2],
+                kps1=[f1.kps[i] for i in candidate1],
+                kps2=[f2.kps[i] for i in candidate2],
+            )
+
+            if matches.idxs1 is None or matches.idxs2 is None:
+                return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+
+            pair_candidates = [
+                (int(candidate1[i1]), int(candidate2[i2]))
+                for i1, i2 in zip(matches.idxs1, matches.idxs2)
+            ]
+
+        if len(pair_candidates) == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+
+        F12, _ = computeF12(f1, f2)
+
+        out1 = []
+        out2 = []
+
+        level_sigmas2 = FeatureTrackerShared.feature_manager.level_sigmas2
+
+        for i1, i2 in pair_candidates:
+            if i1 < 0 or i1 >= len(f1.des) or i2 < 0 or i2 >= len(f2.des):
+                continue
+
+            d = FeatureTrackerShared.descriptor_distance(f1.des[i1], f2.des[i2])
+            if d > max_descriptor_distance:
+                continue
+
+            octave2 = max(0, min(int(f2.octaves[i2]), len(level_sigmas2) - 1))
+            sigma2 = float(level_sigmas2[octave2])
+
+            if not check_dist_epipolar_line(f1.kpsu[i1].pt, f2.kpsu[i2].pt, F12, sigma2):
+                continue
+
+            out1.append(i1)
+            out2.append(i2)
+
+        if len(out1) == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+
+        idxs1_out = np.asarray(out1, dtype=np.int32)
+        idxs2_out = np.asarray(out2, dtype=np.int32)
+
+        if FeatureTrackerShared.oriented_features:
+            valid = RotationHistogram.filter_matches_with_histogram_orientation(
+                idxs1_out,
+                idxs2_out,
+                f1.angles,
+                f2.angles,
+            )
+            idxs1_out = idxs1_out[valid]
+            idxs2_out = idxs2_out[valid]
+
+        return idxs1_out, idxs2_out, len(idxs1_out)
 
 
 def _max_descriptor_distance(value):

@@ -38,6 +38,7 @@ from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.frame import Frame
 from visual_slam.orbslam.slam.keyframe import KeyFrame
 from visual_slam.orbslam.slam.map_point import MapPoint
+from visual_slam.orbslam.slam.optimizer_g2o import local_bundle_adjustment, global_bundle_adjustment
 
 kMaxLenFrameDeque = 20
 
@@ -401,6 +402,87 @@ class Map:
         return self.local_map.get_points()
 
     # ------------------------------------------------------------------
+
+    def locally_optimize(self, kf_ref, abort_flag=None, mp_abort_flag=None):
+        """
+        pySLAM-compatible map local optimization hook.
+
+        pySLAM LocalMappingCore calls map.locally_optimize(kf_ref=...).
+        This port routes it to the g2o local_bundle_adjustment implementation.
+        """
+        result = local_bundle_adjustment(kf_ref, abort_flag=abort_flag)
+        return result.mean_squared_error
+
+    def optimize(self, local_window_size=None, abort_flag=None):
+        """
+        pySLAM-compatible global/large-window optimization hook.
+
+        Returns:
+            (mse, result_dict)
+        """
+        keyframes = self.get_keyframes().to_list() if hasattr(self.get_keyframes(), "to_list") else list(self.get_keyframes())
+        points = self.get_points().to_list() if hasattr(self.get_points(), "to_list") else list(self.get_points())
+
+        return global_bundle_adjustment(
+            keyframes=keyframes,
+            points=points,
+            rounds=10,
+            result_dict={},
+        )
+
+    def add_points(
+        self,
+        pts3d,
+        pts3d_mask,
+        kf1,
+        kf2,
+        idxs1,
+        idxs2,
+        img=None,
+        do_check=True,
+        far_points_threshold=None,
+    ):
+        """
+        pySLAM-compatible triangulated map-point insertion.
+
+        Returns:
+            (num_added, mask_added, list_added_points)
+        """
+        pts3d = np.asarray(pts3d, dtype=np.float64).reshape(-1, 3)
+        pts3d_mask = np.asarray(pts3d_mask, dtype=bool).reshape(-1)
+        idxs1 = np.asarray(idxs1, dtype=np.int32).reshape(-1)
+        idxs2 = np.asarray(idxs2, dtype=np.int32).reshape(-1)
+
+        added_mask = np.zeros(len(pts3d), dtype=bool)
+        list_added_points = []
+
+        for i, (pw, is_valid, idx1, idx2) in enumerate(zip(pts3d, pts3d_mask, idxs1, idxs2)):
+            if not bool(is_valid):
+                continue
+
+            if idx1 < 0 or idx1 >= len(kf1.points):
+                continue
+            if idx2 < 0 or idx2 >= len(kf2.points):
+                continue
+
+            if kf1.points[idx1] is not None or kf2.points[idx2] is not None:
+                continue
+
+            if far_points_threshold is not None:
+                d1 = np.linalg.norm(pw - kf1.Ow().reshape(3))
+                d2 = np.linalg.norm(pw - kf2.Ow().reshape(3))
+                if d1 > far_points_threshold or d2 > far_points_threshold:
+                    continue
+
+            mp = MapPoint(pw, keyframe=kf1, idx=int(idx1))
+            mp.add_observation(kf2, int(idx2))
+            self.add_point(mp)
+            mp.update_info()
+
+            added_mask[i] = True
+            list_added_points.append(mp)
+
+        return len(list_added_points), added_mask, list_added_points
 
     def add_stereo_points(self, pts3d, pts3d_mask, f, kf, idxs, img=None) -> int:
         """

@@ -32,4 +32,7 @@ __all__ = [
     "computeF12_",
     "estimate_pose_ess_mat",
     "Printer",
+    "triangulate_normalized_points",
 ]
+
+from visual_slam.orbslam.utilities.geom_triangulation import triangulate_normalized_points
