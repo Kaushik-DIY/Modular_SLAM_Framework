@@ -31,4 +31,6 @@ outputs/
 Thumbs.db
 
 # Jupyter
-.ipynb_checkpoints/
+.ipynb_checkpoints/visual_slam_outputs/
+visual_slam_outputs/
+third_party/pyslam_reference/
