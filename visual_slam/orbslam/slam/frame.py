@@ -533,37 +533,21 @@ class Frame(FrameBase):
     def get_unmatched_points_idxs(self) -> np.ndarray:
         return np.array([i for i, p in enumerate(self.points) if p is None], dtype=np.int32)
 
-    def get_matched_good_points(self):
-        """Return non-bad matched map points, pySLAM-compatible."""
-        return [p for p, _ in self.get_matched_good_points_and_idxs()]
-
-
-    def get_matched_good_points_idxs(self) -> np.ndarray:
-        return np.array(
-            [i for i, p in enumerate(self.points) if p is not None and not self.outliers[i]],
-            dtype=np.int32,
-        )
-
-    def get_matched_inlier_points(self):
-        return self.get_matched_good_points()
 
     def get_matched_good_points_and_idxs(self):
         """
-        Return pySLAM-compatible matched good point/index pairs.
+        pySLAM-compatible matched good point/index pairs.
 
-        pySLAM LocalMappingCore expects:
-            for p, idx in keyframe.get_matched_good_points_and_idxs():
-                ...
+        Returns:
+            list[(MapPoint, keypoint_idx)]
 
-        Therefore this method must return a list of (MapPoint, keypoint_idx)
-        tuples, not a tuple of separate lists.
+        The index is the original keypoint index in self.points, not the compact
+        index of get_points().
         """
         pairs = []
-
-        points = self.get_points() if hasattr(self, "get_points") else getattr(self, "points", [])
         outliers = getattr(self, "outliers", None)
 
-        for idx, p in enumerate(points):
+        for idx, p in enumerate(getattr(self, "points", [])):
             if p is None:
                 continue
             if hasattr(p, "is_bad") and p.is_bad():
@@ -574,6 +558,87 @@ class Frame(FrameBase):
 
         return pairs
 
+    def get_matched_good_points(self):
+        """Return non-bad, non-outlier matched map points."""
+        return [p for p, _ in self.get_matched_good_points_and_idxs()]
+
+    def get_matched_good_points_idxs(self) -> np.ndarray:
+        """Return original keypoint indices of non-bad, non-outlier matched map points."""
+        return np.asarray(
+            [idx for _, idx in self.get_matched_good_points_and_idxs()],
+            dtype=np.int32,
+        )
+
+    def get_matched_inlier_points(self):
+        return self.get_matched_good_points()
+
+    def num_tracked_points(self, min_num_observations=0):
+        """
+        Count tracked map points with at least min_num_observations.
+
+        pySLAM local mapping uses this after local BA to evaluate how many
+        reference-keyframe points remain supported.
+        """
+        count = 0
+
+        for p, _ in self.get_matched_good_points_and_idxs():
+            if p is None:
+                continue
+            if hasattr(p, "is_bad") and p.is_bad():
+                continue
+            if min_num_observations > 0 and p.num_observations() < min_num_observations:
+                continue
+            count += 1
+
+        return count
+
+    def check_replaced_map_points(self):
+        """
+        Replace frame associations when a MapPoint has been substituted.
+
+        pySLAM calls this before tracking from the previous frame because local
+        mapping/fusion can replace map points between frames.
+        """
+        replaced = 0
+        points = getattr(self, "points", [])
+
+        for idx, p in enumerate(list(points)):
+            if p is None:
+                continue
+
+            replacement = None
+
+            if hasattr(p, "get_replaced"):
+                try:
+                    replacement = p.get_replaced()
+                except Exception:
+                    replacement = None
+            elif hasattr(p, "get_replacement"):
+                try:
+                    replacement = p.get_replacement()
+                except Exception:
+                    replacement = None
+            elif hasattr(p, "replacement"):
+                replacement = p.replacement
+
+            if replacement is None or replacement is p:
+                continue
+            if hasattr(replacement, "is_bad") and replacement.is_bad():
+                continue
+
+            points[idx] = replacement
+
+            try:
+                replacement.add_frame_view(self, idx)
+            except Exception:
+                # The point assignment above is still the important pySLAM-style
+                # frame-side replacement. add_frame_view may no-op if the
+                # replacement already owns the frame view.
+                pass
+
+            replaced += 1
+
+        return replaced
 
     def unproject_points(self, idxs):
         idxs = np.asarray(idxs, dtype=np.int32).reshape(-1)
@@ -676,28 +741,3 @@ def match_frames(frame_ref: Frame, frame_cur: Frame, ratio_test: float | None = 
         frame_cur.kps,
         ratio_test=ratio,
     )
-
-    def get_matched_good_points_idxs(self):
-        """Return indices of non-bad matched map points, pySLAM-compatible."""
-        return [idx for _, idx in self.get_matched_good_points_and_idxs()]
-
-
-    def num_tracked_points(self, min_num_observations=0):
-        """
-        Count tracked map points with at least min_num_observations.
-
-        This is required by pySLAM LocalMappingCore.local_BA().
-        """
-        count = 0
-
-        for p, _ in self.get_matched_good_points_and_idxs():
-            if p is None:
-                continue
-            if hasattr(p, "is_bad") and p.is_bad():
-                continue
-            if min_num_observations > 0 and p.num_observations() < min_num_observations:
-                continue
-            count += 1
-
-        return count
-
