@@ -30,6 +30,8 @@ import traceback
 from visual_slam.orbslam.local_features import create_orb2_feature_tracker
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
+from visual_slam.orbslam.slam.bow import load_default_vocabulary
+from visual_slam.orbslam.slam.keyframe_database import KeyFrameDatabase
 from visual_slam.orbslam.slam.local_mapping import LocalMapping
 from visual_slam.orbslam.slam.map import Map
 from visual_slam.orbslam.slam.sensor_types import SensorType
@@ -72,6 +74,10 @@ class Slam:
         headless: bool = True,
         viewer3d=None,
         start_local_mapping_thread: bool | None = None,
+        enable_loop_closing: bool = False,
+        enable_global_ba: bool = False,
+        global_ba_after_loop: bool | None = None,
+        global_ba_iterations: int = Parameters.kGlobalBAIterations,
     ):
         self.camera = camera
         self.feature_tracker_config = feature_tracker_config or {}
@@ -87,15 +93,25 @@ class Slam:
         self.init_feature_tracker(self.feature_tracker_config)
 
         self.map = Map()
+        self.bow_vocabulary = load_default_vocabulary()
+        self.keyframe_database = KeyFrameDatabase(self.bow_vocabulary)
 
         self.semantic_mapping = None
         self.loop_closing = None
         self.GBA = None
         self.GBA_on_demand = None
+        self.enable_global_ba = bool(enable_global_ba)
+        self.global_ba_after_loop = bool(enable_global_ba if global_ba_after_loop is None else global_ba_after_loop)
+        self.global_ba_iterations = int(global_ba_iterations)
         self.volumetric_integrator = None
 
         self.local_mapping = LocalMapping(self)
         self.tracking = Tracking(self)
+
+        if enable_loop_closing:
+            from visual_slam.orbslam.slam.loop_closing import LoopClosing
+
+            self.loop_closing = LoopClosing(self, keyframe_database=self.keyframe_database)
 
         self.reset_requested = False
         self.has_quit = False
@@ -236,7 +252,14 @@ class Slam:
         self.tracking.state = state
 
     def bundle_adjust(self):
-        return self.map.optimize()
+        from visual_slam.orbslam.slam.global_ba import GlobalBundleAdjuster
+
+        adjuster = GlobalBundleAdjuster(
+            self.map,
+            rounds=self.global_ba_iterations,
+            use_robust_kernel=Parameters.kGBAUseRobustKernel,
+        )
+        return adjuster.run(loop_kf_id=0)
 
     def get_final_trajectory(self):
         """

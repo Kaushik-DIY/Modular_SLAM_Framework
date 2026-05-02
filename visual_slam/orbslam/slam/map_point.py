@@ -399,6 +399,11 @@ class MapPoint(MapPointBase):
         self.first_kid = -1
         self._last_update_time = 0.0
 
+        # pySLAM-compatible temporary Global BA fields.
+        self.pt_GBA = None
+        self.is_pt_GBA_valid = False
+        self.GBA_kf_id = 0
+
         if keyframe is not None and idx is not None:
             self.kf_ref = keyframe
             self.first_kid = int(getattr(keyframe, "kid", getattr(keyframe, "id", -1)))
@@ -430,7 +435,7 @@ class MapPoint(MapPointBase):
 
     def set_position(self, position: np.ndarray) -> None:
         with self._lock_pos:
-            self._position = np.asarray(position, dtype=np.float64).reshape(3)
+            self._position = np.array(position, dtype=np.float64, copy=True).reshape(3)
 
     def update_position(self, position: np.ndarray) -> None:
         self.set_position(position)
@@ -603,28 +608,50 @@ class MapPoint(MapPointBase):
     def replace_with(self, replacement: "MapPoint") -> None:
         if replacement is self:
             return
+        if replacement is None:
+            return
+        if hasattr(replacement, "is_bad") and replacement.is_bad():
+            return
 
         with self._lock_features:
+            if self._is_bad and self.replacement is replacement:
+                return
             observations = list(self._observations.items())
             frame_views = list(self._frame_views.items())
+            self._observations.clear()
+            self._frame_views.clear()
+            self._num_observations = 0
+            self._is_bad = True
             self.replacement = replacement
 
+            found = self.num_times_found
+            visible = self.num_times_visible
+
         for kf, idx in observations:
-            if not replacement.is_in_keyframe(kf):
-                replacement.add_observation(kf, idx)
+            if replacement.add_observation(kf, idx):
+                _set_point_match(kf, replacement, idx)
             else:
-                _remove_point_match(kf, idx)
+                if replacement.get_observation_idx(kf) == idx:
+                    _set_point_match(kf, replacement, idx)
+                else:
+                    _remove_point_match(kf, idx)
 
         for frame, idx in frame_views:
-            if not replacement.is_in_frame(frame):
+            if replacement.is_in_frame(frame):
+                _remove_point_match(frame, idx)
+            elif not getattr(frame, "is_keyframe", False):
                 replacement.add_frame_view(frame, idx)
             else:
                 _remove_point_match(frame, idx)
 
-        replacement.increase_found(self.num_times_found)
-        replacement.increase_visible(self.num_times_visible)
+        replacement.increase_found(found)
+        replacement.increase_visible(visible)
         replacement.update_info()
-        self.set_bad()
+
+        if self.map is not None:
+            remove_fn = getattr(self.map, "remove_point", None) or getattr(self.map, "remove_map_point", None)
+            if remove_fn is not None:
+                remove_fn(self)
 
 
     def min_des_distance(self, descriptor: np.ndarray) -> float:
@@ -656,6 +683,9 @@ class MapPoint(MapPointBase):
     def get_replaced(self):
         with self._lock_features:
             return self.replacement
+
+    def get_replacement(self):
+        return self.get_replaced()
 
     def delete(self) -> None:
         self.set_bad()

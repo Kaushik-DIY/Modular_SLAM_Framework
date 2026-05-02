@@ -178,9 +178,11 @@ class Parameters:
     # ================================================================
     # Global Bundle Adjustment
     # ================================================================
-    kUseGBA = True
+    kUseGBA = False
     kGBADebugAndPrintToFile = True
     kGBAUseRobustKernel = True
+    kGlobalBAIterations = 10
+    kGlobalBAMinInlierEdges = 10
 
     # ================================================================
     # Loop closing
@@ -202,6 +204,15 @@ class Parameters:
     kLoopClosingMinNumMatchedMapPoints = 40
     kLoopClosingMaxReprojectionDistanceFuse = 4
     kLoopClosingFeatureMatchRatioTest = 0.75
+
+    # RGB-D SE3 essential-graph weights. pySLAM's Sim3 graph uses identity
+    # information; this SE3 port keeps conservative non-identity weights to
+    # distinguish structural, covisible, and loop constraints.
+    kEssentialGraphSpanningTreeWeight = 1.0
+    kEssentialGraphCovisibilityWeightScale = 0.01
+    kEssentialGraphCovisibilityWeightMin = 0.5
+    kEssentialGraphCovisibilityWeightMax = 5.0
+    kEssentialGraphLoopEdgeWeight = 10.0
 
     # ================================================================
     # Relocalization

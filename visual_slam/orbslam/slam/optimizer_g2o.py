@@ -29,6 +29,7 @@ Important adaptation:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -59,6 +60,12 @@ class OptimizerResult:
     num_outliers: int
     mean_squared_error: float
     success: bool
+    mean_error_before: float = float("inf")
+    mean_error_after: float = float("inf")
+    num_keyframes: int = 0
+    num_map_points: int = 0
+    aborted: bool = False
+    reason: str = ""
 
 
 def _as_list(values) -> list:
@@ -77,6 +84,48 @@ def _is_bad_point(point: MapPoint) -> bool:
     return point is None or (hasattr(point, "is_bad") and point.is_bad())
 
 
+def _abort_requested(abort_flag) -> bool:
+    if abort_flag is None:
+        return False
+    value = getattr(abort_flag, "value", abort_flag)
+    if callable(value):
+        try:
+            value = value()
+        except TypeError:
+            pass
+    return bool(value)
+
+
+def _is_finite_pose(Tcw: np.ndarray) -> bool:
+    Tcw = np.asarray(Tcw, dtype=np.float64)
+    return Tcw.shape == (4, 4) and np.all(np.isfinite(Tcw))
+
+
+def _point_has_positive_depth(frame_or_kf, point_w: np.ndarray) -> bool:
+    try:
+        Tcw = np.asarray(frame_or_kf.Tcw(), dtype=np.float64).reshape(4, 4)
+    except Exception:
+        return False
+    point_w = np.asarray(point_w, dtype=np.float64).reshape(3)
+    if not (_is_finite_pose(Tcw) and np.all(np.isfinite(point_w))):
+        return False
+    point_c = Tcw[:3, :3] @ point_w + Tcw[:3, 3]
+    return bool(np.isfinite(point_c[2]) and point_c[2] > Parameters.kMinDepth)
+
+
+def _valid_observation(frame_or_kf, idx: int, point_w: np.ndarray) -> bool:
+    try:
+        uv = _get_observation_uv(frame_or_kf, idx)
+        ur = _get_observation_ur(frame_or_kf, idx)
+    except Exception:
+        return False
+    if uv.shape != (2,) or not np.all(np.isfinite(uv)):
+        return False
+    if ur >= 0.0 and not np.isfinite(ur):
+        return False
+    return _point_has_positive_depth(frame_or_kf, point_w)
+
+
 def _camera_to_g2o(camera) -> G2OCamera:
     bf = getattr(camera, "bf", 0.0)
     if bf is None:
@@ -91,11 +140,15 @@ def _camera_to_g2o(camera) -> G2OCamera:
 
 
 def _get_observation_uv(frame_or_kf, idx: int) -> np.ndarray:
-    kps = getattr(frame_or_kf, "kps", getattr(frame_or_kf, "keypoints", None))
+    kps = getattr(frame_or_kf, "kpsu", None)
+    if kps is None:
+        kps = getattr(frame_or_kf, "kps", getattr(frame_or_kf, "keypoints", None))
     if kps is None:
         raise ValueError("Frame/keyframe has no keypoints.")
     kp = kps[int(idx)]
-    return np.array([kp.pt[0], kp.pt[1]], dtype=np.float64)
+    if hasattr(kp, "pt"):
+        return np.array([kp.pt[0], kp.pt[1]], dtype=np.float64)
+    return np.asarray(kp, dtype=np.float64).reshape(2)
 
 
 def _get_observation_ur(frame_or_kf, idx: int) -> float:
@@ -131,6 +184,59 @@ def _extract_Tcw_from_pose_vertex(pose_vertex) -> np.ndarray:
 def _set_frame_pose_from_vertex(frame_or_kf, pose_vertex) -> None:
     Tcw = _extract_Tcw_from_pose_vertex(pose_vertex)
     frame_or_kf.update_pose(g2o.Isometry3d(Tcw))
+
+
+def _pose_vertex_point_depth(pose_vertex, point_vertex) -> float:
+    Tcw = _extract_Tcw_from_pose_vertex(pose_vertex)
+    point_w = np.asarray(point_vertex.estimate(), dtype=np.float64).reshape(3)
+    point_c = Tcw[:3, :3] @ point_w + Tcw[:3, 3]
+    return float(point_c[2])
+
+
+def _is_depth_positive(edge, pose_vertex, point_vertex) -> bool:
+    is_depth_positive = getattr(edge, "is_depth_positive", None)
+    if callable(is_depth_positive):
+        try:
+            return bool(is_depth_positive())
+        except Exception:
+            pass
+
+    # Binding adaptation: this workspace's g2o projection edges do not expose
+    # is_depth_positive(), so mirror pySLAM by checking optimized camera depth.
+    depth = _pose_vertex_point_depth(pose_vertex, point_vertex)
+    return bool(np.isfinite(depth) and depth > 0.0)
+
+
+def _manual_reprojection_chi2(frame_or_kf, idx: int, pose_vertex, point_vertex, is_stereo: bool) -> float:
+    Tcw = _extract_Tcw_from_pose_vertex(pose_vertex)
+    point_w = np.asarray(point_vertex.estimate(), dtype=np.float64).reshape(3)
+    point_c = Tcw[:3, :3] @ point_w + Tcw[:3, 3]
+
+    if not np.all(np.isfinite(point_c)):
+        return float("inf")
+
+    z = float(point_c[2])
+    if z <= 0.0:
+        return float("inf")
+
+    camera = frame_or_kf.camera
+    u = float(camera.fx) * float(point_c[0]) / z + float(camera.cx)
+    v = float(camera.fy) * float(point_c[1]) / z + float(camera.cy)
+
+    if not np.isfinite(u) or not np.isfinite(v):
+        return float("inf")
+
+    uv = _get_observation_uv(frame_or_kf, idx)
+    inv_sigma2 = _get_inv_sigma2(frame_or_kf, idx)
+    err2 = (u - float(uv[0])) ** 2 + (v - float(uv[1])) ** 2
+
+    if is_stereo:
+        ur_obs = _get_observation_ur(frame_or_kf, idx)
+        if ur_obs >= 0.0:
+            ur = u - float(getattr(camera, "bf", 0.0)) / z
+            err2 += (ur - ur_obs) ** 2
+
+    return float(err2 * inv_sigma2)
 
 
 def _add_reprojection_edge(
@@ -217,11 +323,14 @@ def pose_optimization(
     for idx, point in enumerate(points):
         if _is_bad_point(point):
             continue
+        point_w = point.get_position()
+        if not _valid_observation(frame, idx, point_w):
+            continue
 
         point_vertex = add_point_vertex(
             optimizer=optimizer,
             vertex_id=vertex_id,
-            point_w=point.get_position(),
+            point_w=point_w,
             fixed=True,
             marginalized=True,
         )
@@ -297,8 +406,12 @@ def _bundle_adjustment_core(
     fixed_points: bool = False,
     rounds: int = 10,
     use_robust_kernel: bool = False,
+    abort_flag=None,
+    map_lock=None,
     verbose: bool = False,
     result_dict: Optional[dict] = None,
+    write_back: bool = True,
+    prune_outliers: bool = False,
     print=print,
 ) -> OptimizerResult:
     local_keyframes = [kf for kf in local_keyframes if kf is not None and not _is_bad_keyframe(kf)]
@@ -306,51 +419,62 @@ def _bundle_adjustment_core(
     points = [p for p in points if not _is_bad_point(p)]
 
     if len(local_keyframes) == 0 or len(points) == 0:
-        return OptimizerResult(0, 0, 0, float("inf"), False)
+        return OptimizerResult(0, 0, 0, float("inf"), False, reason="empty graph input")
 
     optimizer = make_optimizer(verbose=verbose)
+    if abort_flag is not None:
+        if hasattr(optimizer, "set_force_stop_flag") and abort_flag.__class__.__module__ == "g2o":
+            optimizer.set_force_stop_flag(abort_flag)
     add_camera_parameters(optimizer, _camera_to_g2o(local_keyframes[0].camera), parameter_id=0)
 
     pose_vertices = {}
     point_vertices = {}
+    graph_edges = {}
 
-    vertex_id = 0
+    # pySLAM uses stable even keyframe vertex ids and odd map-point ids. This
+    # makes graph construction traceable across local and global BA windows.
+    good_keyframes = []
 
     for kf in local_keyframes:
+        if kf in pose_vertices:
+            continue
         v = add_pose_vertex(
             optimizer=optimizer,
-            vertex_id=vertex_id,
+            vertex_id=int(kf.kid) * 2,
             Tcw=kf.Tcw(),
             fixed=(kf.kid == 0),
         )
         pose_vertices[kf] = v
-        vertex_id += 1
+        good_keyframes.append(kf)
 
     for kf in fixed_keyframes:
         if kf in pose_vertices:
             continue
         v = add_pose_vertex(
             optimizer=optimizer,
-            vertex_id=vertex_id,
+            vertex_id=int(kf.kid) * 2,
             Tcw=kf.Tcw(),
             fixed=True,
         )
         pose_vertices[kf] = v
-        vertex_id += 1
+        good_keyframes.append(kf)
 
     for point in points:
+        point_w = point.get_position()
+        if not np.all(np.isfinite(point_w)):
+            continue
         v = add_point_vertex(
             optimizer=optimizer,
-            vertex_id=vertex_id,
-            point_w=point.get_position(),
+            vertex_id=int(point.id) * 2 + 1,
+            point_w=point_w,
             fixed=bool(fixed_points),
             marginalized=True,
         )
         point_vertices[point] = v
-        vertex_id += 1
 
     edges = []
     edge_id = 0
+    points_with_edges = set()
 
     for point in points:
         point_vertex = point_vertices.get(point)
@@ -358,8 +482,16 @@ def _bundle_adjustment_core(
             continue
 
         for kf, idx in point.observations():
+            if _is_bad_keyframe(kf):
+                continue
             pose_vertex = pose_vertices.get(kf)
             if pose_vertex is None:
+                continue
+            if idx < 0 or idx >= len(getattr(kf, "points", [])):
+                continue
+            if kf.get_point_match(idx) is not point:
+                continue
+            if not _valid_observation(kf, idx, point.get_position()):
                 continue
 
             edge, chi2_threshold, is_stereo = _add_reprojection_edge(
@@ -373,50 +505,185 @@ def _bundle_adjustment_core(
                 use_robust_kernel=use_robust_kernel,
             )
 
-            edges.append((edge, point, kf, idx, chi2_threshold, is_stereo))
+            edge_data = (point, kf, idx, chi2_threshold, is_stereo, point_vertex, pose_vertex)
+            edges.append((edge, *edge_data))
+            graph_edges[edge] = edge_data
+            points_with_edges.add(point)
             edge_id += 1
 
     if len(edges) == 0:
-        return OptimizerResult(0, 0, 0, float("inf"), False)
+        return OptimizerResult(
+            0,
+            0,
+            0,
+            float("inf"),
+            False,
+            num_keyframes=len(pose_vertices),
+            num_map_points=len(point_vertices),
+            reason="no valid reprojection edges",
+        )
+
+    if verbose:
+        optimizer.set_verbose(True)
+
+    if _abort_requested(abort_flag):
+        return OptimizerResult(
+            len(edges),
+            0,
+            len(edges),
+            float("inf"),
+            False,
+            num_keyframes=len(pose_vertices),
+            num_map_points=len(point_vertices),
+            aborted=True,
+            reason="aborted before optimization",
+        )
+
+    num_bad_edges = 0
 
     try:
-        optimize(optimizer, iterations=rounds, verbose=verbose)
+        optimizer.initialize_optimization()
+        optimizer.compute_active_errors()
+        initial_active_chi2 = float(optimizer.active_chi2())
+
+        if use_robust_kernel:
+            optimizer.optimize(5)
+
+            for edge, (
+                point,
+                kf,
+                idx,
+                chi2_threshold,
+                is_stereo,
+                point_vertex,
+                pose_vertex,
+            ) in graph_edges.items():
+                chi2 = _manual_reprojection_chi2(kf, idx, pose_vertex, point_vertex, is_stereo)
+                is_bad_edge = (
+                    (not np.isfinite(chi2))
+                    or chi2 > float(chi2_threshold)
+                    or not _is_depth_positive(edge, pose_vertex, point_vertex)
+                )
+                if is_bad_edge:
+                    edge.set_level(1)
+                    num_bad_edges += 1
+                edge.set_robust_kernel(None)
+
+            if _abort_requested(abort_flag):
+                return OptimizerResult(
+                    len(edges),
+                    0,
+                    len(edges),
+                    float("inf"),
+                    False,
+                    mean_error_before=initial_active_chi2 / max(len(edges), 1),
+                    num_keyframes=len(pose_vertices),
+                    num_map_points=len(point_vertices),
+                    aborted=True,
+                    reason="aborted after robust optimization",
+                )
+
+            optimizer.initialize_optimization()
+            optimizer.optimize(int(rounds))
+        else:
+            optimizer.initialize_optimization()
+            optimizer.optimize(int(rounds))
     except Exception as exc:
         print(f"bundle_adjustment: g2o failed: {exc}")
-        return OptimizerResult(len(edges), 0, len(edges), float("inf"), False)
+        return OptimizerResult(
+            len(edges),
+            0,
+            len(edges),
+            float("inf"),
+            False,
+            num_keyframes=len(pose_vertices),
+            num_map_points=len(point_vertices),
+            reason=f"g2o failed: {exc}",
+        )
 
-    inliers = []
-    outliers = []
+    outlier_observations = []
+    inlier_chi2 = []
 
-    for edge, point, kf, idx, chi2_threshold, _ in edges:
-        chi2 = float(edge.chi2())
-        if np.isfinite(chi2) and chi2 <= chi2_threshold:
-            inliers.append(edge)
+    for edge, point, kf, idx, chi2_threshold, is_stereo, point_vertex, pose_vertex in edges:
+        if _is_bad_point(point) or _is_bad_keyframe(kf):
+            continue
+        if idx < 0 or idx >= len(getattr(kf, "points", [])):
+            continue
+        if kf.get_point_match(idx) is not point:
+            continue
+        chi2 = _manual_reprojection_chi2(kf, idx, pose_vertex, point_vertex, is_stereo)
+        is_bad_observation = (
+            (not np.isfinite(chi2))
+            or chi2 > float(chi2_threshold)
+            or not _is_depth_positive(edge, pose_vertex, point_vertex)
+        )
+        if is_bad_observation:
+            outlier_observations.append((point, kf, idx, is_stereo))
         else:
-            outliers.append((edge, point, kf, idx))
+            inlier_chi2.append(chi2)
 
+    pose_updates = {}
+    point_updates = {}
     for kf, vertex in pose_vertices.items():
-        # Fixed vertices can be updated too, but their estimate is unchanged.
-        if kf in local_keyframes:
-            _set_frame_pose_from_vertex(kf, vertex)
-
+        pose_updates[kf] = _extract_Tcw_from_pose_vertex(vertex)
     if not fixed_points:
         for point, vertex in point_vertices.items():
-            point.set_position(np.asarray(vertex.estimate(), dtype=np.float64).reshape(3))
-            point.update_normal_and_depth()
+            if point not in points_with_edges:
+                continue
+            point_updates[point] = np.array(vertex.estimate(), dtype=np.float64, copy=True).reshape(3)
+
+    if write_back:
+        lock_context = map_lock if map_lock is not None else nullcontext()
+        with lock_context:
+            if prune_outliers:
+                for point, kf, idx, _ in outlier_observations:
+                    if _is_bad_point(point) or _is_bad_keyframe(kf):
+                        continue
+                    if idx < 0 or idx >= len(getattr(kf, "points", [])):
+                        continue
+                    if kf.get_point_match(idx) is point:
+                        point.remove_observation(kf, idx, map_no_lock=True)
+
+            for kf, Tcw in pose_updates.items():
+                if kf in local_keyframes and not _is_bad_keyframe(kf):
+                    kf.update_pose(g2o.Isometry3d(Tcw))
+                    if hasattr(kf, "lba_count"):
+                        kf.lba_count += 1
+
+            if not fixed_points:
+                for point, position in point_updates.items():
+                    if _is_bad_point(point):
+                        continue
+                    point.update_position(position)
+                    point.update_normal_and_depth()
 
     if result_dict is not None:
-        result_dict["keyframes"] = {kf.kid: kf.Tcw() for kf in pose_vertices.keys()}
-        result_dict["points"] = {p.id: p.get_position() for p in point_vertices.keys()}
+        result_dict["keyframes"] = {kf.kid: Tcw.copy() for kf, Tcw in pose_updates.items()}
+        result_dict["keyframe_updates"] = {
+            getattr(kf, "id", kf.kid): Tcw.copy() for kf, Tcw in pose_updates.items()
+        }
+        result_dict["points"] = {p.id: position.copy() for p, position in point_updates.items()}
+        result_dict["point_updates"] = {p.id: position.copy() for p, position in point_updates.items()}
+        result_dict["fixed_keyframes"] = [kf.kid for kf, vertex in pose_vertices.items() if vertex.fixed()]
+        result_dict["num_edges"] = len(edges)
+        result_dict["num_inliers"] = len(inlier_chi2)
+        result_dict["num_outliers"] = len(outlier_observations)
+        result_dict["mean_error_before"] = initial_active_chi2 / max(len(edges), 1)
+        result_dict["mean_error_after"] = float(np.mean(inlier_chi2)) if inlier_chi2 else float("inf")
 
-    mse = float(np.mean([float(edge.chi2()) for edge in inliers])) if inliers else float("inf")
+    mse = float(np.mean(inlier_chi2)) if inlier_chi2 else float("inf")
 
     return OptimizerResult(
         num_edges=len(edges),
-        num_inliers=len(inliers),
-        num_outliers=len(outliers),
+        num_inliers=len(inlier_chi2),
+        num_outliers=len(outlier_observations),
         mean_squared_error=mse,
-        success=len(inliers) > 0,
+        success=len(inlier_chi2) > 0 and np.isfinite(initial_active_chi2),
+        mean_error_before=initial_active_chi2 / max(len(edges), 1),
+        mean_error_after=mse,
+        num_keyframes=len(pose_vertices),
+        num_map_points=len(point_vertices),
+        reason="" if len(inlier_chi2) > 0 and np.isfinite(initial_active_chi2) else "no inlier edges",
     )
 
 
@@ -431,6 +698,7 @@ def bundle_adjustment(
     abort_flag=None,
     mp_abort_flag=None,
     result_dict: Optional[dict] = None,
+    write_back: bool = True,
     verbose: bool = False,
     print=print,
 ) -> tuple[float, Optional[dict]]:
@@ -461,8 +729,12 @@ def bundle_adjustment(
         fixed_points=fixed_points,
         rounds=rounds,
         use_robust_kernel=use_robust_kernel,
+        abort_flag=abort_flag,
+        map_lock=None,
         verbose=verbose,
         result_dict=result_dict,
+        write_back=write_back,
+        prune_outliers=False,
         print=print,
     )
 
@@ -470,43 +742,56 @@ def bundle_adjustment(
 
 
 def local_bundle_adjustment(
-    keyframe: KeyFrame,
-    abort_flag=None,
-    rounds: int = Parameters.kLocalBAWindowSize,
+    keyframes,
+    points: Optional[Iterable[MapPoint]] = None,
+    keyframes_ref: Optional[Iterable[KeyFrame]] = None,
+    fixed_points: bool = False,
     verbose: bool = False,
+    rounds: int = 10,
+    abort_flag=None,
+    mp_abort_flag=None,
+    map_lock=None,
     print=print,
 ) -> OptimizerResult:
     """
-    pySLAM-style local BA from a reference keyframe.
+    pySLAM-style local BA.
 
-    Local keyframes:
-    - reference keyframe
-    - best covisible keyframes
+    Preferred pySLAM-compatible call:
+        local_bundle_adjustment(keyframes, points, keyframes_ref, ...)
 
-    Fixed keyframes:
-    - other keyframes observing local map points
+    Compatibility call retained for existing tests:
+        local_bundle_adjustment(reference_keyframe, ...)
     """
-    if keyframe is None or keyframe.is_bad():
+    if isinstance(keyframes, KeyFrame):
+        keyframe = keyframes
+        if keyframe is None or keyframe.is_bad():
+            return OptimizerResult(0, 0, 0, float("inf"), False)
+
+        local_keyframes = [keyframe]
+
+        for kf in keyframe.get_covisible_keyframes():
+            if kf is not None and not kf.is_bad() and kf not in local_keyframes:
+                local_keyframes.append(kf)
+
+        local_points = []
+        for kf in local_keyframes:
+            for point in kf.get_matched_good_points():
+                if point is not None and not point.is_bad() and point not in local_points:
+                    local_points.append(point)
+
+        fixed_keyframes = []
+        for point in local_points:
+            for observing_kf, _ in point.observations():
+                if observing_kf not in local_keyframes and observing_kf not in fixed_keyframes:
+                    if not observing_kf.is_bad():
+                        fixed_keyframes.append(observing_kf)
+    else:
+        local_keyframes = _as_list(keyframes)
+        local_points = _as_list(points)
+        fixed_keyframes = _as_list(keyframes_ref)
+
+    if len(local_keyframes) == 0 or len(local_points) == 0:
         return OptimizerResult(0, 0, 0, float("inf"), False)
-
-    local_keyframes = [keyframe]
-
-    for kf in keyframe.get_best_covisible_keyframes(Parameters.kNumBestCovisibilityKeyFrames):
-        if kf is not None and not kf.is_bad() and kf not in local_keyframes:
-            local_keyframes.append(kf)
-
-    local_points = []
-    for kf in local_keyframes:
-        for point in kf.get_matched_good_points():
-            if point is not None and not point.is_bad() and point not in local_points:
-                local_points.append(point)
-
-    fixed_keyframes = []
-    for point in local_points:
-        for observing_kf, _ in point.observations():
-            if observing_kf not in local_keyframes and observing_kf not in fixed_keyframes:
-                if not observing_kf.is_bad():
-                    fixed_keyframes.append(observing_kf)
 
     # If there are no boundary fixed keyframes and the root is not in local set,
     # fix the first local keyframe to remove gauge freedom.
@@ -518,11 +803,15 @@ def local_bundle_adjustment(
         local_keyframes=local_keyframes,
         fixed_keyframes=fixed_keyframes,
         points=local_points,
-        fixed_points=False,
-        rounds=min(int(rounds), 10),
+        fixed_points=fixed_points,
+        rounds=int(rounds),
         use_robust_kernel=True,
+        abort_flag=abort_flag,
+        map_lock=map_lock,
         verbose=verbose,
         result_dict=None,
+        write_back=True,
+        prune_outliers=True,
         print=print,
     )
 
@@ -534,7 +823,9 @@ def global_bundle_adjustment(
     loop_kf_id: int = 0,
     use_robust_kernel: bool = True,
     abort_flag=None,
+    mp_abort_flag=None,
     result_dict: Optional[dict] = None,
+    write_back: bool = True,
     verbose: bool = False,
     print=print,
 ) -> tuple[float, Optional[dict]]:
@@ -548,7 +839,9 @@ def global_bundle_adjustment(
         loop_kf_id=loop_kf_id,
         use_robust_kernel=use_robust_kernel,
         abort_flag=abort_flag,
+        mp_abort_flag=mp_abort_flag,
         result_dict=result_dict,
+        write_back=write_back,
         verbose=verbose,
         print=print,
     )
