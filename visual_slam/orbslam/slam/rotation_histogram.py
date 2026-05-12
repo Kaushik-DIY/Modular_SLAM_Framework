@@ -1,12 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/rotation_histogram.py
-
-pySLAM-aligned rotation histogram.
-
-Reference:
-- pySLAM: pyslam/slam/rotation_histogram.py
-=============================================================================
+Rotation-consistency histogram for feature match filtering.
+This module keeps only the dominant orientation bins after descriptor matching.
 """
 
 from __future__ import annotations
@@ -14,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 
 
+# Bin feature-match rotations and keep the dominant orientation modes.
 class RotationHistogram(object):
     def __init__(self, histogram_length=12):
         self.histogram_length = int(histogram_length)

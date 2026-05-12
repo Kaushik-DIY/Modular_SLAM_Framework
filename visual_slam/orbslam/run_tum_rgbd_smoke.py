@@ -1,18 +1,7 @@
 #!/usr/bin/env python3
 """
-=============================================================================
-visual_slam/orbslam/run_tum_rgbd_smoke.py
-
-Real TUM RGB-D smoke runner for the pySLAM-aligned ORB/RGB-D implementation.
-
-Purpose:
-- Validate real image/depth ingestion.
-- Validate Slam.track() pySLAM-style orchestration.
-- Validate first RGB-D keyframe/map-point creation.
-- Validate short sequence execution before adding loop closing.
-
-This is a smoke test runner, not the final benchmark script.
-=============================================================================
+Short TUM RGB-D smoke runner.
+This script validates end-to-end frame ingestion and basic SLAM execution on a short sequence.
 """
 
 from __future__ import annotations
@@ -24,11 +13,18 @@ import time
 import cv2
 import numpy as np
 
+from tools.export_orbslam_map import export_orbslam_map
+from tools.run_fr1_room_full_evaluation import (
+    LOOP_DEBUG_COLUMNS,
+    _append_loop_debug_records,
+    _write_candidate_pair_reports,
+    write_csv,
+)
 from visual_slam.orbslam.io import (
     load_tum_rgbd_associations,
-    make_tum_rgbd_camera,
     save_tum_trajectory,
 )
+from visual_slam.orbslam.io.rgbd_dataset import detect_dataset_type, make_rgbd_camera
 from visual_slam.orbslam.slam import Slam, SensorType, SlamState
 
 
@@ -38,7 +34,7 @@ def _load_rgb(path: Path):
     if img_bgr is None:
         raise FileNotFoundError(f"Could not load RGB image: {path}")
 
-    # pySLAM/OpenCV feature extraction expects OpenCV BGR or grayscale-compatible input.
+    # Keep RGB frames in OpenCV BGR layout for the feature front-end.
     return img_bgr
 
 
@@ -79,6 +75,12 @@ def run_tum_rgbd_smoke(
     enable_global_ba: bool = False,
     global_ba_after_loop: bool | None = None,
     global_ba_iterations: int = 10,
+    loop_debug: bool = False,
+    stop_after_loop_events: int = 0,
+    stop_after_accepted_loops: int = 0,
+    dump_loop_candidate_reports: bool = False,
+    start_local_mapping_thread: bool = False,
+    lm_wait_timeout: float = 0.5,
 ):
     dataset = Path(dataset).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
@@ -94,7 +96,8 @@ def run_tum_rgbd_smoke(
     if max_frames > 0:
         frames = frames[:max_frames]
 
-    camera = make_tum_rgbd_camera(dataset.name)
+    dataset_type = detect_dataset_type(dataset)
+    camera = make_rgbd_camera(dataset)
     feature_tracker_config = None
     if feature_backend:
         feature_tracker_config = {"extractor_backend": feature_backend}
@@ -103,25 +106,28 @@ def run_tum_rgbd_smoke(
         camera=camera,
         sensor_type=SensorType.RGBD,
         headless=True,
-        start_local_mapping_thread=False,
+        start_local_mapping_thread=start_local_mapping_thread,
         feature_tracker_config=feature_tracker_config,
         enable_loop_closing=enable_loop_closing,
         enable_global_ba=enable_global_ba,
         global_ba_after_loop=global_ba_after_loop,
         global_ba_iterations=global_ba_iterations,
     )
+    threaded_lm = slam.start_local_mapping_thread
 
     print("=" * 80)
-    print("ORB-SLAM pySLAM-aligned TUM RGB-D smoke run")
+    print("ORB-SLAM RGB-D smoke run")
     print("=" * 80)
     print(f"Dataset:       {dataset}")
+    print(f"Dataset type:  {dataset_type}")
     print(f"Output:        {output_dir}")
     print(f"Frames loaded: {len(frames)}")
     print(f"Feature backend: {feature_backend or 'default'}")
     print(f"Loop closing:  {'enabled' if enable_loop_closing else 'disabled'}")
     print(f"Global BA:     {'enabled' if enable_global_ba else 'disabled'}")
+    print(f"LM threading:  {'enabled (wait='+str(lm_wait_timeout)+'s)' if threaded_lm else 'disabled (sequential)'}")
     print(f"Camera:        fx={camera.fx:.3f}, fy={camera.fy:.3f}, cx={camera.cx:.3f}, cy={camera.cy:.3f}")
-    print(f"Depth factor:  {camera.depth_factor}")
+    print(f"Depth factor:  {camera.depth_factor}  (1/depth_map_factor, units: m/raw)")
     print("=" * 80)
 
     start_t = time.time()
@@ -131,6 +137,10 @@ def run_tum_rgbd_smoke(
     num_errors = 0
 
     per_frame_log = []
+    loop_debug_rows = []
+    accepted_loop_count = 0
+    stop_requested = False
+    pair_report_dir = output_dir / "loop_candidate_pair_reports"
 
     for i, entry in enumerate(frames):
         frame_idx = start_index + i
@@ -147,11 +157,34 @@ def run_tum_rgbd_smoke(
                 timestamp=entry.timestamp,
             )
 
-            # Since local mapping is currently sequential, process queued keyframes.
-            while slam.local_mapping.queue_size() > 0:
-                slam.local_mapping.step()
-            while getattr(slam, "loop_closing", None) is not None and slam.loop_closing.queue_size() > 0:
-                slam.loop_closing.step()
+            # Sequential mode advances local mapping explicitly after each frame.
+            if not threaded_lm:
+                while slam.local_mapping.queue_size() > 0:
+                    slam.local_mapping.step()
+            loop_closing = getattr(slam, "loop_closing", None)
+            if threaded_lm:
+                slam.local_mapping.wait_idle(timeout=lm_wait_timeout)
+            while loop_closing is not None and loop_closing.queue_size() > 0:
+                event_start = len(loop_debug_rows) + 1
+                accepted_loop = bool(loop_closing.step())
+                loop_diag_current = loop_closing.last_diagnostics
+                if loop_debug:
+                    _append_loop_debug_records(loop_debug_rows, loop_diag_current)
+                if dump_loop_candidate_reports:
+                    _write_candidate_pair_reports(
+                        pair_report_dir,
+                        loop_diag_current,
+                        event_start=event_start,
+                        dump_all=True,
+                    )
+                if accepted_loop:
+                    accepted_loop_count += 1
+                if stop_after_loop_events > 0 and len(loop_debug_rows) >= int(stop_after_loop_events):
+                    stop_requested = True
+                    break
+                if stop_after_accepted_loops > 0 and accepted_loop_count >= int(stop_after_accepted_loops):
+                    stop_requested = True
+                    break
 
             state = slam.get_tracking_state()
 
@@ -207,22 +240,25 @@ def run_tum_rgbd_smoke(
             num_errors += 1
             print(f"[ERROR] frame_idx={frame_idx} timestamp={entry.timestamp:.6f}: {type(exc).__name__}: {exc}")
 
-            # For a smoke test, fail fast. This is better than hiding runtime issues.
+            # Fail fast here so short validation runs expose runtime issues clearly.
             raise
+
+        if stop_requested:
+            print("[STOP] loop diagnostic stop condition reached")
+            break
 
     elapsed = time.time() - start_t
 
     trajectory = slam.get_final_trajectory()
-    raw_poses = trajectory["poses"]
-    raw_timestamps = trajectory["timestamps"]
-    raw_states = trajectory["history"].slam_states
-
     ok_pairs = [
         (pose, ts)
-        for pose, ts, state in zip(raw_poses, raw_timestamps, raw_states)
+        for pose, ts, state in zip(
+            trajectory["poses"],
+            trajectory["timestamps"],
+            trajectory["slam_states"],
+        )
         if state == SlamState.OK
     ]
-
     poses = [p for p, _ in ok_pairs]
     timestamps = [t for _, t in ok_pairs]
 
@@ -251,6 +287,10 @@ def run_tum_rgbd_smoke(
                 f"{row['loop_global_ba_inliers']},"
                 f"{row['loop_global_ba_mse_after'] if row['loop_global_ba_mse_after'] is not None else ''}\n"
             )
+    if loop_debug:
+        write_csv(output_dir / "loop_debug_candidates.csv", loop_debug_rows, LOOP_DEBUG_COLUMNS)
+
+    map_export = export_orbslam_map(slam, output_dir)
 
     print("=" * 80)
     print("SMOKE SUMMARY")
@@ -268,9 +308,26 @@ def run_tum_rgbd_smoke(
     print(f"avg_fps:              {len(frames) / max(elapsed, 1e-9):.2f}")
     print(f"trajectory_file:      {traj_file}")
     print(f"frame_log_file:       {log_file}")
+    print(f"map_points_ply:       {map_export['map_points_ply']}")
+    print(f"keyframes_json:       {map_export['keyframes_json']}")
+    print(f"keyframe_graph_json:  {map_export['keyframe_graph_json']}")
+    print(f"exported_map_points:  {map_export['num_exported_points']}")
+    print(f"exported_keyframes:   {map_export['num_exported_keyframes']}")
+    print(f"loop_edges:           {map_export['num_loop_edges']}")
+    kf_consistency = slam.compute_kf_trajectory_consistency()
+    if kf_consistency["n_checked"] > 0:
+        print(f"kf_traj_consistency:  n={kf_consistency['n_checked']} "
+              f"max={kf_consistency['max_diff_m']:.4f}m "
+              f"median={kf_consistency['median_diff_m']:.4f}m")
+    if loop_debug:
+        print(f"loop_debug_file:      {output_dir / 'loop_debug_candidates.csv'}")
+        print(f"loop_debug_events:    {len(loop_debug_rows)}")
+        print(f"accepted_loops:       {accepted_loop_count}")
     print("=" * 80)
 
-    # Hard acceptance gates for this checkpoint.
+    slam.shutdown()
+
+    # Keep the smoke-run acceptance rules strict and easy to inspect.
     if slam.map.num_keyframes() < 1:
         raise RuntimeError("Smoke failed: no keyframe was created.")
 
@@ -285,7 +342,7 @@ def run_tum_rgbd_smoke(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run pySLAM-aligned ORB/RGB-D smoke test on a TUM RGB-D sequence."
+        description="Run the ORB RGB-D smoke test on a TUM RGB-D sequence."
     )
     parser.add_argument("dataset", type=Path, help="Path to TUM RGB-D sequence folder")
     parser.add_argument("--output", type=Path, default=Path("visual_slam_outputs/orbslam_tum_smoke"))
@@ -306,6 +363,21 @@ def main():
     gba_group.add_argument("--disable-global-ba", action="store_true", help="Disable loop-triggered Global BA.")
     parser.add_argument("--global-ba-after-loop", action="store_true", help="Run Global BA after accepted loop closures.")
     parser.add_argument("--global-ba-iterations", type=int, default=10)
+    parser.add_argument("--loop-debug", action="store_true")
+    parser.add_argument("--stop-after-loop-events", type=int, default=0)
+    parser.add_argument("--stop-after-accepted-loops", type=int, default=0)
+    parser.add_argument("--dump-loop-candidate-reports", action="store_true")
+    parser.add_argument(
+        "--start-local-mapping-thread",
+        action="store_true",
+        help="Run local mapping on a background thread (faster on multi-core).",
+    )
+    parser.add_argument(
+        "--lm-wait-timeout",
+        type=float,
+        default=0.5,
+        help="Seconds the tracker waits for LM idle in threaded mode (default 0.5).",
+    )
 
     args = parser.parse_args()
 
@@ -320,6 +392,12 @@ def main():
         enable_global_ba=bool(args.enable_global_ba and not args.disable_global_ba),
         global_ba_after_loop=bool(args.global_ba_after_loop or args.enable_global_ba),
         global_ba_iterations=int(args.global_ba_iterations),
+        loop_debug=bool(args.loop_debug),
+        stop_after_loop_events=int(args.stop_after_loop_events),
+        stop_after_accepted_loops=int(args.stop_after_accepted_loops),
+        dump_loop_candidate_reports=bool(args.dump_loop_candidate_reports),
+        start_local_mapping_thread=bool(args.start_local_mapping_thread),
+        lm_wait_timeout=float(args.lm_wait_timeout),
     )
 
 

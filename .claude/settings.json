@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(awk 'NR>1 && !/^#/ {score=$6; inliers=$7; k=$1; if\\(score<0 && inliers>=0 && inliers<30\\) print k, inliers}' /home/kaushik/slam_ws/hector_outputs/trajectory_fr079_scan_to_map_4934_debug.txt)",
-      "Bash(awk 'NR>1 && !/^#/ {k=$1; if\\(k>=2200 && k<=2260\\) print $0}' /home/kaushik/slam_ws/hector_outputs/trajectory_fr079_scan_to_map_4934_debug.txt)"
+      "Bash(awk 'NR>1 && !/^#/ {k=$1; if\\(k>=2200 && k<=2260\\) print $0}' /home/kaushik/slam_ws/hector_outputs/trajectory_fr079_scan_to_map_4934_debug.txt)",
+      "Bash(chmod +x /home/kaushik/slam_ws/tools/master_lab_run.sh /home/kaushik/slam_ws/tools/launch_lab_benchmark.sh)",
+      "Bash(python -c \"import sys; print\\(f'Active Python: {sys.executable}'\\); print\\(f'Version: {sys.version}'\\)\")"
     ]
   }
 }

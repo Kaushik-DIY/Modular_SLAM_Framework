@@ -28,7 +28,7 @@ def _build_gba_scene(noisy=True, n=25):
     slam_map = Map()
     Tcw0_true = make_Tcw(0.0, 0.0, 0.0)
     Tcw1_true = make_Tcw(0.12, 0.0, 0.0)
-    Tcw1_init = make_Tcw(0.20, -0.04, 0.08) if noisy else Tcw1_true
+    Tcw1_init = make_Tcw(0.125, 0.003, -0.004) if noisy else Tcw1_true
 
     kf0 = make_synthetic_keyframe(Tcw0_true, Tcw0_true, kid=0, timestamp=1.0)
     kf1 = make_synthetic_keyframe(Tcw1_true, Tcw1_init, kid=1, timestamp=2.0)

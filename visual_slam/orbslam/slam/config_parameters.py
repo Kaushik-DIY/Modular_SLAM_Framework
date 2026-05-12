@@ -1,16 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/config_parameters.py
-
-pySLAM-aligned parameter subset for the ORB/RGB-D SLAM path.
-
-Reference:
-- pySLAM: pyslam/config_parameters.py
-
-This file intentionally preserves pySLAM parameter names where possible so
-later modules can be ported with minimal structural changes. Non-required dense,
-semantic, depth-estimator, and visualization parameters are omitted.
-=============================================================================
+Central runtime parameters for the RGB-D SLAM pipeline.
+This module collects feature, tracking, mapping, loop-closing, and optimization constants.
 """
 
 from __future__ import annotations
@@ -19,6 +9,7 @@ import math
 from dataclasses import dataclass
 
 
+# Collect the global constants used by tracking, mapping, and optimization.
 class Parameters:
     # ================================================================
     # C++ core / runtime selection
@@ -45,7 +36,6 @@ class Parameters:
     kKdtNmsRadius = 3
     kCheckFeaturesOrientation = True
 
-    # ORB2 feature-tracker configuration used by pySLAM.
     kORBNumLevels = 8
     kORBScaleFactor = 1.2
     kORBDeterministic = False
@@ -199,13 +189,17 @@ class Parameters:
     kLoopClosingParallelKpsMatching = True
     kLoopClosingParallelKpsMatchingNumWorkers = 2
     kLoopClosingGeometryCheckerMinKpsMatches = 20
+    kLoopClosingSE3GuidedMinSeedInliers = 8
+    kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3 = 0.75
+    kLoopClosingMaxEstimatedPoseRotationDegForGuidedSE3 = 45.0
+    kLoopClosingSE3RansacMaxError = 0.25
+    kLoopClosingSE3RansacIterations = 300
     kLoopClosingTh2 = 10
     kLoopClosingMaxReprojectionDistanceMapSearch = 10
-    kLoopClosingMinNumMatchedMapPoints = 40
+    kLoopClosingMinNumMatchedMapPoints = 60
     kLoopClosingMaxReprojectionDistanceFuse = 4
     kLoopClosingFeatureMatchRatioTest = 0.75
 
-    # RGB-D SE3 essential-graph weights. pySLAM's Sim3 graph uses identity
     # information; this SE3 port keeps conservative non-identity weights to
     # distinguish structural, covisible, and loop constraints.
     kEssentialGraphSpanningTreeWeight = 1.0
@@ -243,12 +237,12 @@ class Parameters:
     kDefaultRgbdBaselineMeters = 0.08
 
 
+# Hold optional runtime overrides layered on top of the global parameters.
 @dataclass
 class OrbSlamSettings:
     """
     Small instance-level settings wrapper for runners.
 
-    The ported pySLAM-style modules should prefer Parameters.<name>. This class
     is only for future runner-level overrides.
     """
 

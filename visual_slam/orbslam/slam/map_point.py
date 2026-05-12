@@ -1,27 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/map_point.py
-
-pySLAM-aligned MapPointBase and MapPoint subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/map_point.py
-
-Scope retained:
-- global map-point ID handling
-- keyframe observations
-- transient frame views
-- found/visible statistics
-- bad/replacement state
-- descriptor medoid computation
-- normal/depth-range update
-- scale prediction
-
-Excluded for now:
-- semantic descriptors
-- JSON serialization
-- drawing/color utilities
-=============================================================================
+3D landmark representation for the sparse map.
+This module stores observations, descriptor state, visibility statistics, and replacement links.
 """
 
 from __future__ import annotations
@@ -34,6 +13,14 @@ import numpy as np
 
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
+
+try:
+    import cpp_slam_core as _cpp_slam_core
+    _CppMapPointBase = getattr(_cpp_slam_core, "MapPoint", None)
+    _USE_CPP_MP = _CppMapPointBase is not None
+except ImportError:
+    _CppMapPointBase = None
+    _USE_CPP_MP = False
 
 
 def _normalize_vector(v: np.ndarray) -> np.ndarray:
@@ -109,8 +96,8 @@ def _remove_point(frame_or_keyframe, point) -> None:
         frame.remove_point(point)
 
 
+# Hold the base observation and state interface for one 3D landmark.
 class MapPointBase:
-    """pySLAM-like map-point base object."""
 
     _id = 0
     _id_lock = Lock()
@@ -373,8 +360,15 @@ class MapPointBase:
             return float(self.num_times_found) / float(self.num_times_visible)
 
 
-class MapPoint(MapPointBase):
-    """pySLAM-like 3D landmark."""
+def _make_map_point_base():
+    """Return the appropriate base class for MapPoint (C++ if available, Python otherwise)."""
+    if _USE_CPP_MP:
+        return _CppMapPointBase
+    return MapPointBase
+
+
+# Represent one 3D landmark tracked across frames and keyframes.
+class MapPoint(_make_map_point_base()):
 
     def __init__(
         self,
@@ -384,25 +378,31 @@ class MapPoint(MapPointBase):
         idx: Optional[int] = None,
         id: Optional[int] = None,
     ):
-        super().__init__(id=id)
+        id_val = id if id is not None else -1
+        if _USE_CPP_MP:
+            # C++ base: (pos, kf, idx, map_obj, given_id)
+            # Pass kf=None/idx=-1 here; call add_observation after init so
+            # shared_from_this() is safe (pybind11 has registered self by then).
+            _CppMapPointBase.__init__(
+                self,
+                np.asarray(position, dtype=np.float64).reshape(3),
+                None, -1, None, id_val,
+            )
+        else:
+            super().__init__(id=None if id_val < 0 else id_val)
+            self._position = np.asarray(position, dtype=np.float64).reshape(3)
+            self.normal = np.zeros(3, dtype=np.float64)
+            self.min_distance = 0.0
+            self.max_distance = 0.0
+            self.pt_GBA = None
+            self.is_pt_GBA_valid = False
+            self.GBA_kf_id = 0
+            self.des = None
+            self.descriptor = None
 
-        self._position = np.asarray(position, dtype=np.float64).reshape(3)
         self.color = color
-
-        self.des = None
-        self.descriptor = None
-
-        self.normal = np.zeros(3, dtype=np.float64)
-        self.min_distance = 0.0
-        self.max_distance = 0.0
-
         self.first_kid = -1
         self._last_update_time = 0.0
-
-        # pySLAM-compatible temporary Global BA fields.
-        self.pt_GBA = None
-        self.is_pt_GBA_valid = False
-        self.GBA_kf_id = 0
 
         if keyframe is not None and idx is not None:
             self.kf_ref = keyframe
@@ -410,282 +410,282 @@ class MapPoint(MapPointBase):
             self.add_observation(keyframe, int(idx))
             self.update_info()
 
-    @property
-    def position(self) -> np.ndarray:
-        return self.get_position()
+    # --- Position (Python path only; C++ path uses bound property) -----------
 
-    @position.setter
-    def position(self, value) -> None:
-        self.set_position(value)
+    if not _USE_CPP_MP:
+        @property
+        def position(self) -> np.ndarray:
+            return self.get_position()
 
-    @property
-    def position_world(self) -> np.ndarray:
-        return self.get_position()
+        @position.setter
+        def position(self, value) -> None:
+            self.set_position(value)
 
-    @position_world.setter
-    def position_world(self, value) -> None:
-        self.set_position(value)
+        @property
+        def position_world(self) -> np.ndarray:
+            return self.get_position()
+
+        @position_world.setter
+        def position_world(self, value) -> None:
+            self.set_position(value)
+
+        def get_position(self) -> np.ndarray:
+            with self._lock_pos:
+                return self._position.copy()
+
+        def set_position(self, position: np.ndarray) -> None:
+            with self._lock_pos:
+                self._position = np.array(position, dtype=np.float64, copy=True).reshape(3)
+
+        def update_position(self, position: np.ndarray) -> None:
+            self.set_position(position)
+
+        def get_descriptor(self):
+            with self._lock_features:
+                if self.des is None:
+                    return None
+                return self.des.copy()
+
+        def set_descriptor(self, descriptor: np.ndarray) -> None:
+            with self._lock_features:
+                self.des = np.asarray(descriptor, dtype=np.uint8).copy()
+                self.descriptor = self.des
+
+        def get_normal(self) -> np.ndarray:
+            with self._lock_pos:
+                return self.normal.copy()
+
+        def get_reference_keyframe(self):
+            with self._lock_features:
+                return self.kf_ref
+
+        def compute_distinctive_descriptor(self) -> None:
+            descriptors = []
+            with self._lock_features:
+                observations = list(self._observations.items())
+            for kf, idx in observations:
+                des = _get_descriptor(kf, idx)
+                if des is not None:
+                    descriptors.append(des)
+            if len(descriptors) == 0:
+                self.des = None
+                self.descriptor = None
+                return
+            if len(descriptors) == 1:
+                self.set_descriptor(descriptors[0])
+                return
+            descriptors = np.asarray(descriptors, dtype=np.uint8)
+            n = len(descriptors)
+            distances = np.zeros((n, n), dtype=np.float32)
+            descriptor_distance = FeatureTrackerShared.descriptor_distance
+            if descriptor_distance is None:
+                descriptor_distance = lambda a, b: cv2.norm(a, b, cv2.NORM_HAMMING)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = descriptor_distance(descriptors[i], descriptors[j])
+                    distances[i, j] = d
+                    distances[j, i] = d
+            median_distances = np.median(distances, axis=1)
+            best_idx = int(np.argmin(median_distances))
+            self.set_descriptor(descriptors[best_idx])
+
+        def compute_descriptor(self) -> None:
+            self.compute_distinctive_descriptor()
+
+        def update_normal_and_depth(self) -> None:
+            with self._lock_features:
+                observations = list(self._observations.items())
+                ref_kf = self.kf_ref
+                if ref_kf is None and observations:
+                    ref_kf = observations[0][0]
+                    self.kf_ref = ref_kf
+            if not observations or ref_kf is None:
+                return
+            position = self.get_position()
+            normal = np.zeros(3, dtype=np.float64)
+            for kf, _ in observations:
+                camera_center = _get_camera_center(kf)
+                normal += _normalize_vector(position - camera_center)
+            normal = _normalize_vector(normal / max(1, len(observations)))
+            ref_center = _get_camera_center(ref_kf)
+            dist = float(np.linalg.norm(position - ref_center))
+            ref_idx = self.get_observation_idx(ref_kf)
+            ref_level = _get_keypoint_octave(ref_kf, ref_idx)
+            feature_manager = FeatureTrackerShared.feature_manager
+            if feature_manager is not None:
+                scale_factors = feature_manager.scale_factors
+                ref_level = min(max(ref_level, 0), len(scale_factors) - 1)
+                level_scale_factor = float(scale_factors[ref_level])
+                max_distance = dist * level_scale_factor
+                min_distance = max_distance / float(scale_factors[-1])
+            else:
+                max_distance = dist
+                min_distance = dist
+            with self._lock_pos:
+                self.normal = normal
+                self.max_distance = float(max_distance)
+                self.min_distance = float(min_distance)
+
+        def update_info(self) -> None:
+            self.compute_distinctive_descriptor()
+            self.update_normal_and_depth()
+
+        def get_min_distance_invariance(self) -> float:
+            with self._lock_pos:
+                return 0.8 * self.min_distance
+
+        def get_max_distance_invariance(self) -> float:
+            with self._lock_pos:
+                return 1.2 * self.max_distance
+
+        def set_bad(self, map_no_lock: bool = False) -> None:
+            with self._lock_features:
+                if self._is_bad:
+                    return
+                observations = list(self._observations.items())
+                frame_views = list(self._frame_views.items())
+                self._observations.clear()
+                self._frame_views.clear()
+                self._num_observations = 0
+                self._is_bad = True
+            for kf, idx in observations:
+                try:
+                    _remove_point_match(kf, idx)
+                except Exception:
+                    pass
+            for frame, idx in frame_views:
+                try:
+                    _remove_point_match(frame, idx)
+                except Exception:
+                    pass
+            if self.map is not None:
+                remove_fn = getattr(self.map, "remove_point", None) or getattr(self.map, "remove_map_point", None)
+                if remove_fn is not None:
+                    try:
+                        remove_fn(self)
+                    except TypeError:
+                        remove_fn(self, map_no_lock=map_no_lock)
+
+        def replace_with(self, replacement: "MapPoint") -> None:
+            if replacement is self or replacement is None:
+                return
+            if hasattr(replacement, "is_bad") and replacement.is_bad():
+                return
+            with self._lock_features:
+                if self._is_bad and self.replacement is replacement:
+                    return
+                observations = list(self._observations.items())
+                frame_views = list(self._frame_views.items())
+                self._observations.clear()
+                self._frame_views.clear()
+                self._num_observations = 0
+                self._is_bad = True
+                self.replacement = replacement
+                found = self.num_times_found
+                visible = self.num_times_visible
+            for kf, idx in observations:
+                if replacement.add_observation(kf, idx):
+                    _set_point_match(kf, replacement, idx)
+                else:
+                    if replacement.get_observation_idx(kf) == idx:
+                        _set_point_match(kf, replacement, idx)
+                    else:
+                        _remove_point_match(kf, idx)
+            for frame, idx in frame_views:
+                if replacement.is_in_frame(frame):
+                    _remove_point_match(frame, idx)
+                elif not getattr(frame, "is_keyframe", False):
+                    replacement.add_frame_view(frame, idx)
+                else:
+                    _remove_point_match(frame, idx)
+            replacement.increase_found(found)
+            replacement.increase_visible(visible)
+            replacement.update_info()
+            if self.map is not None:
+                remove_fn = getattr(self.map, "remove_point", None) or getattr(self.map, "remove_map_point", None)
+                if remove_fn is not None:
+                    remove_fn(self)
+
+    # --- Methods present in both C++ and Python paths -------------------------
 
     def pt(self) -> np.ndarray:
         return self.get_position()
-
-    def get_position(self) -> np.ndarray:
-        with self._lock_pos:
-            return self._position.copy()
-
-    def set_position(self, position: np.ndarray) -> None:
-        with self._lock_pos:
-            self._position = np.array(position, dtype=np.float64, copy=True).reshape(3)
-
-    def update_position(self, position: np.ndarray) -> None:
-        self.set_position(position)
-
-    def get_descriptor(self):
-        with self._lock_features:
-            if self.des is None:
-                return None
-            return self.des.copy()
-
-    def set_descriptor(self, descriptor: np.ndarray) -> None:
-        with self._lock_features:
-            self.des = np.asarray(descriptor, dtype=np.uint8).copy()
-            self.descriptor = self.des
-
-    def get_normal(self) -> np.ndarray:
-        with self._lock_pos:
-            return self.normal.copy()
-
-    def get_reference_keyframe(self):
-        with self._lock_features:
-            return self.kf_ref
-
-    def compute_distinctive_descriptor(self) -> None:
-        descriptors = []
-
-        with self._lock_features:
-            observations = list(self._observations.items())
-
-        for kf, idx in observations:
-            des = _get_descriptor(kf, idx)
-            if des is not None:
-                descriptors.append(des)
-
-        if len(descriptors) == 0:
-            self.des = None
-            self.descriptor = None
-            return
-
-        if len(descriptors) == 1:
-            self.set_descriptor(descriptors[0])
-            return
-
-        descriptors = np.asarray(descriptors, dtype=np.uint8)
-
-        n = len(descriptors)
-        distances = np.zeros((n, n), dtype=np.float32)
-
-        descriptor_distance = FeatureTrackerShared.descriptor_distance
-        if descriptor_distance is None:
-            descriptor_distance = lambda a, b: cv2.norm(a, b, cv2.NORM_HAMMING)
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                d = descriptor_distance(descriptors[i], descriptors[j])
-                distances[i, j] = d
-                distances[j, i] = d
-
-        median_distances = np.median(distances, axis=1)
-        best_idx = int(np.argmin(median_distances))
-        self.set_descriptor(descriptors[best_idx])
-
-    def compute_descriptor(self) -> None:
-        self.compute_distinctive_descriptor()
-
-    def update_normal_and_depth(self) -> None:
-        with self._lock_features:
-            observations = list(self._observations.items())
-            ref_kf = self.kf_ref
-            if ref_kf is None and observations:
-                ref_kf = observations[0][0]
-                self.kf_ref = ref_kf
-
-        if not observations or ref_kf is None:
-            return
-
-        position = self.get_position()
-        normal = np.zeros(3, dtype=np.float64)
-
-        for kf, _ in observations:
-            camera_center = _get_camera_center(kf)
-            normal += _normalize_vector(position - camera_center)
-
-        normal = _normalize_vector(normal / max(1, len(observations)))
-
-        ref_center = _get_camera_center(ref_kf)
-        dist = float(np.linalg.norm(position - ref_center))
-
-        ref_idx = self.get_observation_idx(ref_kf)
-        ref_level = _get_keypoint_octave(ref_kf, ref_idx)
-
-        feature_manager = FeatureTrackerShared.feature_manager
-        if feature_manager is not None:
-            scale_factors = feature_manager.scale_factors
-            ref_level = min(max(ref_level, 0), len(scale_factors) - 1)
-            level_scale_factor = float(scale_factors[ref_level])
-            max_distance = dist * level_scale_factor
-            min_distance = max_distance / float(scale_factors[-1])
-        else:
-            max_distance = dist
-            min_distance = dist
-
-        with self._lock_pos:
-            self.normal = normal
-            self.max_distance = float(max_distance)
-            self.min_distance = float(min_distance)
-
-    def update_info(self) -> None:
-        self.compute_distinctive_descriptor()
-        self.update_normal_and_depth()
 
     def predict_scale(self, dist: float, frame_or_keyframe) -> int:
         feature_manager = FeatureTrackerShared.feature_manager
         if feature_manager is None:
             return 0
-
-        with self._lock_pos:
-            max_distance = max(self.max_distance, 1e-12)
-
-        ratio = max_distance / max(float(dist), 1e-12)
+        max_dist_val = float(self.max_distance)
+        if not np.isfinite(max_dist_val) or max_dist_val <= 0:
+            return 0
+        ratio = max_dist_val / max(float(dist), 1e-12)
         n_scale = int(np.ceil(np.log(ratio) / feature_manager.log_scale_factor))
-
         if n_scale < 0:
             return 0
         if n_scale >= feature_manager.num_levels:
             return feature_manager.num_levels - 1
         return n_scale
 
-    def get_min_distance_invariance(self) -> float:
-        with self._lock_pos:
-            return 0.8 * self.min_distance
+    if _USE_CPP_MP:
+        def get_normal(self) -> np.ndarray:
+            return np.asarray(self.normal, dtype=np.float64).copy()
 
-    def get_max_distance_invariance(self) -> float:
-        with self._lock_pos:
-            return 1.2 * self.max_distance
+        def get_reference_keyframe(self):
+            return self.kf_ref
 
-    def set_bad(self, map_no_lock: bool = False) -> None:
-        with self._lock_features:
-            if self._is_bad:
-                return
+        def compute_distinctive_descriptor(self) -> None:
+            self.update_best_descriptor()
 
-            observations = list(self._observations.items())
-            frame_views = list(self._frame_views.items())
+        def compute_descriptor(self) -> None:
+            self.update_best_descriptor()
 
-            self._observations.clear()
-            self._frame_views.clear()
-            self._num_observations = 0
-            self._is_bad = True
+        def set_descriptor(self, descriptor: np.ndarray) -> None:
+            self.set_des(np.asarray(descriptor, dtype=np.uint8).ravel()[:32])
 
-        for kf, idx in observations:
-            try:
-                _remove_point_match(kf, idx)
-            except Exception:
-                pass
+        def get_min_distance_invariance(self) -> float:
+            return 0.8 * float(self.min_distance)
 
-        for frame, idx in frame_views:
-            try:
-                _remove_point_match(frame, idx)
-            except Exception:
-                pass
+        def get_max_distance_invariance(self) -> float:
+            return 1.2 * float(self.max_distance)
 
-        if self.map is not None:
-            remove_fn = getattr(self.map, "remove_point", None) or getattr(self.map, "remove_map_point", None)
-            if remove_fn is not None:
-                try:
-                    remove_fn(self)
-                except TypeError:
-                    remove_fn(self, map_no_lock=map_no_lock)
+        def get_replaced(self):
+            # C++ replace_with() sets _replacement_cpp; Python may set .replacement attribute.
+            cpp_repl = _CppMapPointBase.get_replacement(self)
+            if cpp_repl is not None:
+                return cpp_repl
+            return getattr(self, "replacement", None)
 
-    def replace_with(self, replacement: "MapPoint") -> None:
-        if replacement is self:
-            return
-        if replacement is None:
-            return
-        if hasattr(replacement, "is_bad") and replacement.is_bad():
-            return
-
-        with self._lock_features:
-            if self._is_bad and self.replacement is replacement:
-                return
-            observations = list(self._observations.items())
-            frame_views = list(self._frame_views.items())
-            self._observations.clear()
-            self._frame_views.clear()
-            self._num_observations = 0
-            self._is_bad = True
-            self.replacement = replacement
-
-            found = self.num_times_found
-            visible = self.num_times_visible
-
-        for kf, idx in observations:
-            if replacement.add_observation(kf, idx):
-                _set_point_match(kf, replacement, idx)
-            else:
-                if replacement.get_observation_idx(kf) == idx:
-                    _set_point_match(kf, replacement, idx)
-                else:
-                    _remove_point_match(kf, idx)
-
-        for frame, idx in frame_views:
-            if replacement.is_in_frame(frame):
-                _remove_point_match(frame, idx)
-            elif not getattr(frame, "is_keyframe", False):
-                replacement.add_frame_view(frame, idx)
-            else:
-                _remove_point_match(frame, idx)
-
-        replacement.increase_found(found)
-        replacement.increase_visible(visible)
-        replacement.update_info()
-
-        if self.map is not None:
-            remove_fn = getattr(self.map, "remove_point", None) or getattr(self.map, "remove_map_point", None)
-            if remove_fn is not None:
-                remove_fn(self)
-
-
-    def min_des_distance(self, descriptor: np.ndarray) -> float:
-        """Minimum descriptor distance to this point's distinctive descriptor."""
-        if self.des is None:
-            return float("inf")
-
-        descriptor_distance = FeatureTrackerShared.descriptor_distance
-        if descriptor_distance is None:
-            descriptor_distance = lambda a, b: cv2.norm(a, b, cv2.NORM_HAMMING)
-
-        return float(descriptor_distance(self.des, np.asarray(descriptor, dtype=np.uint8)))
+        def get_replacement(self):
+            return self.get_replaced()
 
     @staticmethod
     def predict_detection_levels(points, dists) -> np.ndarray:
         feature_manager = FeatureTrackerShared.feature_manager
         if feature_manager is None:
             return np.zeros(len(points), dtype=np.int32)
-
         levels = []
         for point, dist in zip(points, dists):
             if point is None:
                 levels.append(0)
             else:
                 levels.append(point.predict_scale(float(dist), None))
-
         return np.asarray(levels, dtype=np.int32)
 
-    def get_replaced(self):
-        with self._lock_features:
-            return self.replacement
+    if not _USE_CPP_MP:
+        def min_des_distance(self, descriptor: np.ndarray) -> float:
+            if self.des is None:
+                return float("inf")
+            descriptor_distance = FeatureTrackerShared.descriptor_distance
+            if descriptor_distance is None:
+                descriptor_distance = lambda a, b: cv2.norm(a, b, cv2.NORM_HAMMING)
+            return float(descriptor_distance(self.des, np.asarray(descriptor, dtype=np.uint8)))
 
-    def get_replacement(self):
-        return self.get_replaced()
+        def get_replaced(self):
+            with self._lock_features:
+                return self.replacement
+
+        def get_replacement(self):
+            return self.get_replaced()
 
     def delete(self) -> None:
         self.set_bad()

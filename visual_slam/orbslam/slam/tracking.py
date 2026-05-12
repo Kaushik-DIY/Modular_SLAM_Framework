@@ -1,36 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/tracking.py
-
-pySLAM-aligned Tracking subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/tracking.py
-
-Implemented in this checkpoint:
-- TrackingHistory
-- Tracking.__init__/reset
-- pose_optimization
-- track_previous_frame
-- track_reference_frame
-- track_keyframe
-- update_local_map
-- track_local_map
-- clean_vo_points
-- need_new_keyframe
-- create_new_keyframe
-- create_vo_points_on_last_frame
-- create_and_add_stereo_map_points_on_new_kf
-- update_history
-- minimal RGB-D track() entry point
-
-Deferred:
-- full relocalizer/database
-- initializer for monocular
-- local mapping thread synchronization
-- dynamic descriptor threshold estimator class
-- drawing/debug viewers
-=============================================================================
+Tracking front-end and frame-to-frame state machine.
+This module estimates poses, tracks local structure, and decides when to create keyframes.
 """
 
 from __future__ import annotations
@@ -50,6 +20,7 @@ from visual_slam.orbslam.slam.map import Map
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.motion_model import MotionModel
 from visual_slam.orbslam.slam.optimizer_g2o import pose_optimization as g2o_pose_optimization
+from visual_slam.orbslam.slam.relocalizer import Relocalizer
 from visual_slam.orbslam.slam.rotation_histogram import RotationHistogram
 from visual_slam.orbslam.slam.sensor_types import SensorType
 from visual_slam.orbslam.slam.slam_commons import SlamState
@@ -70,6 +41,7 @@ kNumMinObsForKeyFrameDefault = 3
 kMinDepth = Parameters.kMinDepth
 
 
+# Store the per-frame pose history needed for final trajectory reconstruction.
 class TrackingHistory(object):
     def __init__(self):
         self.relative_frame_poses = []
@@ -86,10 +58,12 @@ class TrackingHistory(object):
         self.slam_states.clear()
 
 
+# Run the frame-by-frame tracking front-end and manage keyframe decisions.
 class Tracking:
     def __init__(self, slam):
         self.slam = slam
         self.motion_model = MotionModel()
+        self.relocalizer = Relocalizer(self.map)
 
         self.descriptor_distance_sigma = FeatureTrackerShared.feature_manager.max_descriptor_distance
         self.reproj_err_frame_map_sigma = Parameters.kMaxReprojectionDistanceMap
@@ -412,22 +386,60 @@ class Tracking:
         return True
 
     def track_keyframe(self, keyframe: KeyFrame, f_cur: Frame, name="match-frame-keyframe"):
-        f_cur.update_pose(keyframe.pose())
+        """
+        Track current frame against reference keyframe.
+
+        pose, not blindly from the keyframe pose. This avoids a large pose jump
+        when the keyframe is older than the previous frame.
+        """
+        if self.f_ref is not None:
+            f_cur.update_pose(self.f_ref.pose())
+        else:
+            f_cur.update_pose(keyframe.pose())
+
         return self.track_reference_frame(keyframe, f_cur, name)
+
+    def _elect_best_kf_ref(self, local_keyframes):
+        """Return the local KF sharing the most matched map points with f_cur.
+
+        for need_new_keyframe() must stay in sync with what the current frame
+        actually sees, not frozen at last KF creation time.
+        """
+        if self.f_cur is None or not local_keyframes:
+            return None
+        counter: dict = {}
+        for p in self.f_cur.get_matched_good_points():
+            if p is None or (hasattr(p, "is_bad") and p.is_bad()):
+                continue
+            for kf, _ in p.observations():
+                if kf is None or (hasattr(kf, "is_bad") and kf.is_bad()):
+                    continue
+                counter[kf] = counter.get(kf, 0) + 1
+        if not counter:
+            return None
+        return max(counter, key=counter.__getitem__)
 
     def update_local_map(self):
         self.f_cur.clean_bad_map_points()
 
         reference = self.kf_ref
-        if reference is None:
+        # If kf_ref was culled, fall back to kf_last then any valid KF in the map
+        if reference is None or (hasattr(reference, "is_bad") and reference.is_bad()):
             reference = self.kf_last
+        if reference is None or (hasattr(reference, "is_bad") and reference.is_bad()):
+            all_kfs = [kf for kf in self.map.get_keyframes() if not kf.is_bad()]
+            reference = all_kfs[-1] if all_kfs else None
 
         if reference is not None:
             self.map.update_local_map(reference)
             self.local_keyframes = self.map.get_local_keyframes().to_list()
             self.local_points = self.map.get_local_points().to_list()
-            self.kf_ref = reference
-            self.f_cur.kf_ref = reference
+            # with the current frame. Keeps num_tracked_points(3) meaningful each frame.
+            best_ref = self._elect_best_kf_ref(self.local_keyframes)
+            if best_ref is None:
+                best_ref = reference
+            self.kf_ref = best_ref
+            self.f_cur.kf_ref = best_ref
         else:
             self.local_keyframes = []
             self.local_points = []
@@ -482,6 +494,11 @@ class Tracking:
         if self.sensor_type == SensorType.MONOCULAR:
             return False
 
+        # Do not insert KFs while LM is stopped (e.g., during loop correction)
+        if self.local_mapping is not None:
+            if getattr(self.local_mapping, "stopped", False) or getattr(self.local_mapping, "stop_requested", False):
+                return False
+
         if self.local_mapping is not None:
             is_idle = getattr(self.local_mapping, "is_idle", lambda: True)()
         else:
@@ -494,28 +511,87 @@ class Tracking:
 
         frames_since_last_kf = self.f_cur.id - self.kf_last.id
 
+        # Dynamic reference KF tracked point count.
+        # observations quickly. In our slow Python pipeline, many map points stay at 1-2
+        # observations → kf_ref.num_tracked_points(3) returns ~200-300 instead of 500+, making
+        # the c2 threshold (0.75×ref) fall below plateau tracked counts and stalling KF creation.
+        # Fix: use nMinObs=1 to count all matched valid points, giving a meaningful reference.
+        nMinObs = 1
+        # Guard: if kf_ref was culled (set_bad clears all point observations → returns 0),
+        # fall back to kf_last, then any valid map KF, so c2 always has a meaningful baseline.
+        kf_ref_for_count = self.kf_ref
+        if kf_ref_for_count is None or (hasattr(kf_ref_for_count, "is_bad") and kf_ref_for_count.is_bad()):
+            kf_ref_for_count = self.kf_last
+        if kf_ref_for_count is None or (hasattr(kf_ref_for_count, "is_bad") and kf_ref_for_count.is_bad()):
+            all_kfs = [kf for kf in self.map.get_keyframes() if not kf.is_bad()]
+            kf_ref_for_count = all_kfs[-1] if all_kfs else None
+        num_ref_tracked = (
+            kf_ref_for_count.num_tracked_points(nMinObs) if kf_ref_for_count is not None else 1
+        )
+        num_ref_tracked = max(1, num_ref_tracked)
+        # Keep cache in sync for external readers (e.g., local_BA result update)
+        self.num_kf_ref_tracked_points = num_ref_tracked
+
+        # Current frame matched inlier map points
+        num_matched_cur = self.num_matched_map_points if self.num_matched_map_points is not None else 0
+
+        # Close point starvation check (RGB-D specific)
         num_tracked_close, num_non_tracked_close, _ = (
             TrackingCore.count_tracked_and_non_tracked_close_points(self.f_cur, self.sensor_type)
         )
-
         need_to_insert_close = (
             num_tracked_close < Parameters.kNumMinTrackedClosePointsForNewKfNonMonocular
             and num_non_tracked_close > Parameters.kNumMaxNonTrackedClosePointsForNewKfNonMonocular
         )
 
-        if self.num_kf_ref_tracked_points is None:
-            self.num_kf_ref_tracked_points = max(1, len(self.kf_ref.get_matched_good_points()) if self.kf_ref else 1)
-
+        # Ratio threshold — more permissive during early map build
         ref_ratio = Parameters.kThNewKfRefRatioStereo
+        if num_kfs < 2:
+            ref_ratio = 0.4
 
+        # Single-thread guard: sequential mode has is_idle=True always → clamp min_frames to 3
+        is_threaded = (
+            self.local_mapping is not None
+            and getattr(self.local_mapping, "_thread", None) is not None
+            and getattr(self.local_mapping._thread, "is_alive", lambda: False)()
+        )
+        if not is_threaded:
+            self.min_frames_between_kfs = 3
+
+        # Condition 1a: time fallback — max_frames_between_kfs elapsed since last KF
         c1a = frames_since_last_kf >= self.max_frames_between_kfs
-        c1b = frames_since_last_kf >= self.min_frames_between_kfs and is_idle
-        c2 = (
-            self.num_matched_map_points is not None
-            and self.num_matched_map_points < ref_ratio * self.num_kf_ref_tracked_points
-        ) or need_to_insert_close
 
-        return bool((c1a or c1b) and c2)
+        # Condition 1b: min_frames elapsed AND LM is idle
+        c1b = frames_since_last_kf >= self.min_frames_between_kfs and is_idle
+
+        # Condition 1c: RGB-D idle-bypass — tracking weak or close points starved
+        c1c = self.sensor_type != SensorType.MONOCULAR and (
+            num_matched_cur < Parameters.kThNewKfRefRatioNonMonocular * num_ref_tracked
+            or need_to_insert_close
+        )
+
+        # Condition 2: fewer tracked points than threshold of reference KF (+ absolute min floor)
+        c2 = (
+            (num_matched_cur < ref_ratio * num_ref_tracked or need_to_insert_close)
+            and num_matched_cur > Parameters.kNumMinPointsForNewKf
+        )
+
+        if not ((c1a or c1b or c1c) and c2):
+            return False
+
+        if is_idle:
+            return True
+
+        # LM is busy — for slow Python LM, force insert on time fallback or critical close starvation
+        if c1a or (c1c and need_to_insert_close):
+            if self.local_mapping is not None and hasattr(self.local_mapping, "interrupt_optimization"):
+                self.local_mapping.interrupt_optimization()
+            return True
+
+        # Not critical — interrupt optimization so LM finishes sooner; retry next frame
+        if self.local_mapping is not None and hasattr(self.local_mapping, "interrupt_optimization"):
+            self.local_mapping.interrupt_optimization()
+        return False
 
     def create_new_keyframe(self, img=None):
         if self.f_cur is None:
@@ -523,6 +599,7 @@ class Tracking:
 
         kf_new = KeyFrame(self.f_cur, img=img)
         self.map.add_keyframe(kf_new)
+        self._add_keyframe_to_database(kf_new)
 
         kf_new.init_observations()
 
@@ -541,11 +618,20 @@ class Tracking:
         if self.local_mapping is not None and hasattr(self.local_mapping, "insert_keyframe"):
             self.local_mapping.insert_keyframe(kf_new)
 
+        loop_closing = getattr(self.slam, "loop_closing", None)
+        if loop_closing is not None and hasattr(loop_closing, "insert_keyframe"):
+            loop_closing.insert_keyframe(kf_new)
+
         return kf_new
 
     def relocalize(self, frame: Frame):
-        Printer.orange("Relocalization is deferred until keyframe database / loop-closing port.")
-        return False
+        Printer.green(f"Relocalizing frame id: {frame.id}...")
+        keyframe_database = getattr(self.slam, "keyframe_database", None)
+        return self.relocalizer.relocalize(
+            frame,
+            keyframe_database=keyframe_database,
+            keyframes_map=self.map.keyframes_map,
+        )
 
     def create_vo_points_on_last_frame(self):
         if self.f_ref is None:
@@ -557,7 +643,6 @@ class Tracking:
         return TrackingCore.create_and_add_stereo_map_points_on_new_kf(f, kf, self.map, img)
 
     def wait_for_local_mapping(self):
-        # Full pySLAM threading synchronization will be ported with local_mapping.py.
         return True
 
     def update_history(self):
@@ -580,6 +665,7 @@ class Tracking:
 
         kf0 = KeyFrame(f_cur, img=img)
         self.map.add_keyframe(kf0)
+        self._add_keyframe_to_database(kf0)
 
         num_created = TrackingCore.create_and_add_stereo_map_points_on_new_kf(
             f_cur,
@@ -603,6 +689,14 @@ class Tracking:
 
         return num_created >= Parameters.kInitializerNumMinTriangulatedPointsStereo
 
+    def _add_keyframe_to_database(self, keyframe: KeyFrame) -> None:
+        keyframe_database = getattr(self.slam, "keyframe_database", None)
+        if keyframe_database is None:
+            return
+        if not getattr(keyframe_database, "available", False):
+            return
+        keyframe_database.add(keyframe)
+
     def track(
         self,
         img,
@@ -614,13 +708,15 @@ class Tracking:
         mask_right=None,
     ):
         """
-        pySLAM-style tracking entry point.
 
-        Signature follows pySLAM:
-            track(img, img_right, depth, img_id, timestamp, mask, mask_right)
-
-        The mask arguments are accepted for API compatibility and are reserved
-        for the later masked feature-extraction path.
+        Main state flow:
+          1. Build current frame.
+          2. Initialize first RGB-D keyframe if needed.
+          3. Use previous frame from the map as f_ref.
+          4. Try previous-frame tracking.
+          5. If that fails, fall back to reference-keyframe tracking.
+          6. If pose is valid, track local map.
+          7. Only then update state, motion model, and keyframe insertion.
         """
         f_cur = Frame(
             camera=self.camera,
@@ -632,35 +728,83 @@ class Tracking:
             img_right=img_right,
         )
 
-        self.map.add_frame(f_cur)
         self.f_cur = f_cur
+        self.idxs_ref = []
+        self.idxs_cur = []
+        self.pose_is_ok = False
+        self.num_matched_map_points = 0
+        self.mean_pose_opt_chi2_error = float("inf")
 
+        # First frame: create initial RGB-D keyframe/map.
         if self.state in (SlamState.NO_IMAGES_YET, SlamState.NOT_INITIALIZED):
+            self.map.add_frame(f_cur)
             ok = self._create_initial_rgbd_map(f_cur, img=img)
             self.update_history()
             return ok
 
-        if self.motion_model.is_ok:
-            predicted_pose, _ = self.motion_model.predict_pose(timestamp)
-            f_cur.update_pose(predicted_pose)
-        elif self.f_ref is not None:
-            f_cur.update_pose(self.f_ref.pose())
+        f_ref = self.map.get_frame(-1)
+        self.f_ref = f_ref
 
-        ok_prev = self.track_previous_frame(self.f_ref, f_cur) if self.f_ref is not None else False
+        self.map.add_frame(f_cur)
+        f_cur.kf_ref = self.kf_ref
 
-        if ok_prev:
-            self.track_local_map()
+        if self.state == SlamState.OK:
+            if self.f_ref is not None and hasattr(self.f_ref, "check_replaced_map_points"):
+                self.f_ref.check_replaced_map_points()
+
+            if self.motion_model.is_ok:
+                predicted_pose, _ = self.motion_model.predict_pose(timestamp)
+                f_cur.update_pose(predicted_pose)
+            elif self.f_ref is not None:
+                f_cur.update_pose(self.f_ref.pose())
+            elif self.kf_ref is not None:
+                f_cur.update_pose(self.kf_ref.pose())
+
+            if (not self.motion_model.is_ok) and self.kf_ref is not None:
+                self.track_keyframe(self.kf_ref, f_cur, "match-frame-keyframe")
+            else:
+                if self.f_ref is not None:
+                    self.track_previous_frame(self.f_ref, f_cur)
+
+                if (not self.pose_is_ok) and self.kf_ref is not None:
+                    self.track_keyframe(self.kf_ref, f_cur, "match-frame-keyframe")
+
+            if self.pose_is_ok:
+                self.track_local_map()
+
+        else:
+            if self.state != SlamState.INIT_RELOCALIZE:
+                self.state = SlamState.RELOCALIZE
+
+            if self.relocalize(f_cur):
+                self.last_reloc_frame_id = f_cur.id
+                self.state = SlamState.OK
+                self.pose_is_ok = True
+                self.kf_ref = f_cur.kf_ref
+                self.kf_last = self.kf_ref
+                self.map.update_local_map(self.kf_ref)
+                self.motion_model.reset()
+                Printer.green(
+                    f"Relocalization successful, frame id {f_cur.id} "
+                    f"reconnected to keyframe id {self.kf_ref.id}"
+                )
+            else:
+                self.pose_is_ok = False
+                Printer.red("Relocalization failed")
 
         if self.pose_is_ok:
-            self.motion_model.update_pose_from_matrix(timestamp, f_cur.pose())
             self.state = SlamState.OK
+            self.motion_model.update_pose_from_matrix(timestamp, f_cur.pose())
+            if f_cur.id <= self.last_reloc_frame_id + 1:
+                self.motion_model.is_ok = False
 
             if self.need_new_keyframe():
                 self.create_new_keyframe(img=img)
         else:
             self.state = SlamState.LOST
+            self.motion_model.is_ok = False
 
-        self.f_ref = f_cur
+        # Important: do not assign self.f_ref = f_cur here.
         self.update_history()
 
         return self.pose_is_ok

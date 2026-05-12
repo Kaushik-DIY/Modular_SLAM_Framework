@@ -1,13 +1,6 @@
 """
-RGB-D SE3 essential graph / pose graph correction helpers.
-
-Reference:
-- pySLAM: pyslam/slam/optimizer_g2o.py::optimize_essential_graph()
-- pySLAM: pyslam/loop_closing/loop_closing.py::LoopCorrector.correct_loop()
-
-pySLAM optimizes a Sim3 essential graph. This RGB-D port keeps metric scale
-fixed and optimizes SE3 constraints instead; monocular Sim3 parity is not claimed
-in this checkpoint.
+Essential-graph correction utilities for loop closing.
+This module builds and optimizes the pose graph used to distribute loop corrections.
 """
 
 from __future__ import annotations
@@ -20,6 +13,7 @@ import numpy as np
 from visual_slam.orbslam.slam.config_parameters import Parameters
 
 
+# Store the outcome and graph statistics of one essential-graph optimization.
 @dataclass
 class EssentialGraphResult:
     success: bool
@@ -38,6 +32,7 @@ class EssentialGraphResult:
     edge_weights: dict[str, list[float]] = field(default_factory=dict)
 
 
+# Build and optimize the pose graph used to distribute loop corrections.
 class EssentialGraph:
     def __init__(
         self,

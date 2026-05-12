@@ -1,19 +1,12 @@
 """
-=============================================================================
-visual_slam/orbslam/utilities/logging.py
-
-Small pySLAM-compatible Printer subset.
-
-Reference:
-- pySLAM: pyslam/utilities/logging.py
-
-Only Printer methods used by the ORB-SLAM subset are implemented.
-=============================================================================
+Minimal logging helpers.
+This module exposes a small print-based logger with color-style method names.
 """
 
 from __future__ import annotations
 
 
+# Expose a tiny print-based logger with severity-style method names.
 class Printer:
     @staticmethod
     def red(*args, **kwargs):

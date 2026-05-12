@@ -1,16 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/feature_tracker_shared.py
-
-pySLAM-aligned shared feature-tracker state.
-
-Reference:
-- pySLAM: pyslam/slam/feature_tracker_shared.py
-
-The C++ callback logic from pySLAM is deliberately omitted because this thesis
-port runs inside the current Python/g2o environment. The shared Python fields
-needed by Frame, MapPoint, matchers, and optimizers are preserved.
-=============================================================================
+Shared feature front-end state for the SLAM system.
+This module stores the active tracker, feature manager, and orientation settings.
 """
 
 from __future__ import annotations
@@ -26,6 +16,7 @@ if TYPE_CHECKING:
     from visual_slam.orbslam.local_features.feature_manager import FeatureManager
 
 
+# Cache the feature-manager properties needed across the SLAM modules.
 class SlamFeatureManagerInfo:
     """Minimal information about the feature manager used by SLAM."""
 
@@ -46,6 +37,7 @@ class SlamFeatureManagerInfo:
             self.max_descriptor_distance = feature_manager.max_descriptor_distance
 
 
+# Expose the active front-end components as shared global state.
 class FeatureTrackerShared:
     feature_tracker: "FeatureTracker | None" = None
     feature_manager: "FeatureManager | None" = None

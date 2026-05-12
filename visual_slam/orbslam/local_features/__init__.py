@@ -1,3 +1,8 @@
+"""
+Local feature subsystem exports.
+This package exposes detector, descriptor, matcher, and tracker building blocks.
+"""
+
 from visual_slam.orbslam.local_features.feature_types import (
     FeatureDescriptorTypes,
     FeatureDetectorTypes,
@@ -8,6 +13,14 @@ from visual_slam.orbslam.local_features.feature_matcher import (
     FeatureMatcherTypes,
     FeatureMatchingResult,
     feature_matcher_factory,
+)
+from visual_slam.orbslam.local_features.extractor_backends import (
+    BackendUnavailableError,
+    DEFAULT_EXTRACTOR_BACKEND,
+    FeatureExtractionResult,
+    OpenCVORBBackend,
+    PySLAMORB2Backend,
+    create_extractor_backend,
 )
 from visual_slam.orbslam.local_features.feature_manager import (
     FeatureManager,
@@ -33,6 +46,12 @@ __all__ = [
     "FeatureMatcherTypes",
     "FeatureMatchingResult",
     "feature_matcher_factory",
+    "BackendUnavailableError",
+    "DEFAULT_EXTRACTOR_BACKEND",
+    "FeatureExtractionResult",
+    "OpenCVORBBackend",
+    "PySLAMORB2Backend",
+    "create_extractor_backend",
     "FeatureManager",
     "feature_manager_factory",
     "FeatureTracker",

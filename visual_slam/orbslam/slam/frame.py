@@ -1,26 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/frame.py
-
-pySLAM-aligned FrameBase and Frame subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/frame.py
-
-Scope:
-- Keep pySLAM's Tcw pose convention through CameraPose.
-- Keep projection/visibility helpers.
-- Keep ORB feature extraction via FeatureTrackerShared.
-- Keep RGB-D depth association and virtual stereo coordinate uR.
-- Keep map-point association containers needed by tracking/local mapping.
-
-Excluded for now:
-- semantic fields
-- JSON serialization
-- threaded matching
-- Sim3/PnP solver preparation
-- full stereo correlation matching
-=============================================================================
+Frame representation for RGB-D tracking and mapping.
+This module stores image-derived data, pose state, and projection/visibility helpers.
 """
 
 from __future__ import annotations
@@ -40,6 +20,7 @@ from visual_slam.orbslam.slam.config_parameters import Parameters
 
 kMinDepth = Parameters.kMinDepth
 
+# Provide a minimal radius-search structure when scipy is unavailable.
 class SimpleKDTree:
     """Small query_ball_point-compatible fallback for scipy.spatial.cKDTree."""
 
@@ -96,7 +77,6 @@ def ensure_frame_feature_arrays(frame) -> None:
 
 
 def detect_and_compute(img: np.ndarray, left: bool = True, mask=None):
-    """Feature extraction through the shared feature tracker, like pySLAM."""
     if left:
         if FeatureTrackerShared.feature_tracker is None:
             raise RuntimeError("FeatureTrackerShared.feature_tracker is not set.")
@@ -125,6 +105,7 @@ def _as_points_array(points_or_map_points) -> np.ndarray:
     return np.ascontiguousarray(pts, dtype=np.float64)
 
 
+# Store the common camera, pose, and projection state shared by frame types.
 class FrameBase:
     """Base object for camera intrinsics, pose, projection, and visibility."""
 
@@ -304,9 +285,9 @@ class FrameBase:
         return visible, projs, depths, dists
 
 
+# Represent one RGB-D frame together with extracted features and map links.
 class Frame(FrameBase):
     """
-    pySLAM-like frame object for ORB/RGB-D SLAM.
 
     Important fields preserved for later porting:
     - kps / kpsu
@@ -347,6 +328,9 @@ class Frame(FrameBase):
 
         self.depths: np.ndarray = np.empty((0,), dtype=np.float32)
         self.uRs: np.ndarray = np.empty((0,), dtype=np.float32)
+        self.octaves: np.ndarray = np.empty((0,), dtype=np.int32)
+        self.angles: np.ndarray = np.empty((0,), dtype=np.float32)
+        self.sizes: np.ndarray = np.empty((0,), dtype=np.float32)
 
         self.points: list[Any | None] = []
         self.outliers: np.ndarray = np.empty((0,), dtype=bool)
@@ -356,6 +340,12 @@ class Frame(FrameBase):
         self._is_deleted = False
         self.is_keyframe = False
         self.kf_ref = None
+
+        # BoW/global descriptor fields used by relocalization and loop closing.
+        self.g_des = None
+        self.f_des = None
+        self.bow_vector = None
+        self.feature_vector = None
         self.is_blurry = False
         self.laplacian_var = None
 
@@ -381,6 +371,9 @@ class Frame(FrameBase):
         self.des = np.ascontiguousarray(self.des)
         self.depths = np.ascontiguousarray(self.depths)
         self.uRs = np.ascontiguousarray(self.uRs)
+        self.octaves = np.ascontiguousarray(self.octaves)
+        self.angles = np.ascontiguousarray(self.angles)
+        self.sizes = np.ascontiguousarray(self.sizes)
         self.outliers = np.ascontiguousarray(self.outliers)
         self.idxs = np.ascontiguousarray(self.idxs)
 
@@ -398,6 +391,7 @@ class Frame(FrameBase):
         self.idxs = np.arange(n, dtype=np.int32)
         self.octaves = np.array([max(0, int(getattr(kp, 'octave', 0))) for kp in self.kps], dtype=np.int32)
         self.angles = np.array([float(getattr(kp, 'angle', -1.0)) for kp in self.kps], dtype=np.float32)
+        self.sizes = np.array([float(getattr(kp, 'size', 0.0)) for kp in self.kps], dtype=np.float32)
         pts = np.array([kp.pt for kp in self.kps], dtype=np.float64).reshape(-1, 2)
         self.kpsn = self.camera.unproject_points(pts) if len(pts) > 0 else np.empty((0, 2), dtype=np.float64)
         self.kps_ur = self.uRs
@@ -533,10 +527,14 @@ class Frame(FrameBase):
     def get_unmatched_points_idxs(self) -> np.ndarray:
         return np.array([i for i, p in enumerate(self.points) if p is None], dtype=np.int32)
 
+    def compute_bow(self, vocabulary):
+        from visual_slam.orbslam.slam.bow import compute_bow_for_frame
+
+        return compute_bow_for_frame(self, vocabulary)
+
 
     def get_matched_good_points_and_idxs(self):
         """
-        pySLAM-compatible matched good point/index pairs.
 
         Returns:
             list[(MapPoint, keypoint_idx)]
@@ -576,7 +574,6 @@ class Frame(FrameBase):
         """
         Count tracked map points with at least min_num_observations.
 
-        pySLAM local mapping uses this after local BA to evaluate how many
         reference-keyframe points remain supported.
         """
         count = 0
@@ -596,7 +593,6 @@ class Frame(FrameBase):
         """
         Replace frame associations when a MapPoint has been substituted.
 
-        pySLAM calls this before tracking from the previous frame because local
         mapping/fusion can replace map points between frames.
         """
         replaced = 0
@@ -618,8 +614,12 @@ class Frame(FrameBase):
                     replacement = p.get_replacement()
                 except Exception:
                     replacement = None
-            elif hasattr(p, "replacement"):
-                replacement = p.replacement
+            # Fallback: check .replacement attribute even when get_replacement() returned None
+            if replacement is None and hasattr(p, "replacement"):
+                try:
+                    replacement = p.replacement
+                except Exception:
+                    replacement = None
 
             if replacement is None or replacement is p:
                 continue
@@ -631,7 +631,6 @@ class Frame(FrameBase):
             try:
                 replacement.add_frame_view(self, idx)
             except Exception:
-                # The point assignment above is still the important pySLAM-style
                 # frame-side replacement. add_frame_view may no-op if the
                 # replacement already owns the frame view.
                 pass
@@ -724,7 +723,6 @@ def match_frames(frame_ref: Frame, frame_cur: Frame, ratio_test: float | None = 
     """
     Minimal descriptor matching helper.
 
-    Full pySLAM frame matching includes geometric filtering and threading. This
     subset delegates to the shared ORB matcher and returns index arrays.
     """
     if FeatureTrackerShared.feature_matcher is None:

@@ -135,9 +135,12 @@ def test_slam_state_and_trajectory_accessors():
 
     assert "poses" in traj
     assert "timestamps" in traj
-    assert "history" in traj
+    assert "slam_states" in traj
+    assert "ids" in traj
     assert isinstance(traj["poses"], list)
     assert isinstance(traj["timestamps"], list)
+    assert isinstance(traj["slam_states"], list)
+    assert len(traj["poses"]) == len(traj["timestamps"]) == len(traj["slam_states"])
 
 
 def test_slam_reset_preserves_module_ownership_and_clears_request():

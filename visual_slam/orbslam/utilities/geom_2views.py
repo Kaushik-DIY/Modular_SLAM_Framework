@@ -1,17 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/utilities/geom_2views.py
-
-pySLAM two-view geometry helper subset.
-
-Reference:
-- pySLAM: pyslam/utilities/geom_2views.py
-
-Important convention:
-- estimate_pose_ess_mat returns Trc, where pr = Trc * pc.
-  This matches pySLAM's documented convention:
-  current frame with respect to reference frame.
-=============================================================================
+Two-view geometry helpers.
+This module estimates essential-matrix motion and epipolar relations between frames.
 """
 
 from __future__ import annotations
@@ -144,7 +133,6 @@ def estimate_pose_ess_mat(
         return None, None
 
     # OpenCV gives current-from-reference: pc = Tcr * pr.
-    # pySLAM helper returns reference-from-current: pr = Trc * pc.
     Trc = inv_poseRt(Rcr, np.asarray(tcr).reshape(3))
 
     if mask_pose is not None:

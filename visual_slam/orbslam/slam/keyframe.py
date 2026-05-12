@@ -1,26 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/keyframe.py
-
-pySLAM-aligned KeyFrameGraph and KeyFrame subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/keyframe.py
-
-Scope retained:
-- spanning tree: parent/children
-- loop edges
-- covisibility graph with ordered weights
-- KeyFrame construction from Frame without recomputing features
-- map-point observation initialization
-- covisibility update
-- bad-keyframe cleanup
-
-Excluded for now:
-- JSON serialization
-- full map reload helpers
-- full bad-keyframe child reparenting complexity beyond the required subset
-=============================================================================
+Keyframe representation and graph structure.
+This module stores covisibility, spanning-tree, loop-edge, and observation relationships.
 """
 
 from __future__ import annotations
@@ -36,9 +16,9 @@ from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.frame import Frame
 
 
+# Store the graph relationships attached to one keyframe.
 class KeyFrameGraph:
-    """pySLAM-like graph container for a keyframe."""
-
+    """Graph container storing parent, child, loop, and covisibility edges."""
     def __init__(self):
         self._lock_features = RLock()
         self._lock_connections = Lock()
@@ -191,8 +171,8 @@ class KeyFrameGraph:
             }
 
 
+# Represent a selected map keyframe with graph and observation state.
 class KeyFrame(Frame, KeyFrameGraph):
-    """pySLAM-like keyframe derived from a Frame."""
 
     def __init__(
         self,
@@ -215,7 +195,6 @@ class KeyFrame(Frame, KeyFrameGraph):
             img_id=frame.img_id,
         )
 
-        # Keep image references like pySLAM; no expensive copies here.
         self.img = frame.img if frame.img is not None else img
         self.img_right = frame.img_right if frame.img_right is not None else img_right
         self.depth_img = frame.depth_img if frame.depth_img is not None else depth
@@ -242,7 +221,6 @@ class KeyFrame(Frame, KeyFrameGraph):
         self.uRs = frame.uRs
         self.kps_ur = frame.uRs
 
-        # Optional pySLAM-compatible aliases.
         self.kpsn = getattr(frame, "kpsn", None)
         self.octaves = np.array([max(0, int(getattr(kp, "octave", 0))) for kp in self.kps], dtype=np.int32)
         self.sizes = np.array([float(getattr(kp, "size", 0.0)) for kp in self.kps], dtype=np.float32)
@@ -254,6 +232,9 @@ class KeyFrame(Frame, KeyFrameGraph):
 
         # Loop closing fields
         self.g_des = None
+        self.f_des = None
+        self.bow_vector = None
+        self.feature_vector = None
         self.loop_query_id = None
         self.num_loop_words = 0
         self.loop_score = 0.0
@@ -290,7 +271,6 @@ class KeyFrame(Frame, KeyFrameGraph):
 
     def update_connections(self) -> None:
         """
-        Build covisibility graph from shared map points, following pySLAM logic.
         """
         points = self.get_matched_good_points()
         if len(points) == 0:
@@ -349,6 +329,11 @@ class KeyFrame(Frame, KeyFrameGraph):
         with self._lock_connections:
             return self._is_bad
 
+    def compute_bow(self, vocabulary):
+        from visual_slam.orbslam.slam.bow import compute_bow_for_frame
+
+        return compute_bow_for_frame(self, vocabulary)
+
     def set_not_erase(self) -> None:
         with self._lock_connections:
             self.not_to_erase = True
@@ -364,12 +349,7 @@ class KeyFrame(Frame, KeyFrameGraph):
             self.set_bad()
 
     def set_bad(self) -> None:
-        """
-        Mark this keyframe bad and remove graph/point links.
-
-        This is a reduced pySLAM-compatible version. Full child reparenting will
-        be expanded when local mapping and loop closing are ported.
-        """
+        """Mark this keyframe bad and detach its graph and point links."""
         with self._lock_connections:
             if self.kid == 0:
                 return
@@ -412,18 +392,15 @@ class KeyFrame(Frame, KeyFrameGraph):
 
     def get_matched_good_points_and_idxs(self):
         """
-        Return pySLAM-compatible matched good point/index pairs.
 
-        pySLAM LocalMappingCore expects:
-            for p, idx in keyframe.get_matched_good_points_and_idxs():
-                ...
+        Returns:
+            list[(MapPoint, keypoint_idx)]
 
-        Therefore this method must return a list of (MapPoint, keypoint_idx)
-        tuples, not a tuple of separate lists.
+        The index must be the original keypoint index in self.points, not the
+        compact index of get_points().
         """
         pairs = []
-
-        points = self.get_points() if hasattr(self, "get_points") else getattr(self, "points", [])
+        points = getattr(self, "points", [])
         outliers = getattr(self, "outliers", None)
 
         for idx, p in enumerate(points):
@@ -437,23 +414,19 @@ class KeyFrame(Frame, KeyFrameGraph):
 
         return pairs
 
-
     def get_matched_good_points(self):
-        """Return non-bad matched map points, pySLAM-compatible."""
+        """Return non-bad matched map points."""
         return [p for p, _ in self.get_matched_good_points_and_idxs()]
 
-
     def get_matched_good_points_idxs(self):
-        """Return indices of non-bad matched map points, pySLAM-compatible."""
-        return [idx for _, idx in self.get_matched_good_points_and_idxs()]
-
+        """Return original keypoint indices of non-bad matched map points."""
+        return np.asarray(
+            [idx for _, idx in self.get_matched_good_points_and_idxs()],
+            dtype=np.int32,
+        )
 
     def num_tracked_points(self, min_num_observations=0):
-        """
-        Count tracked map points with at least min_num_observations.
-
-        This is required by pySLAM LocalMappingCore.local_BA().
-        """
+        """Count tracked map points with at least min_num_observations."""
         count = 0
 
         for p, _ in self.get_matched_good_points_and_idxs():
@@ -467,3 +440,39 @@ class KeyFrame(Frame, KeyFrameGraph):
 
         return count
 
+    def check_replaced_map_points(self):
+        """
+        Replace frame associations when a MapPoint has been substituted.
+
+        mapping / fusion can replace map points between frames.
+        """
+        replaced = 0
+
+        points = getattr(self, "points", [])
+        for idx, p in enumerate(list(points)):
+            if p is None:
+                continue
+
+            replacement = None
+
+            if hasattr(p, "get_replacement"):
+                try:
+                    replacement = p.get_replacement()
+                except Exception:
+                    replacement = None
+            # Fallback: check .replacement attribute even when get_replacement() returned None
+            if replacement is None and hasattr(p, "replacement"):
+                try:
+                    replacement = p.replacement
+                except Exception:
+                    replacement = None
+
+            if replacement is not None and replacement is not p:
+                points[idx] = replacement
+                try:
+                    replacement.add_frame_view(self, idx)
+                except Exception:
+                    pass
+                replaced += 1
+
+        return replaced

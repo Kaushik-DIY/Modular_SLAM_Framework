@@ -1,14 +1,6 @@
 """
-Synchronous RGB-D Global Bundle Adjustment coordinator.
-
-Reference:
-- pySLAM: pyslam/slam/global_bundle_adjustment.py
-- pySLAM: pyslam/slam/optimizer_g2o.py::global_bundle_adjustment()
-
-pySLAM launches loop-triggered GBA in a background process/thread and applies
-updates later through a correction step. This RGB-D port keeps the same
-deferred-write structure but runs synchronously so tests and benchmark smoke
-runs remain deterministic.
+Global bundle-adjustment coordinator.
+This module runs a full-map optimization pass and applies the validated updates.
 """
 
 from __future__ import annotations
@@ -23,6 +15,7 @@ from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.optimizer_g2o import global_bundle_adjustment
 
 
+# Store the summary of one global bundle-adjustment run.
 @dataclass
 class GlobalBAResult:
     started: bool = False
@@ -43,6 +36,7 @@ class GlobalBAResult:
         return asdict(self)
 
 
+# Prepare, execute, and validate a full-map bundle-adjustment pass.
 class GlobalBundleAdjuster:
     def __init__(
         self,
@@ -117,6 +111,18 @@ class GlobalBundleAdjuster:
         result.mean_error_after = _finite_or_none(updates.get("mean_error_after"))
         result.fixed_keyframe_ids = tuple(int(kid) for kid in updates.get("fixed_keyframes", ()))
 
+        total_edges = result.num_inliers + result.num_outliers
+        if total_edges > 0:
+            outlier_rate = result.num_outliers / total_edges
+            if outlier_rate > 0.30:
+                result.reason = (
+                    f"GBA outlier rate {outlier_rate:.1%} exceeds 30% — "
+                    f"map likely corrupted by a false loop; aborting to prevent further damage"
+                )
+                result.elapsed_sec = time.time() - start_t
+                self.last_result = result
+                return result
+
         if _abort_requested(opt_abort_flag):
             result.aborted = True
             result.reason = "aborted during optimization"
@@ -170,6 +176,9 @@ class GlobalBundleAdjuster:
                 continue
             if point in seen or point.num_observations() < self.min_point_observations:
                 continue
+            point_w = point.get_position()
+            if not np.all(np.isfinite(point_w)):
+                continue
             observations = [
                 (kf, idx)
                 for kf, idx in point.observations()
@@ -177,7 +186,7 @@ class GlobalBundleAdjuster:
             ]
             if len(observations) == 0:
                 continue
-            if not np.all(np.isfinite(point.get_position())):
+            if not any(_kf_has_positive_depth(kf, point_w) for kf, _ in observations):
                 continue
             points.append(point)
             seen.add(point)
@@ -310,6 +319,15 @@ def _abort_requested(stop_flag) -> bool:
     return bool(value)
 
 
+def _kf_has_positive_depth(kf, point_w: np.ndarray) -> bool:
+    try:
+        Tcw = np.asarray(kf.Tcw(), dtype=np.float64).reshape(4, 4)
+        p_c = Tcw[:3, :3] @ point_w + Tcw[:3, 3]
+        return bool(np.isfinite(p_c[2]) and p_c[2] > Parameters.kMinDepth)
+    except Exception:
+        return False
+
+
 def _finite_or_none(value):
     try:
         value = float(value)
@@ -326,6 +344,7 @@ def _as_list(values) -> list:
     return list(values)
 
 
+# Provide a no-op lock interface for code paths that do not need synchronization.
 class _NullLock:
     def __enter__(self):
         return self

@@ -18,9 +18,13 @@ dist/
 
 # Local build artifacts
 third_party/build/
+third_party/vocabs/
 third_party/local/orbslam2_features/*.so
 third_party/local/orbslam2_features/*.pyd
 third_party/local/orbslam2_features/*.dylib
+third_party/local/pydbow3/*.so
+third_party/local/pydbow3/*.pyd
+third_party/local/pydbow3/*.dylib
 
 # Local environment backups
 .venv_backup_before_orbslam2_features/

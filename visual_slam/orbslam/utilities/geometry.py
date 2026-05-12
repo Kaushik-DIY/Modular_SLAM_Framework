@@ -1,15 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/utilities/geometry.py
-
-pySLAM geometry helper subset.
-
-Reference:
-- pySLAM: pyslam/utilities/geometry.py
-
-Kept close to pySLAM naming so later modules can be ported without rewriting
-helper calls.
-=============================================================================
+Small geometry helper functions.
+This module provides SE3 algebra, angle utilities, normalization, and skew matrices.
 """
 
 from __future__ import annotations

@@ -1,12 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/slam_commons.py
-
-pySLAM-aligned SLAM state definitions.
-
-Reference:
-- pySLAM: pyslam/slam/slam_commons.py
-=============================================================================
+Shared SLAM state definitions.
+This module defines the high-level states reported by the tracking pipeline.
 """
 
 from __future__ import annotations
@@ -14,9 +8,9 @@ from __future__ import annotations
 from enum import Enum
 
 
+# Enumerate the high-level states reported by the SLAM pipeline.
 class SlamState(Enum):
-    """pySLAM-compatible SLAM state values."""
-
+    """High-level states reported by the SLAM system."""
     NO_IMAGES_YET = 0
     NOT_INITIALIZED = 1
     OK = 2

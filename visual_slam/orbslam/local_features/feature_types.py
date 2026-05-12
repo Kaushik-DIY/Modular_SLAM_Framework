@@ -1,15 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/local_features/feature_types.py
-
-pySLAM-aligned minimal feature type definitions for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/local_features/feature_types.py
-
-Only the ORB/ORB2 subset is implemented now. Enum names are kept pySLAM-like
-so later modules can be ported with minimal changes.
-=============================================================================
+Feature type definitions for the local feature stack.
+This module collects the detector and descriptor enums used across the pipeline.
 """
 
 from __future__ import annotations
@@ -17,6 +8,7 @@ from __future__ import annotations
 from enum import Enum
 
 
+# Enumerate the keypoint detector families used by the front-end.
 class FeatureDetectorTypes(Enum):
     NONE = 0
     SHI_TOMASI = 1
@@ -25,18 +17,16 @@ class FeatureDetectorTypes(Enum):
     ORB2 = 4
 
 
+# Enumerate the descriptor families used by the front-end.
 class FeatureDescriptorTypes(Enum):
     NONE = 0
     ORB = 1
     ORB2 = 2
 
 
+# Provide small capability checks for detector and descriptor types.
 class FeatureInfo:
-    """
-    Minimal pySLAM-like feature metadata helper.
-
-    The ORB/ORB2 path uses binary descriptors and Hamming distance.
-    """
+    """Small metadata helper for detector and descriptor capabilities."""
 
     @staticmethod
     def is_binary_descriptor(descriptor_type: FeatureDescriptorTypes) -> bool:

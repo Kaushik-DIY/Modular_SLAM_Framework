@@ -1,8 +1,6 @@
 """
-pySLAM-aligned ORB-SLAM core package.
-
-This package contains the self-contained ORB/RGB-D SLAM implementation.
-The legacy flat visual_slam modules remain outside this package.
+ORB-SLAM RGB-D core exports.
+This package re-exports the camera, map, tracking, mapping, and optimization modules.
 """
 
 from visual_slam.orbslam.slam.sensor_types import (

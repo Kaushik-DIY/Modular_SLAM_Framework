@@ -1,16 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/camera.py
-
-pySLAM-aligned pinhole camera subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/camera.py
-
-This keeps the module names and core behavior needed by the ORB/RGB-D path:
-CameraType, fov conversion, projection, stereo projection, backprojection,
-K/Kinv, bf/baseline/depth factor, and image-bound checks.
-=============================================================================
+Camera models and projection helpers for RGB-D SLAM.
+This module stores intrinsics and provides projection, backprojection, and image-bound checks.
 """
 
 from __future__ import annotations
@@ -26,8 +16,9 @@ from visual_slam.orbslam.slam.sensor_types import SensorType, get_sensor_type
 from visual_slam.orbslam.slam.config_parameters import Parameters
 
 
+# Enumerate the camera model families supported by the pipeline.
 class CameraType(Enum):
-    """pySLAM-compatible camera type values."""
+    """Supported camera model identifiers."""
 
     NONE = 0
     PINHOLE = 1
@@ -46,8 +37,9 @@ def _add_ones(uvs: np.ndarray) -> np.ndarray:
     return np.concatenate([uvs, np.ones((uvs.shape[0], 1), dtype=uvs.dtype)], axis=1)
 
 
+# Group reusable projection and backprojection helper functions.
 class CameraUtils:
-    """Static camera geometry helpers following pySLAM's conventions."""
+    """Static camera geometry helpers used across tracking and mapping."""
 
     @staticmethod
     def backproject_3d(uv: np.ndarray, depth: np.ndarray, K: np.ndarray) -> np.ndarray:
@@ -107,6 +99,7 @@ class CameraUtils:
         )
 
 
+# Hold the common intrinsic and geometric fields shared by all camera models.
 class CameraBase:
     def __init__(self):
         self.type = CameraType.NONE
@@ -135,13 +128,12 @@ class CameraBase:
         self.initialized = False
 
 
+# Represent a calibrated camera with projection and image-bound checks.
 class Camera(CameraBase):
     """
-    pySLAM-like camera base.
 
     This implementation accepts either:
     - None
-    - a dict using pySLAM-style keys, e.g. Camera.fx, Camera.width, Camera.bf
     - explicit keyword parameters through subclasses/classmethods
     """
 
@@ -238,8 +230,8 @@ class Camera(CameraBase):
         self.set_intrinsic_matrices()
 
 
+# Specialize the generic camera model for the pinhole RGB-D setup.
 class PinholeCamera(Camera):
-    """pySLAM-aligned pinhole camera."""
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)

@@ -1,12 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/local_features/feature_tracker.py
-
-pySLAM-aligned minimal FeatureTracker for ORB2 + BF matching.
-
-Reference:
-- pySLAM: pyslam/local_features/feature_tracker.py
-=============================================================================
+Feature tracking wrapper for frame-to-frame correspondence.
+This module couples feature extraction with descriptor matching for the front-end.
 """
 
 from __future__ import annotations
@@ -29,6 +23,7 @@ from visual_slam.orbslam.local_features.feature_matcher import (
 from visual_slam.orbslam.slam.config_parameters import Parameters
 
 
+# Enumerate the feature tracking modes exposed by the front-end.
 class FeatureTrackerTypes(Enum):
     NONE = 0
     LK = 1
@@ -36,6 +31,7 @@ class FeatureTrackerTypes(Enum):
     DES_FLANN = 3
 
 
+# Store one frame-to-frame feature tracking result.
 @dataclass
 class FeatureTrackingResult:
     kps_ref: list
@@ -47,6 +43,7 @@ class FeatureTrackingResult:
     matches: list
 
 
+# Couple feature extraction and descriptor matching for tracking.
 class FeatureTracker:
     def __init__(
         self,
@@ -77,6 +74,9 @@ class FeatureTracker:
 
     def detectAndCompute(self, image: np.ndarray, mask=None):
         return self.feature_manager.detectAndCompute(image, mask)
+
+    def extract(self, image: np.ndarray, mask=None):
+        return self.feature_manager.extract(image, mask)
 
     def track(self, image_ref, image_cur, kps_ref, des_ref):
         kps_cur, des_cur = self.detectAndCompute(image_cur)

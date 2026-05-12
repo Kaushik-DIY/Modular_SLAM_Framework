@@ -1,20 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/local_mapping_core.py
-
-pySLAM-aligned LocalMappingCore subset.
-
-Reference:
-- pySLAM: pyslam/slam/local_mapping_core.py
-
-Core responsibilities:
-- process_new_keyframe
-- cull_map_points
-- local_BA
-- large_window_BA
-- cull_keyframes
-- fuse_map_points
-=============================================================================
+Core local-mapping operations.
+This module handles triangulation, culling, local BA, and local map fusion.
 """
 
 from __future__ import annotations
@@ -56,6 +42,7 @@ def _point_first_kid(point: MapPoint, fallback_kid: int) -> int:
     return min(int(kf.kid) for kf, _ in observations)
 
 
+# Implement the core map-growth and local-refinement operations.
 class LocalMappingCore:
     print = staticmethod(lambda *args, **kwargs: None)
 

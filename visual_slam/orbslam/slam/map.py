@@ -1,28 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/map.py
-
-pySLAM-aligned Map subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/map.py
-
-Scope retained:
-- recent frame buffer
-- ordered keyframes
-- map points
-- keyframe origins
-- frame-id -> keyframe lookup
-- max frame/keyframe/point ID counters
-- add/remove/get methods
-- local covisibility map
-
-Excluded for now:
-- serialization/reload
-- viewer drawing arrays
-- semantic/dense map hooks
-- add_points triangulation path
-=============================================================================
+Global sparse map container.
+This module stores frames, keyframes, landmarks, and local-covisibility bookkeeping.
 """
 
 from __future__ import annotations
@@ -43,11 +21,11 @@ from visual_slam.orbslam.slam.optimizer_g2o import local_bundle_adjustment, glob
 kMaxLenFrameDeque = 20
 
 
+# Provide a lightweight ordered set for keyframes and map points.
 class OrderedSetLite:
     """
     Minimal ordered-set replacement.
 
-    pySLAM uses ordered_set.OrderedSet. To keep this package self-contained, this
     small container preserves insertion order and supports the subset used by the
     ORB-SLAM path.
     """
@@ -101,6 +79,7 @@ class OrderedSetLite:
         return f"OrderedSetLite({self._items!r})"
 
 
+# Store counters recovered from a previously saved map session.
 @dataclass
 class ReloadedSessionMapInfo:
     num_keyframes: int
@@ -110,8 +89,8 @@ class ReloadedSessionMapInfo:
     max_keyframe_id: int
 
 
+# Hold cached map-state arrays used by visualization and export code.
 class MapStateData:
-    """Small pySLAM-compatible map state container for later visualization."""
 
     def __init__(self):
         self.poses = []
@@ -126,9 +105,9 @@ class MapStateData:
         self.loops = []
 
 
+# Maintain the local keyframe and point neighborhood around a reference keyframe.
 class LocalCovisibilityMap:
     """
-    pySLAM-style local map based on covisibility.
 
     The local map consists of:
     - the reference keyframe
@@ -141,16 +120,19 @@ class LocalCovisibilityMap:
         self.reference_keyframe = None
         self.local_keyframes = OrderedSetLite()
         self.local_points = OrderedSetLite()
+        self.ref_keyframes = OrderedSetLite()
 
     def reset(self) -> None:
         self.reference_keyframe = None
         self.local_keyframes.clear()
         self.local_points.clear()
+        self.ref_keyframes.clear()
 
     def reset_session(self, keyframes_to_remove=None, points_to_remove=None) -> None:
         if keyframes_to_remove:
             for kf in keyframes_to_remove:
                 self.local_keyframes.discard(kf)
+                self.ref_keyframes.discard(kf)
         if points_to_remove:
             for p in points_to_remove:
                 self.local_points.discard(p)
@@ -160,11 +142,11 @@ class LocalCovisibilityMap:
         self.reference_keyframe = reference_keyframe
 
         if reference_keyframe is None:
-            return
+            return self.get_keyframes(), self.get_points(), self.ref_keyframes.copy()
 
         self.local_keyframes.add(reference_keyframe)
 
-        for kf in reference_keyframe.get_best_covisible_keyframes(num_best):
+        for kf in reference_keyframe.get_covisible_keyframes():
             if kf is not None and not kf.is_bad():
                 self.local_keyframes.add(kf)
 
@@ -172,6 +154,13 @@ class LocalCovisibilityMap:
             for p in kf.get_matched_good_points():
                 if p is not None and not p.is_bad():
                     self.local_points.add(p)
+
+        for p in self.local_points:
+            for kf, _ in p.observations():
+                if kf is not None and not kf.is_bad() and kf not in self.local_keyframes:
+                    self.ref_keyframes.add(kf)
+
+        return self.get_keyframes(), self.get_points(), self.ref_keyframes.copy()
 
     def get_keyframes(self) -> OrderedSetLite:
         return self.local_keyframes.copy()
@@ -186,8 +175,8 @@ class LocalCovisibilityMap:
         return len(self.local_points)
 
 
+# Store the global sparse map with frames, keyframes, points, and local neighborhoods.
 class Map:
-    """pySLAM-like sparse SLAM map."""
 
     def __init__(self):
         self._lock = RLock()
@@ -198,7 +187,6 @@ class Map:
         self.points: OrderedSetLite = OrderedSetLite()
         self.keyframe_origins: OrderedSetLite = OrderedSetLite()
 
-        # pySLAM map: frame id -> keyframe
         self.keyframes_map: dict[int, KeyFrame] = {}
 
         self.max_point_id = 0
@@ -234,7 +222,7 @@ class Map:
                 self.max_keyframe_id = 0
 
     def reset_session(self) -> None:
-        # Full reload-session behavior will be expanded when map persistence is ported.
+        # Reset the in-memory map state for a fresh run.
         self.reset()
 
     def delete(self) -> None:
@@ -404,18 +392,23 @@ class Map:
     # ------------------------------------------------------------------
 
     def locally_optimize(self, kf_ref, abort_flag=None, mp_abort_flag=None):
-        """
-        pySLAM-compatible map local optimization hook.
-
-        pySLAM LocalMappingCore calls map.locally_optimize(kf_ref=...).
-        This port routes it to the g2o local_bundle_adjustment implementation.
-        """
-        result = local_bundle_adjustment(kf_ref, abort_flag=abort_flag)
+        """Run local bundle adjustment around the current reference keyframe."""
+        keyframes, points, ref_keyframes = self.local_map.update(kf_ref)
+        result = local_bundle_adjustment(
+            keyframes,
+            points,
+            ref_keyframes,
+            False,
+            False,
+            10,
+            abort_flag=abort_flag,
+            mp_abort_flag=mp_abort_flag,
+            map_lock=self.update_lock,
+        )
         return result.mean_squared_error
 
     def optimize(self, local_window_size=None, abort_flag=None):
         """
-        pySLAM-compatible global/large-window optimization hook.
 
         Returns:
             (mse, result_dict)
@@ -443,7 +436,6 @@ class Map:
         far_points_threshold=None,
     ):
         """
-        pySLAM-compatible triangulated map-point insertion.
 
         Returns:
             (num_added, mask_added, list_added_points)
@@ -486,7 +478,6 @@ class Map:
 
     def add_stereo_points(self, pts3d, pts3d_mask, f, kf, idxs, img=None) -> int:
         """
-        pySLAM-compatible helper used by TrackingCore.
 
         Creates RGB-D/stereo map points from valid 3D coordinates and attaches
         them to the new keyframe observations.

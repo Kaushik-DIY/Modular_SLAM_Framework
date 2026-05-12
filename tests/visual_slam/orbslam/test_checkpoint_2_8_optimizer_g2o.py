@@ -127,6 +127,7 @@ def attach_observations(kf, points, Tcw_true):
         point.add_observation(kf, i)
 
     kf.uRs = np.asarray(kf.uRs, dtype=np.float32)
+    kf.kps_ur = kf.uRs  # keep kps_ur in sync — KeyFrame.__init__ copies uRs, but we rebuilt uRs here
     kf.depths = np.asarray(kf.depths, dtype=np.float32)
     kf.des = np.asarray(kf.des, dtype=np.uint8)
     kf.outliers = np.zeros(len(kf.kps), dtype=bool)

@@ -1,3 +1,8 @@
+"""
+Geometry and logging utility exports.
+This package re-exports the helper functions used across tracking and mapping.
+"""
+
 from visual_slam.orbslam.utilities.geometry import (
     add_ones,
     add_ones_1D,

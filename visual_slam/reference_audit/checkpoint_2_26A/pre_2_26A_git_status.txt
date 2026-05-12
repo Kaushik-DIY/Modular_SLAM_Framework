@@ -1,0 +1,47 @@
+ M .gitignore
+ M visual_slam/orbslam/local_features/__init__.py
+ M visual_slam/orbslam/local_features/feature_manager.py
+ M visual_slam/orbslam/local_features/feature_orbslam2.py
+ M visual_slam/orbslam/local_features/feature_tracker.py
+ M visual_slam/orbslam/local_features/feature_tracker_configs.py
+ M visual_slam/orbslam/slam/frame.py
+ M visual_slam/orbslam/slam/geometry_matchers.py
+ M visual_slam/orbslam/slam/keyframe.py
+ M visual_slam/orbslam/slam/map.py
+ M visual_slam/orbslam/slam/tracking.py
+?? AGENTS.md
+?? tests/visual_slam/orbslam/test_checkpoint_2_14_tum_smoke_runner.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_15_feature_backend_contract.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_16_pyslam_orb2_optional.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_17_extractor_comparison.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_19_relocalization.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_20_bow_guided_matching.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_20_bow_keyframe_database.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_21_loop_closing.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_22_loop_fusion.py
+?? tests/visual_slam/orbslam/test_checkpoint_2_23_essential_graph.py
+?? third_party.zip
+?? tools/build_pyslam_pydbow3_local.sh
+?? tools/compare_orb_extractors.py
+?? tools/install_pyslam_vocabulary_local.sh
+?? tools/validate_orbslam_pyslam_port.py
+?? visual_slam/orbslam/io/
+?? visual_slam/orbslam/local_features/extractor_backends.py
+?? visual_slam/orbslam/slam/bow.py
+?? visual_slam/orbslam/slam/bow_matcher.py
+?? visual_slam/orbslam/slam/keyframe_database.py
+?? visual_slam/orbslam/slam/loop_detector.py
+?? visual_slam/orbslam/slam/relocalizer.py
+?? visual_slam/orbslam/slam/sim3_solver.py
+?? visual_slam/reference_audit/checkpoint_2_14/
+?? visual_slam/reference_audit/checkpoint_2_15/
+?? visual_slam/reference_audit/checkpoint_2_16/
+?? visual_slam/reference_audit/checkpoint_2_17/
+?? visual_slam/reference_audit/checkpoint_2_18A/
+?? visual_slam/reference_audit/checkpoint_2_19/
+?? visual_slam/reference_audit/checkpoint_2_20/
+?? visual_slam/reference_audit/checkpoint_2_21/
+?? visual_slam/reference_audit/checkpoint_2_22/
+?? visual_slam/reference_audit/checkpoint_2_23/
+?? visual_slam/reference_audit/checkpoint_2_26A/
+?? visual_slam_before_GBA.zip

@@ -1,27 +1,11 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/geometry_matchers.py
-
-pySLAM-aligned projection matcher subset.
-
-Reference:
-- pySLAM: pyslam/slam/geometry_matchers.py
-
-Implemented now:
-- ProjectionMatcher.search_frame_by_projection
-- ProjectionMatcher.search_keyframe_by_projection
-- ProjectionMatcher.search_map_by_projection
-- ProjectionMatcher.search_local_frames_by_projection
-- ProjectionMatcher.search_all_map_by_projection
-- ProjectionMatcher.search_and_fuse
-
-Deferred:
-- Sim3 loop-correction search
-- Epipolar triangulation matcher
-=============================================================================
+Geometric matching routines for tracking, mapping, and loop correction.
+This module implements projection search, epipolar matching, and map-point fusion.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -41,6 +25,7 @@ from visual_slam.orbslam.utilities.geom_2views import computeF12, check_dist_epi
 kCheckFeaturesOrientation = Parameters.kCheckFeaturesOrientation
 
 
+# Group projection-based matching routines used across the pipeline.
 class ProjectionMatcher:
     @staticmethod
     def search_frame_by_projection(*args, **kwargs):
@@ -64,7 +49,7 @@ class ProjectionMatcher:
 
     @staticmethod
     def search_more_map_points_by_projection(*args, **kwargs):
-        raise NotImplementedError("Sim3 projection search is ported with loop closing.")
+        return _search_more_map_points_by_projection(*args, **kwargs)
 
     @staticmethod
     def search_and_fuse(*args, **kwargs):
@@ -72,13 +57,14 @@ class ProjectionMatcher:
 
     @staticmethod
     def search_and_fuse_for_loop_correction(*args, **kwargs):
-        raise NotImplementedError("Loop-correction fusion is ported with loop closing.")
+        return _search_and_fuse_for_loop_correction(*args, **kwargs)
 
     @staticmethod
     def search_by_sim3(*args, **kwargs):
-        raise NotImplementedError("Sim3 matching is ported with loop closing.")
+        raise NotImplementedError("Sim3 matching is not used in the current RGB-D path.")
 
 
+# Match feature pairs under epipolar constraints for triangulation.
 class EpipolarMatcher:
     @staticmethod
     def search_frame_for_triangulation(
@@ -90,7 +76,6 @@ class EpipolarMatcher:
         is_monocular=True,
     ):
         """
-        pySLAM-aligned epipolar matcher used by local mapping triangulation.
 
         It returns only matches where both keypoints currently have no assigned
         map point, which is the intended local-mapping triangulation input.
@@ -188,8 +173,319 @@ class EpipolarMatcher:
         return idxs1_out, idxs2_out, len(idxs1_out)
 
 
+# Collect statistics from one projection-fusion step.
+@dataclass
+class ProjectionFuseDiagnostics:
+    projected_points: int = 0
+    visible_projected_points: int = 0
+    candidate_matches: int = 0
+    added_observations: int = 0
+    fused_points: int = 0
+    replaced_points: int = 0
+    rejected_bad_point: int = 0
+    rejected_not_visible: int = 0
+    rejected_descriptor: int = 0
+    rejected_scale: int = 0
+    rejected_duplicate: int = 0
+
+    def merge(self, other: "ProjectionFuseDiagnostics") -> None:
+        for name in self.__dataclass_fields__:
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+
+    def as_dict(self) -> dict[str, int]:
+        return {name: int(getattr(self, name)) for name in self.__dataclass_fields__}
+
+
+
+
+
+
+def _map_point_position(mp):
+    if mp is None:
+        return None
+
+    for name in ("pt", "get_position"):
+        if hasattr(mp, name):
+            try:
+                value = getattr(mp, name)()
+                return np.asarray(value, dtype=np.float64).reshape(3)
+            except Exception:
+                pass
+
+    for name in ("position", "position_world"):
+        if hasattr(mp, name):
+            try:
+                value = getattr(mp, name)
+                return np.asarray(value, dtype=np.float64).reshape(3)
+            except Exception:
+                pass
+
+    return None
+
+
+def _map_point_visibility_info(mp, fallback_position):
+    """
+        position, normal, min_distance, max_distance
+
+    that same interface but tolerates partially initialized points.
+    """
+    position = fallback_position
+    normal = None
+    min_dist = 0.0
+    max_dist = np.inf
+
+    if mp is not None and hasattr(mp, "get_all_pos_info"):
+        try:
+            info = mp.get_all_pos_info()
+            if info is not None and len(info) >= 4:
+                position = np.asarray(info[0], dtype=np.float64).reshape(3)
+                normal = np.asarray(info[1], dtype=np.float64).reshape(3)
+                min_dist = float(info[2])
+                max_dist = float(info[3])
+        except Exception:
+            pass
+
+    if normal is None or not np.all(np.isfinite(normal)) or np.linalg.norm(normal) < 1e-12:
+        normal = None
+
+    if not np.isfinite(min_dist):
+        min_dist = 0.0
+
+    if not np.isfinite(max_dist) or max_dist <= 0.0:
+        max_dist = np.inf
+
+    return position, normal, min_dist, max_dist
+
+
+def _prepare_visible_projection_candidates(
+    frame,
+    idxs_ref,
+    map_points,
+    do_stereo_project=False,
+):
+    """
+
+    Invalid/non-finite map points are rejected before transform/project. This
+    design where projection search uses only visible candidate map points.
+    """
+    idxs_ref = np.asarray(idxs_ref, dtype=np.int32).reshape(-1)
+    map_points = list(map_points)
+
+    if len(idxs_ref) != len(map_points):
+        raise ValueError(
+            f"idxs_ref/map_points length mismatch: {len(idxs_ref)} vs {len(map_points)}"
+        )
+
+    candidate_idxs = []
+    candidate_points = []
+    candidate_positions = []
+    candidate_normals = []
+    candidate_min_dists = []
+    candidate_max_dists = []
+
+    for idx_ref, mp in zip(idxs_ref, map_points):
+        if mp is None:
+            continue
+        if hasattr(mp, "is_bad") and mp.is_bad():
+            continue
+
+        pw0 = _map_point_position(mp)
+        if pw0 is None:
+            continue
+
+        pw, normal, min_dist, max_dist = _map_point_visibility_info(mp, pw0)
+
+        if pw is None or pw.shape != (3,):
+            continue
+        if not np.all(np.isfinite(pw)):
+            continue
+
+        # Reject impossible numeric values before matrix multiplication.
+        if np.linalg.norm(pw) > 1.0e9:
+            continue
+
+        candidate_idxs.append(int(idx_ref))
+        candidate_points.append(mp)
+        candidate_positions.append(pw)
+        candidate_normals.append(normal)
+        candidate_min_dists.append(min_dist)
+        candidate_max_dists.append(max_dist)
+
+    proj_dim = 3 if do_stereo_project else 2
+
+    if len(candidate_points) == 0:
+        return (
+            np.empty((0,), dtype=np.int32),
+            [],
+            np.empty((0, proj_dim), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+            np.empty((0,), dtype=np.float64),
+        )
+
+    points_w = np.ascontiguousarray(candidate_positions, dtype=np.float64)
+
+    # Only finite world points reach transform_points().
+    points_c = frame.transform_points(points_w)
+
+    finite_camera = np.all(np.isfinite(points_c), axis=1)
+    positive_depth = finite_camera & (points_c[:, 2] > Parameters.kMinDepth)
+
+    projs = np.zeros((len(candidate_points), proj_dim), dtype=np.float64)
+    depths = np.zeros((len(candidate_points),), dtype=np.float64)
+
+    if np.any(positive_depth):
+        if do_stereo_project:
+            projs_good, depths_good = frame.camera.project_stereo(points_c[positive_depth])
+        else:
+            projs_good, depths_good = frame.camera.project(points_c[positive_depth])
+
+        projs[positive_depth] = np.asarray(projs_good, dtype=np.float64)
+        depths[positive_depth] = np.asarray(depths_good, dtype=np.float64).reshape(-1)
+
+    try:
+        Ow = np.asarray(frame.Ow(), dtype=np.float64).reshape(3)
+    except Exception:
+        Twc = np.linalg.inv(frame.pose())
+        Ow = Twc[:3, 3]
+
+    PO = points_w - Ow.reshape(1, 3)
+    dists = np.linalg.norm(PO, axis=1)
+
+    valid = (
+        positive_depth
+        & np.all(np.isfinite(projs[:, :2]), axis=1)
+        & np.isfinite(depths)
+        & np.isfinite(dists)
+    )
+
+    try:
+        valid &= frame.are_in_image(projs[:, :2], depths)
+    except Exception:
+        width = getattr(frame.camera, "width", None)
+        height = getattr(frame.camera, "height", None)
+        if width is not None and height is not None:
+            valid &= (
+                (projs[:, 0] >= 0.0)
+                & (projs[:, 0] < float(width))
+                & (projs[:, 1] >= 0.0)
+                & (projs[:, 1] < float(height))
+            )
+
+    normals_available = np.array([n is not None for n in candidate_normals], dtype=bool)
+    if np.any(normals_available):
+        safe_dists = np.maximum(dists, 1e-12)
+        dirs = PO / safe_dists.reshape(-1, 1)
+
+        cos_view = np.ones(len(candidate_points), dtype=np.float64)
+        for i, normal in enumerate(candidate_normals):
+            if normal is not None:
+                cos_view[i] = float(np.dot(normal, dirs[i]))
+
+        valid &= (~normals_available) | (cos_view > Parameters.kViewingCosLimitForPoint)
+
+    min_dists = np.asarray(candidate_min_dists, dtype=np.float64)
+    max_dists = np.asarray(candidate_max_dists, dtype=np.float64)
+
+    valid &= dists > min_dists
+    valid &= dists < max_dists
+
+    idxs_ref_valid = np.asarray(candidate_idxs, dtype=np.int32)[valid]
+    map_points_valid = [mp for mp, keep in zip(candidate_points, valid) if keep]
+    projs_valid = projs[valid]
+    depths_valid = depths[valid]
+    dists_valid = dists[valid]
+
+    return idxs_ref_valid, map_points_valid, projs_valid, depths_valid, dists_valid
+
+
+def _make_projection_query_safe(frame, projs, depths, radiuses):
+    """
+
+    to the spatial search. Candidate map points are filtered by finite projection,
+    positive depth, image bounds, and valid search radius before descriptor
+    matching.
+
+    This helper preserves the original candidate indexing while making invalid
+    candidates produce no KD-tree matches.
+    """
+    projs = np.asarray(projs, dtype=np.float64)
+    depths = np.asarray(depths, dtype=np.float64).reshape(-1)
+    radiuses = np.asarray(radiuses, dtype=np.float64).reshape(-1)
+
+    if projs.ndim != 2 or projs.shape[1] < 2:
+        raise ValueError(f"Expected projs shape Nx2/Nx3, got {projs.shape}")
+
+    n = len(projs)
+    if len(depths) != n or len(radiuses) != n:
+        raise ValueError(
+            f"Inconsistent projection arrays: projs={len(projs)}, "
+            f"depths={len(depths)}, radiuses={len(radiuses)}"
+        )
+
+    valid = (
+        np.all(np.isfinite(projs[:, :2]), axis=1)
+        & np.isfinite(depths)
+        & (depths > Parameters.kMinDepth)
+        & np.isfinite(radiuses)
+        & (radiuses > 0.0)
+    )
+
+    try:
+        valid &= frame.are_in_image(projs[:, :2], depths)
+    except Exception:
+        width = getattr(frame.camera, "width", None)
+        height = getattr(frame.camera, "height", None)
+        if width is not None and height is not None:
+            valid &= (
+                (projs[:, 0] >= 0.0)
+                & (projs[:, 0] < float(width))
+                & (projs[:, 1] >= 0.0)
+                & (projs[:, 1] < float(height))
+            )
+
+    safe_points = np.ascontiguousarray(projs[:, :2], dtype=np.float64)
+    safe_radiuses = np.ascontiguousarray(radiuses, dtype=np.float64)
+
+    invalid = ~valid
+    if np.any(invalid):
+        # cKDTree requires finite query points. Use a finite out-of-image dummy
+        # with zero radius so invalid map-point candidates return no matches.
+        safe_points[invalid, :] = -1.0e9
+        safe_radiuses[invalid] = 0.0
+
+    return safe_points, safe_radiuses, valid
+
+
 def _max_descriptor_distance(value):
     return Parameters.kMaxDescriptorDistance if value is None else value
+
+
+def _as_se3_matrix(pose_like) -> np.ndarray:
+    if hasattr(pose_like, "matrix"):
+        pose_like = pose_like.matrix()
+    elif hasattr(pose_like, "to_homogeneous_matrix"):
+        pose_like = pose_like.to_homogeneous_matrix()
+    return np.asarray(pose_like, dtype=np.float64).reshape(4, 4)
+
+
+def _project_points_with_pose(keyframe: KeyFrame, points_w: np.ndarray, Tcw) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    Tcw = _as_se3_matrix(Tcw)
+    points_w = np.asarray(points_w, dtype=np.float64).reshape(-1, 3)
+    points_c = (Tcw[:3, :3] @ points_w.T + Tcw[:3, 3].reshape(3, 1)).T
+    depths = points_c[:, 2].astype(np.float64, copy=True)
+    projs = np.full((len(points_w), 2), np.nan, dtype=np.float64)
+
+    valid_depth = np.isfinite(depths) & (depths > Parameters.kMinDepth)
+    if np.any(valid_depth):
+        projected, _ = keyframe.camera.project(points_c[valid_depth])
+        projs[valid_depth] = np.asarray(projected, dtype=np.float64).reshape(-1, 2)
+
+    try:
+        Ow = np.linalg.inv(Tcw)[:3, 3]
+    except np.linalg.LinAlgError:
+        Ow = np.zeros(3, dtype=np.float64)
+    dists = np.linalg.norm(points_w - Ow.reshape(1, 3), axis=1)
+    return projs, depths, dists
 
 
 def _valid_rotation_filter(idxs_ref, idxs_cur, ref_angles, cur_angles):
@@ -237,14 +533,29 @@ def _search_frame_by_projection(
 
     matched_ref_points = [f_ref.points[i] for i in matched_ref_idxs]
 
-    projs, depths = f_cur.project_map_points(matched_ref_points, f_cur.camera.is_stereo())
-    is_visible = f_cur.are_in_image(projs[:, :2], depths)
+    matched_ref_idxs, matched_ref_points, projs, depths, dists = _prepare_visible_projection_candidates(
+        f_cur,
+        matched_ref_idxs,
+        matched_ref_points,
+        do_stereo_project=f_cur.camera.is_stereo(),
+    )
+
+    if len(matched_ref_idxs) == 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+
+    is_visible = np.ones(len(matched_ref_idxs), dtype=bool)
 
     kp_ref_octaves = f_ref.octaves[matched_ref_idxs]
     kp_ref_scale_factors = FeatureTrackerShared.feature_manager.scale_factors[kp_ref_octaves]
     radiuses = max_reproj_distance * kp_ref_scale_factors
 
-    kd_cur_idxs = f_cur.kd.query_ball_point(projs[:, :2], radiuses)
+    safe_query_points, safe_radiuses, valid_projection_mask = _make_projection_query_safe(
+        f_cur,
+        projs,
+        depths,
+        radiuses,
+    )
+    kd_cur_idxs = f_cur.kd.query_ball_point(safe_query_points, safe_radiuses)
 
     idxs_ref = []
     idxs_cur = []
@@ -327,11 +638,28 @@ def _search_keyframe_by_projection(
     if len(matched_ref_points) == 0:
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
 
-    visible, projs, depths, dists = f_cur.are_visible(matched_ref_points, f_cur.camera.is_stereo())
+    matched_ref_idxs, matched_ref_points, projs, depths, dists = _prepare_visible_projection_candidates(
+        f_cur,
+        matched_ref_idxs,
+        matched_ref_points,
+        do_stereo_project=f_cur.camera.is_stereo(),
+    )
+
+    if len(matched_ref_points) == 0:
+        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+
+    visible = np.ones(len(matched_ref_points), dtype=bool)
     predicted_levels = MapPoint.predict_detection_levels(matched_ref_points, dists)
     kp_scale_factors = FeatureTrackerShared.feature_manager.scale_factors[predicted_levels]
     radiuses = max_reproj_distance * kp_scale_factors
-    kd_cur_idxs = f_cur.kd.query_ball_point(projs[:, :2], radiuses)
+
+    safe_query_points, safe_radiuses, valid_projection_mask = _make_projection_query_safe(
+        f_cur,
+        projs,
+        depths,
+        radiuses,
+    )
+    kd_cur_idxs = f_cur.kd.query_ball_point(safe_query_points, safe_radiuses)
 
     idxs_ref = []
     idxs_cur = []
@@ -394,13 +722,30 @@ def _search_map_by_projection(
 
     ensure_frame_feature_arrays(f_cur)
 
-    visibility_flags, projs, depths, dists = f_cur.are_visible(points, f_cur.camera.is_stereo())
+    input_idxs = np.arange(len(points), dtype=np.int32)
+    input_idxs, points, projs, depths, dists = _prepare_visible_projection_candidates(
+        f_cur,
+        input_idxs,
+        points,
+        do_stereo_project=f_cur.camera.is_stereo(),
+    )
+
+    if len(points) == 0:
+        return 0, []
+
+    visibility_flags = np.ones(len(points), dtype=bool)
     predicted_levels = MapPoint.predict_detection_levels(points, dists)
 
     kp_scale_factors = FeatureTrackerShared.feature_manager.scale_factors[predicted_levels]
     radiuses = max_reproj_distance * kp_scale_factors
 
-    kd_cur_idxs = f_cur.kd.query_ball_point(projs[:, :2], radiuses)
+    safe_query_points, safe_radiuses, valid_projection_mask = _make_projection_query_safe(
+        f_cur,
+        projs,
+        depths,
+        radiuses,
+    )
+    kd_cur_idxs = f_cur.kd.query_ball_point(safe_query_points, safe_radiuses)
 
     if far_points_threshold is not None:
         visibility_flags = np.logical_and(visibility_flags, depths < far_points_threshold)
@@ -554,3 +899,311 @@ def _search_and_fuse(
             fused_pts_count += 1
 
     return fused_pts_count
+
+
+def _search_and_fuse_for_loop_correction(
+    keyframe: KeyFrame,
+    Scw,
+    points,
+    replace_points,
+    max_reproj_distance=Parameters.kLoopClosingMaxReprojectionDistanceFuse,
+    max_descriptor_distance=None,
+    diagnostics: ProjectionFuseDiagnostics | None = None,
+):
+    """
+
+    `replace_points`: when a projected loop-side point lands on an already
+    occupied target keypoint, the existing current-side point is returned for
+    later replacement by the caller. Missing observations are added directly.
+    """
+    max_descriptor_distance = 0.5 * _max_descriptor_distance(max_descriptor_distance)
+
+    points = list(points)
+    if len(points) != len(replace_points):
+        raise ValueError("points and replace_points must have the same length")
+
+    if diagnostics is None:
+        diagnostics = ProjectionFuseDiagnostics()
+
+    if len(points) == 0:
+        return replace_points
+
+    ensure_frame_feature_arrays(keyframe)
+
+    good_input_idxs = []
+    good_points = []
+    good_positions = []
+    for idx, point in enumerate(points):
+        if point is None:
+            diagnostics.rejected_bad_point += 1
+            continue
+        if point.is_bad():
+            diagnostics.rejected_bad_point += 1
+            continue
+        if point.is_in_keyframe(keyframe):
+            diagnostics.rejected_duplicate += 1
+            continue
+        position = _map_point_position(point)
+        if position is None or not np.all(np.isfinite(position)):
+            diagnostics.rejected_bad_point += 1
+            continue
+        good_input_idxs.append(idx)
+        good_points.append(point)
+        good_positions.append(position)
+
+    diagnostics.projected_points += len(good_points)
+    if len(good_points) == 0:
+        return replace_points
+
+    projs, depths, dists = _project_points_with_pose(
+        keyframe,
+        np.asarray(good_positions, dtype=np.float64),
+        Scw,
+    )
+
+    finite_projection = (
+        np.all(np.isfinite(projs[:, :2]), axis=1)
+        & np.isfinite(depths)
+        & (depths > Parameters.kMinDepth)
+        & np.isfinite(dists)
+    )
+    try:
+        visible = finite_projection & keyframe.are_in_image(projs[:, :2], depths)
+    except Exception:
+        width = getattr(keyframe.camera, "width", None)
+        height = getattr(keyframe.camera, "height", None)
+        if width is None or height is None:
+            visible = finite_projection
+        else:
+            visible = finite_projection & (
+                (projs[:, 0] >= 0.0)
+                & (projs[:, 0] < float(width))
+                & (projs[:, 1] >= 0.0)
+                & (projs[:, 1] < float(height))
+            )
+
+    diagnostics.visible_projected_points += int(np.sum(visible))
+
+    predicted_levels = MapPoint.predict_detection_levels(good_points, dists)
+    feature_manager = FeatureTrackerShared.feature_manager
+    if feature_manager is None:
+        scale_factors = np.ones(max(1, int(np.max(predicted_levels)) + 1), dtype=np.float64)
+        inv_level_sigmas2 = np.ones_like(scale_factors)
+    else:
+        predicted_levels = np.clip(predicted_levels, 0, feature_manager.num_levels - 1)
+        scale_factors = feature_manager.scale_factors
+        inv_level_sigmas2 = feature_manager.inv_level_sigmas2
+
+    radiuses = max_reproj_distance * scale_factors[predicted_levels]
+    query_points, query_radiuses, safe_visible = _make_projection_query_safe(
+        keyframe,
+        projs,
+        depths,
+        radiuses,
+    )
+    visible &= safe_visible
+    kd_idxs = keyframe.kd.query_ball_point(query_points, query_radiuses)
+
+    for local_idx, point in enumerate(good_points):
+        input_idx = good_input_idxs[local_idx]
+        if not visible[local_idx]:
+            diagnostics.rejected_not_visible += 1
+            continue
+
+        kd_idxs_local = list(kd_idxs[local_idx])
+        if len(kd_idxs_local) == 0:
+            diagnostics.rejected_not_visible += 1
+            continue
+
+        predicted_level = int(predicted_levels[local_idx])
+        best_dist = float("inf")
+        best_kd_idx = -1
+        saw_scale_reject = False
+        saw_descriptor_candidate = False
+
+        for kd_idx in kd_idxs_local:
+            kd_idx = int(kd_idx)
+            if kd_idx < 0 or kd_idx >= len(keyframe.des):
+                continue
+
+            existing = keyframe.get_point_match(kd_idx)
+            if existing is point:
+                diagnostics.rejected_duplicate += 1
+                continue
+            if existing is not None and existing.is_bad():
+                diagnostics.rejected_bad_point += 1
+                continue
+
+            kp_level = int(keyframe.octaves[kd_idx])
+            if kp_level < predicted_level - 1 or kp_level > predicted_level:
+                saw_scale_reject = True
+                continue
+
+            inv_sigma2 = float(inv_level_sigmas2[min(kp_level, len(inv_level_sigmas2) - 1)])
+            kp = keyframe.kpsu[kd_idx]
+            kp_uv = np.asarray(kp.pt if hasattr(kp, "pt") else kp, dtype=np.float64).reshape(2)
+            err = projs[local_idx, :2] - kp_uv
+            chi2 = float(np.dot(err, err) * inv_sigma2)
+            if not np.isfinite(chi2) or chi2 > Parameters.kChi2Mono:
+                diagnostics.rejected_not_visible += 1
+                continue
+
+            diagnostics.candidate_matches += 1
+            saw_descriptor_candidate = True
+            descriptor_dist = point.min_des_distance(keyframe.des[kd_idx])
+            if descriptor_dist < best_dist:
+                best_dist = descriptor_dist
+                best_kd_idx = kd_idx
+
+        if best_kd_idx < 0:
+            if saw_scale_reject and not saw_descriptor_candidate:
+                diagnostics.rejected_scale += 1
+            else:
+                diagnostics.rejected_descriptor += 1
+            continue
+
+        if best_dist >= max_descriptor_distance:
+            diagnostics.rejected_descriptor += 1
+            continue
+
+        existing = keyframe.get_point_match(best_kd_idx)
+        if existing is None:
+            if point.add_observation(keyframe, best_kd_idx):
+                point.update_info()
+                diagnostics.added_observations += 1
+                diagnostics.fused_points += 1
+            else:
+                diagnostics.rejected_duplicate += 1
+        elif existing is point:
+            diagnostics.rejected_duplicate += 1
+        elif existing.is_bad():
+            diagnostics.rejected_bad_point += 1
+        else:
+            replace_points[input_idx] = existing
+            diagnostics.replaced_points += 1
+            diagnostics.fused_points += 1
+
+    return replace_points
+
+
+def _search_more_map_points_by_projection(
+    points,
+    f_cur: KeyFrame,
+    current_keyframe_Tcw_corrected: np.ndarray,
+    f_cur_matched_points: list,
+    f_cur_matched_points_idxs=None,
+    max_reproj_distance: float = Parameters.kLoopClosingMaxReprojectionDistanceMapSearch,
+    max_descriptor_distance=None,
+    return_diagnostics: bool = False,
+):
+    """Project corrected loop candidates into the current keyframe and extend loop matches."""
+    if max_descriptor_distance is None:
+        max_descriptor_distance = 0.5 * float(Parameters.kMaxDescriptorDistance or 256)
+
+    diagnostics = {
+        "candidate_input_points": int(len(points) if points is not None else 0),
+        "candidate_unique_points": 0,
+        "projected_visible_points": 0,
+        "new_projection_matches": 0,
+    }
+
+    def _ret(found, matches):
+        if return_diagnostics:
+            return found, matches, diagnostics
+        return found, matches
+
+    if not points or len(f_cur_matched_points) == 0:
+        return _ret(0, f_cur_matched_points)
+
+    ensure_frame_feature_arrays(f_cur)
+    if f_cur.kd is None:
+        return _ret(0, f_cur_matched_points)
+
+    Tcw = np.asarray(current_keyframe_Tcw_corrected, dtype=np.float64).reshape(4, 4)
+    Rcw = Tcw[:3, :3]
+    tcw = Tcw[:3, 3]
+
+    # Compute the current camera center in world coordinates.
+    Ow = (-Rcw.T @ tcw).reshape(3)
+
+    already_matched_ids = {mp.id for mp in f_cur_matched_points if mp is not None}
+
+    target_points = [
+        p for p in points
+        if p is not None and not p.is_bad() and p.id not in already_matched_ids
+    ]
+    diagnostics["candidate_unique_points"] = int(len(target_points))
+    if not target_points:
+        return _ret(0, f_cur_matched_points)
+
+    # Gather the map-point data needed by the visibility and projection tests.
+    positions_w = np.array([p.get_position() for p in target_points], dtype=np.float64)
+    normals = np.array([p.get_normal() for p in target_points], dtype=np.float64)
+    min_dists = np.array([p.get_min_distance_invariance() for p in target_points], dtype=np.float64)
+    max_dists = np.array([p.get_max_distance_invariance() for p in target_points], dtype=np.float64)
+
+    # Project into corrected camera frame
+    positions_c = (Rcw @ positions_w.T).T + tcw
+    depths = positions_c[:, 2]
+
+    projs_raw, _ = f_cur.camera.project(positions_c)
+    projs = np.asarray(projs_raw, dtype=np.float64).reshape(-1, 2)
+
+    # View direction vectors from camera center to each point (world frame)
+    POs = positions_w - Ow
+    dists_from_cam = np.linalg.norm(POs, axis=1, keepdims=False)
+    POs_unit = POs / np.maximum(dists_from_cam[:, None], 1e-12)
+    cos_views = np.einsum("ij,ij->i", normals, POs_unit)
+
+    in_image = f_cur.are_in_image(projs, depths)
+    good_depth = depths > Parameters.kMinDepth
+    good_angle = cos_views > Parameters.kViewingCosLimitForPoint
+    good_dist = (dists_from_cam > min_dists) & (dists_from_cam < max_dists)
+
+    visible_mask = in_image & good_depth & good_angle & good_dist
+    diagnostics["projected_visible_points"] = int(np.sum(visible_mask))
+
+    # Scale-aware search radius
+    feature_manager = FeatureTrackerShared.feature_manager
+    if feature_manager is not None:
+        predicted_levels = MapPoint.predict_detection_levels(target_points, dists_from_cam)
+        scale_factors = np.asarray(feature_manager.scale_factors, dtype=np.float64)
+        radiuses = max_reproj_distance * scale_factors[
+            np.clip(predicted_levels, 0, len(scale_factors) - 1)
+        ]
+    else:
+        predicted_levels = np.zeros(len(target_points), dtype=np.int32)
+        radiuses = np.full(len(target_points), max_reproj_distance, dtype=np.float64)
+
+    # Batch KD-tree query — scipy supports variable radius per point
+    all_nearby = f_cur.kd.query_ball_point(projs, radiuses)
+
+    found_pts_count = 0
+    for i, point in enumerate(target_points):
+        if not visible_mask[i]:
+            continue
+
+        nearby_idxs = all_nearby[i]
+        if not nearby_idxs:
+            continue
+
+        predicted_level = int(predicted_levels[i])
+        best_dist = float("inf")
+        best_kp_idx = -1
+        for kp_idx in nearby_idxs:
+            if f_cur_matched_points[kp_idx] is not None:
+                continue
+            kp_level = int(f_cur.octaves[kp_idx])
+            if kp_level < predicted_level - 1 or kp_level > predicted_level:
+                continue
+            dist = float(point.min_des_distance(f_cur.des[kp_idx]))
+            if dist < best_dist:
+                best_dist = dist
+                best_kp_idx = kp_idx
+
+        if best_kp_idx >= 0 and best_dist < max_descriptor_distance:
+            f_cur_matched_points[best_kp_idx] = point
+            found_pts_count += 1
+
+    diagnostics["new_projection_matches"] = int(found_pts_count)
+    return _ret(found_pts_count, f_cur_matched_points)

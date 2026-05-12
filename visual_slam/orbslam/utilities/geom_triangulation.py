@@ -1,15 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/utilities/geom_triangulation.py
-
-pySLAM-aligned triangulation helper subset.
-
-Reference:
-- pySLAM: pyslam/utilities/geom_triangulation.py
-
-For normalized keypoints, projection matrices are simply the first 3 rows of
-Tcw. The triangulated output is in world coordinates.
-=============================================================================
+Triangulation helpers for normalized keypoints.
+This module reconstructs world points from two camera poses and matched rays.
 """
 
 from __future__ import annotations

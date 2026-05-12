@@ -1,18 +1,11 @@
 """
-=============================================================================
-visual_slam/orbslam/local_features/feature_tracker_configs.py
-
-pySLAM-aligned ORB2 feature tracker configuration.
-
-Reference:
-- pySLAM: pyslam/local_features/feature_tracker_configs.py
-
-Only ORB2 is retained for the thesis ORB/RGB-D SLAM target.
-=============================================================================
+Predefined feature-tracker configurations.
+This module keeps the default ORB settings used by the RGB-D pipeline.
 """
 
 from __future__ import annotations
 
+from visual_slam.orbslam.local_features.extractor_backends import DEFAULT_EXTRACTOR_BACKEND
 from visual_slam.orbslam.local_features.feature_manager import feature_manager_factory
 from visual_slam.orbslam.local_features.feature_tracker import (
     FeatureTrackerTypes,
@@ -31,6 +24,7 @@ kDefaultRatioTest = Parameters.kFeatureMatchDefaultRatioTest
 kTrackerType = FeatureTrackerTypes.DES_BF
 
 
+# Collect named tracker presets used by the RGB-D front-end.
 class FeatureTrackerConfigs:
     @staticmethod
     def get_config_from_name(config_name: str):
@@ -50,8 +44,11 @@ class FeatureTrackerConfigs:
         tracker_type=kTrackerType,
         matcher_type=FeatureMatcherTypes.DES_BF,
         deterministic=False,
+        extractor_backend=DEFAULT_EXTRACTOR_BACKEND,
     )
 
 
-def create_orb2_feature_tracker():
-    return feature_tracker_factory(**FeatureTrackerConfigs.get_config_from_name("ORB2"))
+def create_orb2_feature_tracker(**overrides):
+    config = FeatureTrackerConfigs.get_config_from_name("ORB2")
+    config.update(overrides)
+    return feature_tracker_factory(**config)

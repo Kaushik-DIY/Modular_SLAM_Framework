@@ -1,16 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/camera_pose.py
-
-pySLAM-aligned camera pose representation.
-
-Reference:
-- pySLAM: pyslam/slam/camera_pose.py
-
-Pose convention:
-- Tcw maps world points into the camera frame: pc = Tcw * pw.
-- Ow is the camera center in world coordinates.
-=============================================================================
+Camera pose wrapper for SE3 transforms.
+This module keeps matrix, rotation, translation, and camera-center views in sync.
 """
 
 from __future__ import annotations
@@ -19,8 +9,9 @@ import numpy as np
 import g2o
 
 
+# Wrap a g2o SE3 pose and expose cached geometric views of it.
 class CameraPose:
-    """Camera pose wrapper around g2o.Isometry3d, following pySLAM's Tcw convention."""
+    """Camera pose wrapper around a g2o SE3 object using the Tcw convention."""
 
     def __init__(self, pose=None):
         if pose is None:

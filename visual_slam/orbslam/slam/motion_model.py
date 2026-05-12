@@ -1,22 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/motion_model.py
-
-pySLAM-aligned motion model subset.
-
-Reference:
-- pySLAM: pyslam/slam/motion_model.py
-
-pySLAM's classes are preserved:
-- MotionModelBase
-- MotionModel
-- MotionModelDamping
-
-Implementation note:
-- pySLAM stores pose as g2o Isometry3d with Tcw convention.
-- This port keeps the same convention, but internally stores 4x4 matrices to
-  avoid depending on every Quaternion operator exposed by the local g2o binding.
-=============================================================================
+Motion-model helpers for frame pose prediction.
+This module stores constant-velocity estimates and optional damping for tracking.
 """
 
 from __future__ import annotations
@@ -65,6 +49,7 @@ def _pose_from_orientation_position(orientation, position) -> np.ndarray:
     return T
 
 
+# Define the shared interface for motion-model prediction and update.
 class MotionModelBase(object):
     def __init__(
         self,
@@ -129,9 +114,9 @@ class MotionModelBase(object):
         self.initialized = False
 
 
+# Predict the next pose using a constant-velocity rigid motion model.
 class MotionModel(MotionModelBase):
     """
-    Simple pySLAM-style kinematic motion model without damping.
 
     delta_Tcw maps previous camera pose to predicted current camera pose.
     """
@@ -178,11 +163,11 @@ class MotionModel(MotionModelBase):
         self.delta_Tcw = correction @ self.delta_Tcw
 
 
+# Predict the next pose using a damped constant-velocity model.
 class MotionModelDamping(MotionModelBase):
     """
     Timestamp-aware damped motion model.
 
-    This is a conservative Python approximation of pySLAM's damping class. It
     preserves the class name and public methods. Translation is damped with dt;
     rotation is propagated through the last delta rotation matrix.
     """

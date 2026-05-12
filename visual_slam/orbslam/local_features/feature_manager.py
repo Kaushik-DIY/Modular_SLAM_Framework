@@ -1,21 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/local_features/feature_manager.py
-
-pySLAM-aligned minimal FeatureManager for ORB2.
-
-Reference:
-- pySLAM: pyslam/local_features/feature_manager.py
-
-The key requirement for later ORB-SLAM modules is not just detection. They need
-shared scale-pyramid statistics:
-- scale_factor
-- inv_scale_factor
-- scale_factors
-- inv_scale_factors
-- level_sigmas2
-- inv_level_sigmas2
-=============================================================================
+Feature extraction manager for the ORB front-end.
+This module owns detector settings, pyramid statistics, and extractor dispatch.
 """
 
 from __future__ import annotations
@@ -26,6 +11,11 @@ from enum import Enum
 import cv2
 import numpy as np
 
+from visual_slam.orbslam.local_features.extractor_backends import (
+    DEFAULT_EXTRACTOR_BACKEND,
+    FeatureExtractionResult,
+    normalize_backend_name,
+)
 from visual_slam.orbslam.local_features.feature_orbslam2 import Orbslam2Feature2D
 from visual_slam.orbslam.local_features.feature_types import (
     FeatureDescriptorTypes,
@@ -35,6 +25,7 @@ from visual_slam.orbslam.local_features.feature_types import (
 from visual_slam.orbslam.slam.config_parameters import Parameters
 
 
+# Enumerate optional post-detection keypoint filtering modes.
 class KeyPointFilterTypes(Enum):
     NONE = 0
 
@@ -60,23 +51,18 @@ def hamming_distances(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def _default_max_descriptor_distance(descriptor_type) -> int:
-    """
-    pySLAM/ORB-SLAM-style descriptor acceptance threshold.
-
-    ORB/ORB2 uses Hamming distance. ORB-SLAM commonly uses TH_HIGH=100 and
-    TH_LOW=50. pySLAM uses the feature manager to initialize the global
-    Parameters.kMaxDescriptorDistance at runtime.
-    """
+    """Return the descriptor distance threshold used by binary feature matching."""
     name = getattr(descriptor_type, "name", str(descriptor_type)).upper()
 
     if "ORB" in name or "BRISK" in name or "AKAZE" in name:
         return 100
 
-    # Conservative fallback for float descriptors; not used for ORB/RGB-D target.
+    # Keep a fallback branch for non-binary descriptors even though ORB is the main path.
     return 0
 
 
 
+# Manage detector settings, descriptor scale statistics, and extraction calls.
 class FeatureManager:
     def __init__(
         self,
@@ -89,6 +75,7 @@ class FeatureManager:
         deterministic: bool = Parameters.kORBDeterministic,
         ini_th_fast: int = 20,
         min_th_fast: int = 7,
+        extractor_backend: str = DEFAULT_EXTRACTOR_BACKEND,
     ):
         self.num_features = int(num_features)
         self.num_levels = int(num_levels)
@@ -103,6 +90,7 @@ class FeatureManager:
         self.norm_type = cv2.NORM_HAMMING
         self.oriented_features = FeatureInfo.is_oriented_features(detector_type)
         self.deterministic = bool(deterministic)
+        self.extractor_backend_name = normalize_backend_name(extractor_backend)
 
         self.init_sigma_levels()
 
@@ -113,12 +101,13 @@ class FeatureManager:
             ini_th_fast=ini_th_fast,
             min_th_fast=min_th_fast,
             deterministic=deterministic,
+            backend_name=self.extractor_backend_name,
         )
+        self.extractor_backend = self.feature.backend
 
         self.descriptor_distance = hamming_distance
         self.descriptor_distances = hamming_distances
 
-        # pySLAM initializes this dynamically from the feature manager.
         Parameters.kMaxDescriptorDistance = 100
 
     def init_sigma_levels(self) -> None:
@@ -150,14 +139,17 @@ class FeatureManager:
         return self.feature.compute(image, keypoints)
 
     def detectAndCompute(self, image: np.ndarray, mask=None):
-        return self.feature.detectAndCompute(image, mask)
+        return self.extract(image, mask).as_tuple()
+
+    def extract(self, image: np.ndarray, mask=None) -> FeatureExtractionResult:
+        return self.extractor_backend.extract(image, mask)
 
     def debug_print(self) -> None:
         print(
             "FeatureManager("
             f"detector={self.detector_type}, descriptor={self.descriptor_type}, "
             f"num_features={self.num_features}, levels={self.num_levels}, "
-            f"scale_factor={self.scale_factor})"
+            f"scale_factor={self.scale_factor}, extractor_backend={self.extractor_backend_name})"
         )
 
 
@@ -179,4 +171,8 @@ def feature_manager_factory(**config) -> FeatureManager:
         detector_type=detector_type,
         descriptor_type=descriptor_type,
         deterministic=config.get("deterministic", Parameters.kORBDeterministic),
+        extractor_backend=config.get(
+            "extractor_backend",
+            config.get("backend_name", config.get("feature_backend", DEFAULT_EXTRACTOR_BACKEND)),
+        ),
     )

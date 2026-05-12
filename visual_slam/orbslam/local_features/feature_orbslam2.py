@@ -1,24 +1,20 @@
 """
-=============================================================================
-visual_slam/orbslam/local_features/feature_orbslam2.py
-
-ORB2-compatible feature extractor wrapper.
-
-Reference:
-- pySLAM: pyslam/local_features/feature_orbslam2.py
-
-pySLAM uses an external ORB-SLAM2 C++ ORBextractor. This self-contained port
-uses OpenCV ORB while preserving the same class/module role. This is the only
-deliberate dependency adaptation in this checkpoint.
-=============================================================================
+ORB feature extractor wrapper with a detector-style interface.
+This module exposes a uniform API for the configured ORB extraction backend.
 """
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
+from visual_slam.orbslam.local_features.extractor_backends import (
+    DEFAULT_EXTRACTOR_BACKEND,
+    FeatureExtractionResult,
+    create_extractor_backend,
+)
 
+
+# Present the configured ORB extractor as a detector-style feature object.
 class Orbslam2Feature2D:
     def __init__(
         self,
@@ -28,6 +24,7 @@ class Orbslam2Feature2D:
         ini_th_fast: int = 20,
         min_th_fast: int = 7,
         deterministic: bool = False,
+        backend_name: str = DEFAULT_EXTRACTOR_BACKEND,
     ):
         self.num_features = int(num_features)
         self.scale_factor = float(scale_factor)
@@ -35,33 +32,30 @@ class Orbslam2Feature2D:
         self.ini_th_fast = int(ini_th_fast)
         self.min_th_fast = int(min_th_fast)
         self.deterministic = bool(deterministic)
+        self.backend_name = backend_name
 
-        self._orb = cv2.ORB_create(
-            nfeatures=self.num_features,
-            scaleFactor=self.scale_factor,
-            nlevels=self.num_levels,
-            edgeThreshold=31,
-            firstLevel=0,
-            WTA_K=2,
-            scoreType=cv2.ORB_HARRIS_SCORE,
-            patchSize=31,
-            fastThreshold=self.ini_th_fast,
+        self.backend = create_extractor_backend(
+            backend_name,
+            num_features=self.num_features,
+            scale_factor=self.scale_factor,
+            num_levels=self.num_levels,
+            ini_th_fast=self.ini_th_fast,
+            min_th_fast=self.min_th_fast,
+            deterministic=self.deterministic,
         )
 
     def setMaxFeatures(self, num_features: int) -> None:
         self.num_features = int(num_features)
-        self._orb.setMaxFeatures(self.num_features)
+        self.backend.setMaxFeatures(self.num_features)
 
     def detect(self, image: np.ndarray, mask=None):
-        return self._orb.detect(image, mask)
+        return self.backend.detect(image, mask)
 
     def compute(self, image: np.ndarray, keypoints):
-        return self._orb.compute(image, keypoints)
+        return self.backend.compute(image, keypoints)
 
     def detectAndCompute(self, image: np.ndarray, mask=None):
-        if image.ndim == 3:
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        keypoints, descriptors = self._orb.detectAndCompute(image, mask)
-        if descriptors is None:
-            descriptors = np.empty((0, 32), dtype=np.uint8)
-        return keypoints, descriptors
+        return self.extract(image, mask).as_tuple()
+
+    def extract(self, image: np.ndarray, mask=None) -> FeatureExtractionResult:
+        return self.backend.extract(image, mask)

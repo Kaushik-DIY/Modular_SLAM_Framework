@@ -1,25 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/tracking_core.py
-
-pySLAM-aligned TrackingCore subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/tracking_core.py
-
-Implemented:
-- estimate_pose_by_fitting_ess_mat
-- find_homography_with_ransac
-- propagate_map_point_matches
-- create_vo_points
-- create_and_add_stereo_map_points_on_new_kf
-- count_tracked_and_non_tracked_close_points
-
-This module now uses locally ported pySLAM utility helpers:
-- utilities.geom_2views.estimate_pose_ess_mat
-- utilities.geometry.inv_T
-- utilities.logging.Printer
-=============================================================================
+Low-level tracking geometry routines.
+This module implements pose fitting, match propagation, and RGB-D support helpers.
 """
 
 from __future__ import annotations
@@ -52,6 +33,7 @@ def _as_int_array(values):
     return np.asarray(values, dtype=np.int32).reshape(-1)
 
 
+# Provide the low-level geometric helpers used by the tracking front-end.
 class TrackingCore:
     @staticmethod
     def estimate_pose_by_fitting_ess_mat(
@@ -63,7 +45,6 @@ class TrackingCore:
         """
         Estimate inter-frame rotation from an essential matrix and filter outliers.
 
-        pySLAM convention:
         - estimate_pose_ess_mat returns Trc such that pr = Trc * pc.
         - Only rotation is used here; translation scale from E is not reliable.
         """
@@ -114,7 +95,6 @@ class TrackingCore:
         Tcr = inv_T(Trc)
         estimated_Tcw = Tcr @ f_ref.pose()
 
-        # pySLAM-style usage: trust the essential-matrix rotation, not its scale.
         Rcw = estimated_Tcw[:3, :3]
         tcw = f_ref.pose()[:3, 3]
         f_cur.update_rotation_and_translation(Rcw, tcw)

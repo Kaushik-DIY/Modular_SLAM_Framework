@@ -1,40 +1,28 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/optimizer_g2o.py
-
-pySLAM-aligned g2o optimizer subset for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/slam/optimizer_g2o.py
-
-Implemented in this checkpoint:
-- pose_optimization(frame)
-- bundle_adjustment(keyframes, points, ...)
-- local_bundle_adjustment(keyframe, ...)
-- global_bundle_adjustment(keyframes, points, ...)
-
-Not implemented yet:
-- optimize_sim3
-- optimize_essential_graph
-- loop-correction specific Sim3 graph
-- multiprocessing abort synchronization
-- semantic residuals
-
-Important adaptation:
-- pySLAM's g2o wrapper exposes projection edges differently.
-- This implementation uses visual_slam.g2o_compat to support the installed
-  parameter-based g2o API in this workspace.
-=============================================================================
+g2o-based optimization routines for the SLAM back-end.
+This module provides pose optimization plus local and global bundle adjustment.
 """
 
 from __future__ import annotations
 
+import os
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 import g2o
 import numpy as np
+
+_BA_PROFILE = os.environ.get("BA_PROFILE", "0") == "1"
+
+# Use the optional C++ backend when available, otherwise stay on the Python implementation.
+try:
+    import slam_optimizer_core as _SOC
+    _SOC_AVAILABLE = True
+except ImportError:
+    _SOC = None
+    _SOC_AVAILABLE = False
 
 from visual_slam.g2o_compat import (
     G2OCamera,
@@ -53,6 +41,7 @@ from visual_slam.orbslam.slam.keyframe import KeyFrame
 from visual_slam.orbslam.slam.map_point import MapPoint
 
 
+# Store the outcome and error statistics of one optimizer call.
 @dataclass
 class OptimizerResult:
     num_edges: int
@@ -202,7 +191,6 @@ def _is_depth_positive(edge, pose_vertex, point_vertex) -> bool:
             pass
 
     # Binding adaptation: this workspace's g2o projection edges do not expose
-    # is_depth_positive(), so mirror pySLAM by checking optimized camera depth.
     depth = _pose_vertex_point_depth(pose_vertex, point_vertex)
     return bool(np.isfinite(depth) and depth > 0.0)
 
@@ -284,6 +272,35 @@ def _add_reprojection_edge(
     return edge, chi2_threshold, is_stereo
 
 
+def _pose_optimization_cpp(frame, rounds: int, iters_per_round: int, print=print) -> tuple[int, float]:
+    """C++ motion-only BA via slam_optimizer_core.run_pose_optimization()."""
+    from visual_slam.orbslam.slam.slam_optimizer_bridge import (
+        pack_pose_optimization, unpack_pose_optimization
+    )
+    feature_manager = FeatureTrackerShared.feature_manager
+
+    frame_pose, observations, camera, valid_indices = pack_pose_optimization(
+        frame, feature_manager
+    )
+
+    if len(observations) < Parameters.kRelocalizationPoseOpt1MinMatches:
+        return 0, float("inf")
+
+    result = _SOC.run_pose_optimization(
+        frame_pose, observations, camera,
+        rounds=rounds,
+        iters_per_round=iters_per_round,
+    )
+
+    num_inliers = int(result["num_inliers"])
+    mse = float(result["mse"])
+
+    if num_inliers >= Parameters.kRelocalizationPoseOpt1MinMatches:
+        unpack_pose_optimization(result, frame, valid_indices)
+
+    return num_inliers, mse
+
+
 def pose_optimization(
     frame: Frame,
     verbose: bool = False,
@@ -292,7 +309,6 @@ def pose_optimization(
     print=print,
 ) -> tuple[int, float]:
     """
-    pySLAM/ORB-SLAM-style motion-only pose optimization.
 
     Optimizes only the current frame pose Tcw. Map points are fixed.
 
@@ -301,6 +317,14 @@ def pose_optimization(
     """
     if frame is None:
         return 0, float("inf")
+
+    # ---- C++ GIL-free dispatch ----
+    if _SOC_AVAILABLE:
+        try:
+            return _pose_optimization_cpp(frame, rounds, iterations_per_round, print)
+        except Exception as _cpp_exc:
+            print(f"[slam_optimizer_core] C++ pose_opt failed ({_cpp_exc}), falling back")
+    # ---- end C++ dispatch ----
 
     points = list(getattr(frame, "points", []))
     if len(points) == 0:
@@ -399,6 +423,164 @@ def pose_optimization(
     return num_inliers, mse
 
 
+def _bundle_adjustment_cpp(
+    local_keyframes,
+    fixed_keyframes,
+    points,
+    rounds,
+    use_robust_kernel,
+    abort_flag,
+    map_lock,
+    prune_outliers,
+    print=print,
+) -> "OptimizerResult":
+    """C++ BA via slam_optimizer_core — called only when _SOC_AVAILABLE is True."""
+    from visual_slam.orbslam.slam.slam_optimizer_bridge import pack_local_ba, unpack_local_ba
+
+    feature_manager = FeatureTrackerShared.feature_manager
+
+    if abort_flag is not None and _abort_requested(abort_flag):
+        return OptimizerResult(0, 0, 0, float("inf"), False,
+                               aborted=True, reason="aborted before C++ BA")
+
+    # Wire abort into the C++ module flag
+    _SOC.set_abort(False)
+
+    (kf_poses, kf_ids, kf_fixed, point_pos,
+     observations, camera, kf_list, pt_list, obs_triples) = pack_local_ba(
+        local_keyframes, fixed_keyframes, points, feature_manager
+    )
+
+    if len(observations) == 0:
+        return OptimizerResult(0, 0, 0, float("inf"), False,
+                               reason="no valid reprojection edges (C++)")
+
+    # Block solver asserts _sizePoses > 0 — skip if all KFs are fixed (e.g. only KF 0)
+    n_free_kfs = int(np.sum(kf_fixed == 0))
+    if n_free_kfs == 0:
+        return OptimizerResult(0, 0, 0, 0.0, True,
+                               reason="no free KFs — nothing to optimize (C++)")
+
+    result = _SOC.run_local_ba(
+        kf_poses, kf_ids, kf_fixed, point_pos, observations, camera,
+        rounds=rounds,
+        use_robust_kernel=use_robust_kernel,
+        prune_outliers=prune_outliers,
+    )
+
+    n_edges = len(observations)
+    n_bad = int(result["n_bad_edges"])
+    n_inliers = n_edges - n_bad
+    mse = float(result["mse"])
+
+    unpack_local_ba(
+        result=result,
+        kf_list=kf_list,
+        pt_list=pt_list,
+        obs_triples=obs_triples,
+        local_keyframes=local_keyframes,
+        fixed_keyframes=fixed_keyframes,
+        fixed_points=False,
+        prune_outliers=prune_outliers,
+        map_lock=map_lock,
+    )
+
+    return OptimizerResult(
+        n_edges, n_inliers, n_bad, mse, True,
+        num_keyframes=len(kf_list),
+        num_map_points=len(pt_list),
+    )
+
+
+def _bundle_adjustment_cpp_deferred(
+    local_keyframes,
+    fixed_keyframes,
+    points,
+    rounds,
+    use_robust_kernel,
+    abort_flag,
+    result_dict: dict,
+    print=print,
+) -> "OptimizerResult":
+    """Run global BA through the C++ backend and collect updates before write-back."""
+    from visual_slam.orbslam.slam.slam_optimizer_bridge import pack_local_ba
+
+    feature_manager = FeatureTrackerShared.feature_manager
+
+    if abort_flag is not None and _abort_requested(abort_flag):
+        return OptimizerResult(0, 0, 0, float("inf"), False,
+                               aborted=True, reason="aborted before C++ global BA")
+
+    _SOC.set_abort(False)
+
+    (kf_poses, kf_ids, kf_fixed, point_pos,
+     observations, camera, kf_list, pt_list, obs_triples) = pack_local_ba(
+        local_keyframes, fixed_keyframes, points, feature_manager
+    )
+
+    if len(observations) == 0:
+        return OptimizerResult(0, 0, 0, float("inf"), False,
+                               reason="no valid reprojection edges (C++ deferred)")
+
+    n_free_kfs = int(np.sum(kf_fixed == 0))
+    if n_free_kfs == 0:
+        return OptimizerResult(0, 0, 0, 0.0, True,
+                               reason="no free KFs — nothing to optimize (C++ deferred)")
+
+    cpp_result = _SOC.run_global_ba(
+        kf_poses, kf_ids, point_pos, observations, camera,
+        rounds=rounds,
+        use_robust_kernel=use_robust_kernel,
+        loop_kf_id=0,
+    )
+
+    n_edges    = len(observations)
+    n_bad      = int(cpp_result["n_bad_edges"])
+    n_inliers  = n_edges - n_bad
+    initial_mse = float(cpp_result["initial_mse"])
+    mse        = float(cpp_result["mse"])
+
+    updated_poses  = cpp_result["updated_poses"]   # (N, 16)
+    updated_points = cpp_result["updated_points"]  # (M, 3)
+    outlier_mask   = cpp_result["outlier_mask"]    # (K,)
+
+    # Map kf_list rows back to kid-indexed dicts expected by GlobalBundleAdjuster
+    local_ids = {id(kf) for kf in local_keyframes}
+    fixed_ids = {id(kf) for kf in fixed_keyframes}
+
+    kf_updates: dict = {}
+    for i, kf in enumerate(kf_list):
+        T = updated_poses[i].reshape(4, 4)
+        if not np.all(np.isfinite(T)):
+            continue
+        kf_updates[kf.kid] = T.copy()
+
+    pt_updates: dict = {}
+    for j, p in enumerate(pt_list):
+        pos = updated_points[j]
+        if np.all(np.isfinite(pos)):
+            pt_updates[p.id] = pos.copy()
+
+    fixed_kf_ids = [int(kf_list[i].kid) for i in range(len(kf_list)) if kf_fixed[i]]
+
+    result_dict["keyframes"]         = kf_updates
+    result_dict["keyframe_updates"]  = kf_updates
+    result_dict["points"]            = pt_updates
+    result_dict["point_updates"]     = pt_updates
+    result_dict["fixed_keyframes"]   = fixed_kf_ids
+    result_dict["num_edges"]         = n_edges
+    result_dict["num_inliers"]       = n_inliers
+    result_dict["num_outliers"]      = n_bad
+    result_dict["mean_error_before"] = initial_mse
+    result_dict["mean_error_after"]  = mse
+
+    return OptimizerResult(
+        n_edges, n_inliers, n_bad, mse, True,
+        num_keyframes=len(kf_list),
+        num_map_points=len(pt_list),
+    )
+
+
 def _bundle_adjustment_core(
     local_keyframes: list[KeyFrame],
     fixed_keyframes: list[KeyFrame],
@@ -414,6 +596,8 @@ def _bundle_adjustment_core(
     prune_outliers: bool = False,
     print=print,
 ) -> OptimizerResult:
+    _t0 = time.perf_counter() if _BA_PROFILE else 0.0
+
     local_keyframes = [kf for kf in local_keyframes if kf is not None and not _is_bad_keyframe(kf)]
     fixed_keyframes = [kf for kf in fixed_keyframes if kf is not None and not _is_bad_keyframe(kf)]
     points = [p for p in points if not _is_bad_point(p)]
@@ -421,17 +605,54 @@ def _bundle_adjustment_core(
     if len(local_keyframes) == 0 or len(points) == 0:
         return OptimizerResult(0, 0, 0, float("inf"), False, reason="empty graph input")
 
+    # ---- C++ GIL-free dispatch (slam_optimizer_core) ----
+    if _SOC_AVAILABLE and not fixed_points:
+        if write_back and result_dict is None:
+            # Local BA: write back directly to map objects
+            try:
+                return _bundle_adjustment_cpp(
+                    local_keyframes=local_keyframes,
+                    fixed_keyframes=fixed_keyframes,
+                    points=points,
+                    rounds=rounds,
+                    use_robust_kernel=use_robust_kernel,
+                    abort_flag=abort_flag,
+                    map_lock=map_lock,
+                    prune_outliers=prune_outliers,
+                    print=print,
+                )
+            except Exception as _cpp_exc:
+                print(f"[slam_optimizer_core] C++ local BA failed ({_cpp_exc}), falling back to Python")
+        elif not write_back and result_dict is not None:
+            # Global BA deferred: collect updates into result_dict, apply validation + atomic
+            # write handled by caller (GlobalBundleAdjuster)
+            try:
+                return _bundle_adjustment_cpp_deferred(
+                    local_keyframes=local_keyframes,
+                    fixed_keyframes=fixed_keyframes,
+                    points=points,
+                    rounds=rounds,
+                    use_robust_kernel=use_robust_kernel,
+                    abort_flag=abort_flag,
+                    result_dict=result_dict,
+                    print=print,
+                )
+            except Exception as _cpp_exc:
+                print(f"[slam_optimizer_core] C++ global BA failed ({_cpp_exc}), falling back to Python")
+    # ---- end C++ dispatch ----
+
     optimizer = make_optimizer(verbose=verbose)
     if abort_flag is not None:
         if hasattr(optimizer, "set_force_stop_flag") and abort_flag.__class__.__module__ == "g2o":
             optimizer.set_force_stop_flag(abort_flag)
     add_camera_parameters(optimizer, _camera_to_g2o(local_keyframes[0].camera), parameter_id=0)
 
+    _t1 = time.perf_counter() if _BA_PROFILE else 0.0
+
     pose_vertices = {}
     point_vertices = {}
     graph_edges = {}
 
-    # pySLAM uses stable even keyframe vertex ids and odd map-point ids. This
     # makes graph construction traceable across local and global BA windows.
     good_keyframes = []
 
@@ -459,6 +680,8 @@ def _bundle_adjustment_core(
         pose_vertices[kf] = v
         good_keyframes.append(kf)
 
+    _t2 = time.perf_counter() if _BA_PROFILE else 0.0
+
     for point in points:
         point_w = point.get_position()
         if not np.all(np.isfinite(point_w)):
@@ -471,6 +694,8 @@ def _bundle_adjustment_core(
             marginalized=True,
         )
         point_vertices[point] = v
+
+    _t3 = time.perf_counter() if _BA_PROFILE else 0.0
 
     edges = []
     edge_id = 0
@@ -511,6 +736,8 @@ def _bundle_adjustment_core(
             points_with_edges.add(point)
             edge_id += 1
 
+    _t4 = time.perf_counter() if _BA_PROFILE else 0.0
+
     if len(edges) == 0:
         return OptimizerResult(
             0,
@@ -538,6 +765,8 @@ def _bundle_adjustment_core(
             aborted=True,
             reason="aborted before optimization",
         )
+
+    _t5 = time.perf_counter() if _BA_PROFILE else 0.0
 
     num_bad_edges = 0
 
@@ -600,6 +829,8 @@ def _bundle_adjustment_core(
             num_map_points=len(point_vertices),
             reason=f"g2o failed: {exc}",
         )
+
+    _t6 = time.perf_counter() if _BA_PROFILE else 0.0
 
     outlier_observations = []
     inlier_chi2 = []
@@ -671,6 +902,22 @@ def _bundle_adjustment_core(
         result_dict["mean_error_before"] = initial_active_chi2 / max(len(edges), 1)
         result_dict["mean_error_after"] = float(np.mean(inlier_chi2)) if inlier_chi2 else float("inf")
 
+    _t7 = time.perf_counter() if _BA_PROFILE else 0.0
+
+    if _BA_PROFILE:
+        nkf = len(local_keyframes)
+        nfkf = len(fixed_keyframes)
+        npt = len(point_vertices)
+        ned = len(edges)
+        print(
+            f"[BA_PROFILE] kfs={nkf}+{nfkf}fix pts={npt} edges={ned} | "
+            f"setup={_t1-_t0:.3f}s pose_v={_t2-_t1:.3f}s pt_v={_t3-_t2:.3f}s "
+            f"edges={_t4-_t3:.3f}s abort_chk={_t5-_t4:.3f}s "
+            f"optimize={_t6-_t5:.3f}s extract={_t7-_t6:.3f}s "
+            f"total={_t7-_t0:.3f}s",
+            flush=True,
+        )
+
     mse = float(np.mean(inlier_chi2)) if inlier_chi2 else float("inf")
 
     return OptimizerResult(
@@ -703,7 +950,6 @@ def bundle_adjustment(
     print=print,
 ) -> tuple[float, Optional[dict]]:
     """
-    pySLAM-compatible bundle_adjustment wrapper.
 
     Returns:
         (mean_squared_error, result_dict)
@@ -754,9 +1000,7 @@ def local_bundle_adjustment(
     print=print,
 ) -> OptimizerResult:
     """
-    pySLAM-style local BA.
 
-    Preferred pySLAM-compatible call:
         local_bundle_adjustment(keyframes, points, keyframes_ref, ...)
 
     Compatibility call retained for existing tests:
@@ -793,10 +1037,11 @@ def local_bundle_adjustment(
     if len(local_keyframes) == 0 or len(local_points) == 0:
         return OptimizerResult(0, 0, 0, float("inf"), False)
 
-    # If there are no boundary fixed keyframes and the root is not in local set,
+    # If there are no boundary fixed keyframes and kid=0 is not already local,
     # fix the first local keyframe to remove gauge freedom.
+    # Skip if any local KF has kid==0 — pack_local_ba already fixes it via the kid==0 rule.
     if not fixed_keyframes and local_keyframes:
-        if local_keyframes[0].kid != 0:
+        if not any(kf.kid == 0 for kf in local_keyframes):
             fixed_keyframes.append(local_keyframes[0])
 
     return _bundle_adjustment_core(
@@ -829,7 +1074,6 @@ def global_bundle_adjustment(
     verbose: bool = False,
     print=print,
 ) -> tuple[float, Optional[dict]]:
-    """pySLAM-compatible global BA wrapper."""
     return bundle_adjustment(
         keyframes=keyframes,
         points=points,

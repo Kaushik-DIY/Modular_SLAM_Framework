@@ -1,15 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/sensor_types.py
-
-pySLAM-aligned minimal dataset/sensor type definitions.
-
-Reference:
-- pySLAM: pyslam/io/dataset_types.py
-
-Only the ORB/RGB-D SLAM-relevant subset is kept, but enum values are preserved
-to stay compatible with pySLAM-style logic.
-=============================================================================
+Dataset and sensor type definitions.
+This module stores the enums and helpers used to configure sensor mode and dataset metadata.
 """
 
 from __future__ import annotations
@@ -17,9 +8,9 @@ from __future__ import annotations
 from enum import Enum
 
 
+# Enumerate the dataset families recognized by the project.
 class DatasetType(Enum):
-    """pySLAM-compatible dataset type values."""
-
+    """Dataset family identifiers."""
     NONE = 1
     KITTI = 2
     TUM = 3
@@ -39,23 +30,23 @@ class DatasetType(Enum):
     ROVER = 17
 
 
+# Enumerate the operating environments associated with a dataset.
 class DatasetEnvironmentType(Enum):
-    """pySLAM-compatible environment type values."""
-
+    """Environment labels attached to a dataset."""
     INDOOR = 1
     OUTDOOR = 2
 
 
+# Enumerate the camera sensing modes supported by the pipeline.
 class SensorType(Enum):
-    """pySLAM-compatible sensor type values."""
-
+    """Sensor mode identifiers used by the pipeline."""
     MONOCULAR = 0
     STEREO = 1
     RGBD = 2
 
 
 def get_sensor_type(sensor_str: str | SensorType) -> SensorType:
-    """pySLAM-compatible sensor string parser."""
+    """Normalize a sensor specification into a SensorType enum."""
     if isinstance(sensor_str, SensorType):
         return sensor_str
 

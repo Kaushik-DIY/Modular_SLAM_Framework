@@ -1,24 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/slam/slam.py
-
-pySLAM-aligned sparse ORB-SLAM system orchestrator.
-
-Reference:
-- pySLAM: pyslam/slam/slam.py
-
-Responsibilities:
-- own camera / feature tracker / map / local mapping / tracking
-- initialize FeatureTrackerShared through init_feature_tracker()
-- expose pySLAM-compatible track() delegation
-- provide reset/quit/config-distribution hooks
-
-Deferred:
-- semantic mapping
-- volumetric integration
-- full loop closing
-- system serialization/reload
-=============================================================================
+Top-level RGB-D SLAM system container.
+This module wires the front-end, map, local mapping, loop closing, and optimization services.
 """
 
 from __future__ import annotations
@@ -26,6 +8,8 @@ from __future__ import annotations
 from enum import Enum
 import time
 import traceback
+
+import numpy as np
 
 from visual_slam.orbslam.local_features import create_orb2_feature_tracker
 from visual_slam.orbslam.slam.config_parameters import Parameters
@@ -43,16 +27,16 @@ from visual_slam.orbslam.utilities.logging import Printer
 kVerbose = True
 
 
+# Enumerate the top-level operating modes of the SLAM system.
 class SlamMode(Enum):
     SLAM = 0
     MAP_BROWSER = 1
 
 
+# Own and connect the full RGB-D SLAM pipeline.
 class Slam:
     """
-    pySLAM-style sparse SLAM system container.
 
-    The construction order intentionally follows pySLAM:
         1. store camera/config/sensor metadata
         2. initialize feature tracker and FeatureTrackerShared
         3. create map
@@ -119,8 +103,7 @@ class Slam:
 
         self.set_config_params(config)
 
-        # pySLAM starts local mapping on a separate thread when configured.
-        # This port keeps local mapping sequential until the full online path is stable.
+        # Enable threaded local mapping only when the runner requests it.
         self.start_local_mapping_thread = (
             Parameters.kLocalMappingOnSeparateThread
             if start_local_mapping_thread is None
@@ -128,10 +111,7 @@ class Slam:
         )
 
         if self.start_local_mapping_thread:
-            Printer.orange(
-                "Slam: local-mapping thread start requested, but this ORB subset "
-                "currently runs local mapping sequentially."
-            )
+            self.local_mapping.start_thread()
 
     def set_config_params(self, config):
         self.config = config
@@ -171,7 +151,6 @@ class Slam:
 
         self.feature_tracker = feature_tracker
 
-        # pySLAM sets this with force=True during Slam initialization.
         FeatureTrackerShared.set_feature_tracker(feature_tracker, force=True)
 
         if self.sensor_type == SensorType.STEREO:
@@ -200,13 +179,18 @@ class Slam:
     def reset_session(self):
         self.reset()
 
+    def shutdown(self):
+        """Stop background threads cleanly. Call before discarding the Slam object."""
+        if self.start_local_mapping_thread and self.local_mapping is not None:
+            self.local_mapping.stop_thread()
+
     def quit(self):
         if self.has_quit:
             return
 
         self.has_quit = True
 
-        # No background local mapping thread is started yet, but keep the hook.
+        # Give the local-mapping thread a moment to exit cleanly if it was started.
         time.sleep(0.01)
 
     def __del__(self):
@@ -226,7 +210,6 @@ class Slam:
         mask_right=None,
     ):
         """
-        pySLAM-compatible public tracking entry point.
 
         Delegates to Tracking.track() with the same argument order.
         """
@@ -262,13 +245,68 @@ class Slam:
         return adjuster.run(loop_kf_id=0)
 
     def get_final_trajectory(self):
-        """
-        Return pySLAM-style final trajectory containers available in Tracking.
-        """
+        """Reconstruct the final per-frame trajectory from stored frame-to-keyframe poses."""
+        history = self.tracking.tracking_history
+        poses = []
+        for rel_pose, ref_kf in zip(history.relative_frame_poses, history.kf_references):
+            keyframe = ref_kf
+            Tcr_accum = np.eye(4, dtype=np.float64)
+            depth = 0
+            while keyframe.is_bad() and depth < 10:
+                Tcr_accum = Tcr_accum @ np.asarray(keyframe.Tcp(), dtype=np.float64)
+                parent = keyframe.get_parent()
+                if parent is None:
+                    keyframe = ref_kf
+                    Tcr_accum = np.eye(4, dtype=np.float64)
+                    break
+                keyframe = parent
+                depth += 1
+
+            Tcw_ref = np.asarray(keyframe.Tcw(), dtype=np.float64)
+            Tcr_frame = np.asarray(rel_pose.matrix(), dtype=np.float64)
+            Tcw_frame = Tcr_frame @ Tcr_accum @ Tcw_ref
+            poses.append(Tcw_frame)
+
         return {
-            "poses": list(self.tracking.poses),
-            "timestamps": list(self.tracking.pose_timestamps),
-            "history": self.tracking.tracking_history,
+            "poses": poses,
+            "timestamps": list(history.timestamps),
+            "ids": list(history.ids),
+            "slam_states": list(history.slam_states),
+        }
+
+    def compute_kf_trajectory_consistency(self) -> dict:
+        """
+        Diagnostic: compare each keyframe's Tcw() against the reconstructed trajectory
+        at the matching timestamp. After correct reconstruction the difference should be
+        near-zero (numerical noise only, < 0.001 m).
+        """
+        traj = self.get_final_trajectory()
+        ts_to_pose = dict(zip(traj["timestamps"], traj["poses"]))
+
+        diffs = []
+        for kf in list(self.map.keyframes_map.values()):
+            if kf is None or kf.is_bad():
+                continue
+            kf_ts = kf.timestamp
+            traj_pose = ts_to_pose.get(kf_ts)
+            if traj_pose is None:
+                closest_ts = min(ts_to_pose, key=lambda t: abs(t - kf_ts), default=None)
+                if closest_ts is None or abs(closest_ts - kf_ts) > 0.05:
+                    continue
+                traj_pose = ts_to_pose[closest_ts]
+
+            t_kf = np.asarray(kf.Tcw(), dtype=np.float64)[:3, 3]
+            t_traj = np.asarray(traj_pose, dtype=np.float64)[:3, 3]
+            diffs.append(float(np.linalg.norm(t_kf - t_traj)))
+
+        if not diffs:
+            return {"n_checked": 0, "max_diff_m": None, "median_diff_m": None}
+
+        return {
+            "n_checked": len(diffs),
+            "max_diff_m": float(np.max(diffs)),
+            "median_diff_m": float(np.median(diffs)),
+            "mean_diff_m": float(np.mean(diffs)),
         }
 
     def get_tracking_state(self):

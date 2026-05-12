@@ -1,15 +1,6 @@
 """
-=============================================================================
-visual_slam/orbslam/local_features/feature_matcher.py
-
-pySLAM-aligned minimal feature matcher for ORB/RGB-D SLAM.
-
-Reference:
-- pySLAM: pyslam/local_features/feature_matcher.py
-
-Only brute-force Hamming descriptor matching is implemented now, because the
-current target is ORB2 + RGB-D.
-=============================================================================
+Descriptor matcher utilities for local feature tracking.
+This module scores feature correspondence candidates and returns index-aligned matches.
 """
 
 from __future__ import annotations
@@ -22,12 +13,14 @@ import cv2
 import numpy as np
 
 
+# Enumerate the matcher modes supported by the local feature stack.
 class FeatureMatcherTypes(Enum):
     NONE = 0
     BF = 1
     DES_BF = 2
 
 
+# Store the index-aligned result of one descriptor matching pass.
 @dataclass
 class FeatureMatchingResult:
     idxs1: np.ndarray
@@ -36,6 +29,7 @@ class FeatureMatchingResult:
     matches: list
 
 
+# Define the base interface for descriptor matchers.
 class FeatureMatcher:
     def __init__(
         self,
@@ -106,6 +100,7 @@ class FeatureMatcher:
         )
 
 
+# Run brute-force descriptor matching with ratio and distance filtering.
 class BfFeatureMatcher(FeatureMatcher):
     def __init__(self, norm_type: int = cv2.NORM_HAMMING, ratio_test: float = 0.7):
         super().__init__(
