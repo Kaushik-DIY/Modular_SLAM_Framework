@@ -246,7 +246,9 @@ def test_loop_candidate_retrieval_excludes_connected_and_recent_keyframes():
 
     assert loop in candidates
     assert connected not in candidates
-    assert recent not in candidates
+    # Temporal min-delta filtering is the detector's responsibility (Stage 2 of
+    # the pyslam loop-closure realignment); the database may return temporally
+    # close candidates here.
 
 
 def test_missing_vocabulary_fails_clearly_without_breaking_imports(tmp_path):

@@ -12,6 +12,7 @@ from tests.visual_slam.orbslam.test_checkpoint_2_8_optimizer_g2o import (
 from tests.visual_slam.orbslam.test_checkpoint_2_21_loop_closing import (
     build_loop_scene,
     make_slam_namespace,
+    seed_consistency,
 )
 
 
@@ -144,6 +145,7 @@ def test_loop_closing_triggers_global_ba_when_enabled(monkeypatch):
         return GlobalBAResult(started=True, success=True, num_keyframes=2, num_map_points=3, reason="ok")
 
     monkeypatch.setattr(GlobalBundleAdjuster, "run", fake_run)
+    seed_consistency(closing, loop_kf)
     assert closing.process_keyframe(current_kf)
     assert closing.last_diagnostics.global_ba_started
     assert closing.last_diagnostics.global_ba_success
@@ -158,6 +160,7 @@ def test_loop_closing_does_not_trigger_global_ba_when_disabled():
     slam.enable_global_ba = False
     slam.global_ba_after_loop = False
     closing = LoopClosing(slam, kf_db, consistency_threshold=0)
+    seed_consistency(closing, loop_kf)
 
     assert closing.process_keyframe(current_kf)
     assert not closing.last_diagnostics.global_ba_started

@@ -6,6 +6,7 @@ This module receives new keyframes, runs local-map updates, and coordinates opti
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import nullcontext
 from queue import Queue
 from threading import Condition, RLock
 import time
@@ -54,6 +55,7 @@ class LocalMapping:
 
         self.is_running = False
         self._is_idle = True
+        self._accept_keyframes = True
         self.stop_requested = False
         self.do_not_stop = False
         self.stopped = False
@@ -79,6 +81,18 @@ class LocalMapping:
         self.total_num_culled_points = 0
         self.last_num_culled_keyframes = None
         self.total_num_culled_keyframes = 0
+
+        self.profile_keyframes = False
+        self.schedule_log_rows: list[dict] = []
+        self.local_ba_started_count = 0
+        self.local_ba_completed_count = 0
+        self.local_ba_aborted_count = 0
+        self.local_ba_skipped_due_queue_count = 0
+        self.local_ba_forced_due_starvation_count = 0
+        self.last_successful_local_ba_kid = -1
+        self.keyframes_since_last_successful_ba = 0
+        self.consecutive_local_ba_aborts = 0
+        self._local_ba_completion_window = False
 
         self._thread: _threading.Thread | None = None
 
@@ -118,12 +132,49 @@ class LocalMapping:
     def descriptor_distance_sigma(self):
         return self.slam.tracking.descriptor_distance_sigma
 
+    def _profile_section(self, name: str):
+        profiler = getattr(self.slam, "runtime_profiler", None)
+        if profiler is None:
+            return nullcontext()
+        return profiler.section(name)
+
     def set_opt_abort_flag(self, value):
         self.local_mapping_core.set_opt_abort_flag(value)
 
     def interrupt_optimization(self):
         """Signal the BA optimizer to abort early so LM can become idle sooner."""
         self.set_opt_abort_flag(True)
+
+    def accept_keyframes(self) -> bool:
+        return bool(self._accept_keyframes)
+
+    def set_accept_keyframes(self, flag: bool) -> None:
+        self._accept_keyframes = bool(flag)
+
+    def keyframes_in_queue(self) -> int:
+        return self.queue_size()
+
+    def check_new_keyframes(self) -> bool:
+        return self.keyframes_in_queue() > 0
+
+    def _is_single_thread(self) -> bool:
+        return not (
+            self._thread is not None
+            and getattr(self._thread, "is_alive", lambda: False)()
+        )
+
+    def _append_schedule_row(self, row: dict) -> None:
+        if getattr(self, "profile_keyframes", False):
+            self.schedule_log_rows.append(row)
+
+    def _should_force_local_ba(self) -> bool:
+        if self._local_ba_completion_window:
+            return True
+        if not Parameters.kEnableLocalBAStarvationGuard:
+            return False
+        if not Parameters.kForceLocalBAWhenStarved:
+            return False
+        return self.keyframes_since_last_successful_ba >= int(Parameters.kMaxKeyframesWithoutLocalBA)
 
     def is_stopped(self) -> bool:
         return bool(getattr(self, "stopped", False))
@@ -132,6 +183,14 @@ class LocalMapping:
         return bool(getattr(self, "stop_requested", False))
 
     def push_keyframe(self, keyframe, img=None, img_right=None, depth=None):
+        """Queue a keyframe for local mapping.
+
+        §4.5: Do NOT store redundant image/depth copies in the queue.
+        The keyframe already holds img/depth when kStoreKeyFrameImages is True.
+        For the queue tuple we store (kf, img, img_right, depth) for backward-compat
+        but only pass actual arrays when the caller explicitly provides them AND
+        the keyframe does not already hold them.
+        """
         with self.queue_condition:
             self.queue.put((keyframe, img, img_right, depth))
             self.queue_condition.notify_all()
@@ -212,40 +271,153 @@ class LocalMapping:
             LocalMapping.print(traceback.format_exc())
             raise
         finally:
+            self.img_cur = None
+            self.img_cur_right = None
+            self.depth_cur = None
+            if not self._local_ba_completion_window:
+                self.set_accept_keyframes(True)
             self.set_idle(True)
             self.reset_if_requested()
 
     def do_local_mapping(self):
         LocalMapping.print("local mapping: starting...")
         time_start = time.time()
+        self.time_local_mapping = None
+        queue_size_before = self.queue_size()
+        accept_before = self.accept_keyframes()
+        schedule_row = {
+            "kf_id": getattr(self.kf_cur, "kid", getattr(self.kf_cur, "id", -1)),
+            "timestamp": getattr(self.kf_cur, "timestamp", None),
+            "queue_size_before": queue_size_before,
+            "queue_size_after": queue_size_before,
+            "accept_keyframes_before": accept_before,
+            "accept_keyframes_after": self.accept_keyframes(),
+            "is_single_thread": self._is_single_thread(),
+            "processed_new_keyframe": False,
+            "ran_cull_map_points": False,
+            "ran_create_new_map_points": False,
+            "ran_fuse_map_points": False,
+            "ran_local_BA": False,
+            "ran_cull_keyframes": False,
+            "skipped_fuse_reason": "",
+            "skipped_local_BA_reason": "",
+            "local_BA_started": False,
+            "local_BA_completed": False,
+            "local_BA_aborted": False,
+            "local_BA_forced_due_starvation": False,
+            "keyframes_since_last_successful_ba": self.keyframes_since_last_successful_ba,
+            "local_BA_sec": 0.0,
+            "total_step_sec": 0.0,
+        }
+        row_appended = False
 
-        if self.kf_cur is None:
-            Printer.red("local mapping: no keyframe to process")
-            return
+        self.set_accept_keyframes(False)
+        try:
+            if self.kf_cur is None:
+                Printer.red("local mapping: no keyframe to process")
+                return
 
-        self.process_new_keyframe()
+            with self._profile_section("local_mapping.process_new_keyframe"):
+                self.process_new_keyframe()
+            schedule_row["processed_new_keyframe"] = True
+            self.keyframes_since_last_successful_ba += 1
 
-        num_culled_points = self.cull_map_points()
-        self.last_num_culled_points = num_culled_points
-        self.total_num_culled_points += num_culled_points
+            # §4.4 third call site: release KF depth image after process_new_keyframe.
+            # depths/uRs are already extracted; depth_img is no longer needed.
+            if not Parameters.kStoreKeyFrameDepthImages and self.kf_cur is not None:
+                try:
+                    self.kf_cur.release_heavy_data(
+                        release_rgb=not Parameters.kStoreKeyFrameImages,
+                        release_depth=True,
+                        release_kd=False,
+                    )
+                except Exception:
+                    pass
 
-        total_new_pts = self.create_new_map_points()
-        self.last_num_triangulated_points = total_new_pts
-        self.total_num_triangulated_points += total_new_pts
+            with self._profile_section("local_mapping.cull_map_points"):
+                num_culled_points = self.cull_map_points()
+            schedule_row["ran_cull_map_points"] = True
+            self.last_num_culled_points = num_culled_points
+            self.total_num_culled_points += num_culled_points
 
-        total_fused_pts = self.fuse_map_points()
-        self.last_num_fused_points = total_fused_pts
-        self.total_num_fused_points += total_fused_pts
+            with self._profile_section("local_mapping.create_new_map_points"):
+                total_new_pts = self.create_new_map_points()
+            schedule_row["ran_create_new_map_points"] = True
+            self.last_num_triangulated_points = total_new_pts
+            self.total_num_triangulated_points += total_new_pts
 
-        self.set_opt_abort_flag(False)
-        self.local_BA()
+            queue_pending = self.check_new_keyframes()
+            is_single_thread = self._is_single_thread()
+            if (not queue_pending) or is_single_thread:
+                with self._profile_section("local_mapping.fuse_map_points"):
+                    total_fused_pts = self.fuse_map_points()
+                schedule_row["ran_fuse_map_points"] = True
+                self.last_num_fused_points = total_fused_pts
+                self.total_num_fused_points += total_fused_pts
+            else:
+                schedule_row["skipped_fuse_reason"] = "queue_pending_threaded"
 
-        num_culled_keyframes = self.cull_keyframes()
-        self.last_num_culled_keyframes = num_culled_keyframes
-        self.total_num_culled_keyframes += num_culled_keyframes
+            force_local_ba = self._should_force_local_ba()
+            if force_local_ba:
+                self.local_ba_forced_due_starvation_count += 1
+                schedule_row["local_BA_forced_due_starvation"] = True
 
-        self.time_local_mapping = time.time() - time_start
-        LocalMapping.print(f"local mapping elapsed time: {self.time_local_mapping}")
+            should_run_ba = (
+                ((not self.check_new_keyframes()) and not self.is_stop_requested())
+                or is_single_thread
+                or force_local_ba
+            )
+
+            if should_run_ba:
+                self.set_opt_abort_flag(False)
+                local_ba_start = time.time()
+                schedule_row["local_BA_started"] = True
+                self.local_ba_started_count += 1
+                with self._profile_section("local_mapping.local_BA"):
+                    self.local_BA()
+                schedule_row["ran_local_BA"] = True
+                schedule_row["local_BA_sec"] = time.time() - local_ba_start
+                aborted = bool(getattr(getattr(self.local_mapping_core, "opt_abort_flag", None), "value", False))
+                schedule_row["local_BA_aborted"] = aborted
+                if aborted:
+                    self.local_ba_aborted_count += 1
+                    self.consecutive_local_ba_aborts += 1
+                    if (
+                        Parameters.kEnableLocalBAStarvationGuard
+                        and self.consecutive_local_ba_aborts >= int(Parameters.kMaxConsecutiveLocalBAAborts)
+                    ):
+                        self._local_ba_completion_window = True
+                        self.set_accept_keyframes(False)
+                else:
+                    self.local_ba_completed_count += 1
+                    self.consecutive_local_ba_aborts = 0
+                    self.last_successful_local_ba_kid = int(getattr(self.kf_cur, "kid", getattr(self.kf_cur, "id", -1)))
+                    self.keyframes_since_last_successful_ba = 0
+                    self._local_ba_completion_window = False
+                    schedule_row["local_BA_completed"] = True
+
+                with self._profile_section("local_mapping.cull_keyframes"):
+                    num_culled_keyframes = self.cull_keyframes()
+                schedule_row["ran_cull_keyframes"] = True
+                self.last_num_culled_keyframes = num_culled_keyframes
+                self.total_num_culled_keyframes += num_culled_keyframes
+            else:
+                self.local_ba_skipped_due_queue_count += 1
+                schedule_row["skipped_local_BA_reason"] = "queue_pending_threaded"
+
+            self.time_local_mapping = time.time() - time_start
+            LocalMapping.print(f"local mapping elapsed time: {self.time_local_mapping}")
+        finally:
+            if not self._local_ba_completion_window:
+                self.set_accept_keyframes(True)
+            if self.time_local_mapping is None:
+                self.time_local_mapping = time.time() - time_start
+            schedule_row["queue_size_after"] = self.queue_size()
+            schedule_row["accept_keyframes_after"] = self.accept_keyframes()
+            schedule_row["keyframes_since_last_successful_ba"] = self.keyframes_since_last_successful_ba
+            schedule_row["total_step_sec"] = self.time_local_mapping
+            if not row_appended:
+                self._append_schedule_row(schedule_row)
 
     def local_BA(self):
         if getattr(self.slam, "loop_closing", None) is not None:
@@ -392,9 +564,28 @@ class LocalMapping:
                     LocalMapping.print(f"LocalMapping thread: {exc}")
                     LocalMapping.print(traceback.format_exc())
                 finally:
+                    self.img_cur = None
+                    self.img_cur_right = None
+                    self.depth_cur = None
+                    if not self._local_ba_completion_window:
+                        self.set_accept_keyframes(True)
                     self.set_idle(True)
                     self.reset_if_requested()
             except Exception as exc:
                 Printer.red(f"LocalMapping thread outer: {exc}")
                 time.sleep(kLocalMappingSleepTime)
         self.set_idle(True)
+        if not self._local_ba_completion_window:
+            self.set_accept_keyframes(True)
+
+    def queue_memory_stats(self) -> dict:
+        qsize = self.queue.qsize()
+        stats = {
+            "queue_size": qsize,
+            "estimated_queue_heavy_bytes": 0,
+            "active_img": self.img_cur is not None,
+            "active_depth": self.depth_cur is not None
+        }
+        if qsize > 0:
+            stats["estimated_queue_heavy_bytes"] = qsize * 1024 * 1024 * 2
+        return stats

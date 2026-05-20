@@ -1061,6 +1061,181 @@ def local_bundle_adjustment(
     )
 
 
+def optimize_sim3(
+    kf1: KeyFrame,
+    kf2: KeyFrame,
+    map_points1,
+    map_point_matches12,
+    R12: np.ndarray,
+    t12: np.ndarray,
+    s12: float,
+    th2: float,
+    fix_scale: bool,
+    verbose: bool = False,
+):
+    """Optimize a Sim3 transformation between two keyframes using g2o.
+
+    Mirrors pyslam optimizer_g2o.py:optimize_sim3 (lines 1226-1417) exactly.
+    map_point_matches12[i] = map point of kf2 matched with i-th map point of kf1.
+    Returns (num_inliers, R12, t12, s12, delta_err).
+    """
+    R12 = np.asarray(R12, dtype=np.float64)
+    t12 = np.asarray(t12, dtype=np.float64).ravel()
+    s12 = float(s12)
+    th2 = float(th2)
+
+    cam1 = kf1.camera
+    cam2 = kf2.camera
+    kf1_Tcw = np.asarray(kf1.Tcw(), dtype=np.float64).reshape(4, 4)
+    kf2_Tcw = np.asarray(kf2.Tcw(), dtype=np.float64).reshape(4, 4)
+    R1w, t1w = kf1_Tcw[:3, :3], kf1_Tcw[:3, 3]
+    R2w, t2w = kf2_Tcw[:3, :3], kf2_Tcw[:3, 3]
+
+    optimizer = g2o.SparseOptimizer()
+    solver = g2o.BlockSolverX(g2o.LinearSolverDenseX())
+    algorithm = g2o.OptimizationAlgorithmLevenberg(solver)
+    optimizer.set_algorithm(algorithm)
+
+    sim3 = g2o.Sim3(R12.copy(), t12.copy(), s12)
+    sim3_vertex = g2o.VertexSim3Expmap()
+    sim3_vertex.set_estimate(sim3)
+    sim3_vertex.set_id(0)
+    sim3_vertex.set_fixed(False)
+    sim3_vertex._fix_scale = fix_scale
+    sim3_vertex._principle_point1 = np.array([cam1.cx, cam1.cy])
+    sim3_vertex._focal_length1 = np.array([cam1.fx, cam1.fy])
+    sim3_vertex._principle_point2 = np.array([cam2.cx, cam2.cy])
+    sim3_vertex._focal_length2 = np.array([cam2.fx, cam2.fy])
+    optimizer.add_vertex(sim3_vertex)
+
+    if map_points1 is None:
+        map_points1 = kf1.get_points()
+    num_matches = len(map_point_matches12)
+    assert num_matches == len(map_points1)
+
+    edges_12 = []
+    edges_21 = []
+    vertex_indices = []
+    delta_huber = float(np.sqrt(th2))
+    inv_level_sigmas2 = (
+        FeatureTrackerShared.feature_manager.inv_level_sigmas2
+        if FeatureTrackerShared.feature_manager is not None
+        else np.ones(8)
+    )
+    eye2 = np.eye(2)
+
+    num_correspondences = 0
+    for i in range(num_matches):
+        mp1 = map_points1[i]
+        if mp1 is None or mp1.is_bad():
+            continue
+        mp2 = map_point_matches12[i]
+        if mp2 is None or mp2.is_bad():
+            continue
+
+        vertex_id1 = 2 * i + 1
+        vertex_id2 = 2 * (i + 1)
+        index2 = mp2.get_observation_idx(kf2)
+        if index2 < 0:
+            continue
+
+        v_mp1 = g2o.VertexSBAPointXYZ()
+        v_mp1.set_estimate(R1w @ mp1.pt() + t1w)
+        v_mp1.set_id(vertex_id1)
+        v_mp1.set_fixed(True)
+        optimizer.add_vertex(v_mp1)
+
+        v_mp2 = g2o.VertexSBAPointXYZ()
+        v_mp2.set_estimate(R2w @ mp2.pt() + t2w)
+        v_mp2.set_id(vertex_id2)
+        v_mp2.set_fixed(True)
+        optimizer.add_vertex(v_mp2)
+
+        kpsu_i = np.array(kf1.kpsu[i].pt if hasattr(kf1.kpsu[i], "pt") else kf1.kpsu[i], dtype=np.float64)
+        edge_12 = g2o.EdgeSim3ProjectXYZ()
+        edge_12.set_vertex(0, optimizer.vertex(vertex_id2))
+        edge_12.set_vertex(1, optimizer.vertex(0))
+        edge_12.set_measurement(kpsu_i)
+        level_i = int(kf1.octaves[i]) if kf1.octaves is not None else 0
+        invSigma2_12 = float(inv_level_sigmas2[min(level_i, len(inv_level_sigmas2) - 1)])
+        edge_12.set_information(eye2 * invSigma2_12)
+        edge_12.set_robust_kernel(g2o.RobustKernelHuber(delta_huber))
+        optimizer.add_edge(edge_12)
+
+        kpsu_j = np.array(kf2.kpsu[index2].pt if hasattr(kf2.kpsu[index2], "pt") else kf2.kpsu[index2], dtype=np.float64)
+        edge_21 = g2o.EdgeInverseSim3ProjectXYZ()
+        edge_21.set_vertex(0, optimizer.vertex(vertex_id1))
+        edge_21.set_vertex(1, optimizer.vertex(0))
+        edge_21.set_measurement(kpsu_j)
+        level_j = int(kf2.octaves[index2]) if kf2.octaves is not None else 0
+        invSigma2_21 = float(inv_level_sigmas2[min(level_j, len(inv_level_sigmas2) - 1)])
+        edge_21.set_information(eye2 * invSigma2_21)
+        edge_21.set_robust_kernel(g2o.RobustKernelHuber(delta_huber))
+        optimizer.add_edge(edge_21)
+
+        edges_12.append(edge_12)
+        edges_21.append(edge_21)
+        vertex_indices.append(i)
+        num_correspondences += 1
+
+    if num_correspondences < 10:
+        return 0, None, None, None, 0.0
+
+    optimizer.initialize_optimization()
+    if verbose:
+        optimizer.set_verbose(True)
+    optimizer.optimize(5)
+    err = optimizer.active_chi2()
+
+    # First inlier check
+    num_bad = 0
+    for i, (e12, e21) in enumerate(zip(edges_12, edges_21)):
+        if (
+            e12.chi2() > th2
+            or not e12.is_depth_positive()
+            or e21.chi2() > th2
+            or not e21.is_depth_positive()
+        ):
+            idx = vertex_indices[i]
+            map_points1[idx] = None
+            optimizer.remove_edge(e12)
+            optimizer.remove_edge(e21)
+            edges_12[i] = None
+            edges_21[i] = None
+            num_bad += 1
+
+    num_more_iterations = 10 if num_bad > 0 else 5
+    if num_correspondences - num_bad < 10:
+        return 0, None, None, None, 0.0
+
+    optimizer.initialize_optimization()
+    optimizer.optimize(num_more_iterations)
+    delta_err = optimizer.active_chi2() - err
+
+    num_inliers = 0
+    for i, (e12, e21) in enumerate(zip(edges_12, edges_21)):
+        if e12 is None or e21 is None:
+            continue
+        if (
+            e12.chi2() > th2
+            or not e12.is_depth_positive()
+            or e21.chi2() > th2
+            or not e21.is_depth_positive()
+        ):
+            map_points1[vertex_indices[i]] = None
+        else:
+            num_inliers += 1
+
+    sim3_recov = optimizer.vertex(0).estimate()
+    return (
+        num_inliers,
+        np.asarray(sim3_recov.rotation().matrix(), dtype=np.float64),
+        np.asarray(sim3_recov.translation(), dtype=np.float64).ravel(),
+        float(sim3_recov.scale()),
+        float(delta_err),
+    )
+
+
 def global_bundle_adjustment(
     keyframes,
     points,

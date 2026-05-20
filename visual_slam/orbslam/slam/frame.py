@@ -516,7 +516,9 @@ class Frame(FrameBase):
         return removed
 
     def get_points(self):
-        return [p for p in self.points if p is not None]
+        # Return full list preserving keypoint-index alignment (pyslam frame.py:938).
+        # None entries mean "no map point for this keypoint" — callers must handle None.
+        return list(self.points)
 
     def get_matched_points(self):
         return [p for p in self.points if p is not None]
@@ -678,6 +680,54 @@ class Frame(FrameBase):
 
         return pts3d, valid
 
+    def release_images(self, release_rgb=True, release_right=True, release_depth=True, release_mask=True) -> None:
+        if release_rgb:
+            self.img = None
+        if release_right:
+            self.img_right = None
+        if release_depth:
+            self.depth_img = None
+        if release_mask:
+            self.mask = None
+
+    def release_heavy_data(self, release_images=True, release_kd=True, release_descriptors=False, release_points=False) -> None:
+        if release_images:
+            self.release_images()
+        if release_kd:
+            self.kd = None
+        if release_descriptors:
+            self.des = np.empty((0, 32), dtype=np.uint8)
+            self.g_des = None
+            self.f_des = None
+        if release_points:
+            self.reset_points()
+
+    def heavy_memory_bytes(self) -> int:
+        total = 0
+        if self.img is not None:
+            total += self.img.nbytes
+        if self.img_right is not None:
+            total += self.img_right.nbytes
+        if self.depth_img is not None:
+            total += self.depth_img.nbytes
+        if hasattr(self, 'des') and self.des is not None:
+            total += self.des.nbytes
+        if hasattr(self, 'depths') and self.depths is not None:
+            total += self.depths.nbytes
+        if hasattr(self, 'uRs') and self.uRs is not None:
+            total += self.uRs.nbytes
+        if hasattr(self, 'octaves') and self.octaves is not None:
+            total += self.octaves.nbytes
+        if hasattr(self, 'angles') and self.angles is not None:
+            total += self.angles.nbytes
+        if hasattr(self, 'sizes') and self.sizes is not None:
+            total += self.sizes.nbytes
+        if hasattr(self, 'points') and self.points is not None:
+            total += len(self.points) * 8
+        if hasattr(self, 'outliers') and self.outliers is not None:
+            total += self.outliers.nbytes
+        return total
+
     def delete(self) -> None:
         self._is_deleted = True
         self.img = None
@@ -717,6 +767,43 @@ def are_map_points_visible_in_frame(
 
 def are_map_points_visible(frame: FrameBase, map_points, **kwargs):
     return are_map_points_visible_in_frame(frame, map_points, **kwargs)
+
+
+def prepare_input_data_for_sim3solver(f1: "FrameBase", f2: "FrameBase", idxs1, idxs2):
+    """Build 3D correspondences and per-keypoint sigma2 arrays for Sim3Solver.
+
+    Mirrors pyslam frame.py:1878 exactly.
+    """
+    level_sigmas2 = FeatureTrackerShared.feature_manager.level_sigmas2 if FeatureTrackerShared.feature_manager is not None else [1.0]
+    points_3d_1 = []
+    points_3d_2 = []
+    sigmas2_1 = []
+    sigmas2_2 = []
+    idxs1_out = []
+    idxs2_out = []
+    for i1, i2 in zip(idxs1, idxs2):
+        p1 = f1.get_point_match(int(i1))
+        if p1 is None or p1.is_bad():
+            continue
+        p2 = f2.get_point_match(int(i2))
+        if p2 is None or p2.is_bad():
+            continue
+        points_3d_1.append(p1.pt())
+        points_3d_2.append(p2.pt())
+        lv1 = int(f1.octaves[int(i1)]) if hasattr(f1, "octaves") and f1.octaves is not None else 0
+        lv2 = int(f2.octaves[int(i2)]) if hasattr(f2, "octaves") and f2.octaves is not None else 0
+        sigmas2_1.append(float(level_sigmas2[min(lv1, len(level_sigmas2) - 1)]))
+        sigmas2_2.append(float(level_sigmas2[min(lv2, len(level_sigmas2) - 1)]))
+        idxs1_out.append(int(i1))
+        idxs2_out.append(int(i2))
+    return (
+        np.ascontiguousarray(points_3d_1, dtype=np.float32) if points_3d_1 else np.zeros((0, 3), dtype=np.float32),
+        np.ascontiguousarray(points_3d_2, dtype=np.float32) if points_3d_2 else np.zeros((0, 3), dtype=np.float32),
+        np.ascontiguousarray(sigmas2_1, dtype=np.float32) if sigmas2_1 else np.zeros(0, dtype=np.float32),
+        np.ascontiguousarray(sigmas2_2, dtype=np.float32) if sigmas2_2 else np.zeros(0, dtype=np.float32),
+        np.ascontiguousarray(idxs1_out, dtype=np.int32) if idxs1_out else np.zeros(0, dtype=np.int32),
+        np.ascontiguousarray(idxs2_out, dtype=np.int32) if idxs2_out else np.zeros(0, dtype=np.int32),
+    )
 
 
 def match_frames(frame_ref: Frame, frame_cur: Frame, ratio_test: float | None = None):

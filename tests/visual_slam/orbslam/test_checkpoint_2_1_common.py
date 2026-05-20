@@ -55,18 +55,18 @@ def test_parameters_match_pyslam_orb_rgbd_subset():
 
     assert Parameters.kORBNumLevels == 8
     assert abs(Parameters.kORBScaleFactor - 1.2) < 1e-12
-    assert Parameters.kORBDeterministic is False
+    assert Parameters.kORBDeterministic is True
 
     assert Parameters.kMinNumMatchedFeaturesSearchFrameByProjection == 20
     assert Parameters.kNumMinPointsForNewKf == 15
     assert Parameters.kNumMinTrackedClosePointsForNewKfNonMonocular == 100
     assert Parameters.kNumMaxNonTrackedClosePointsForNewKfNonMonocular == 70
-    assert Parameters.kThNewKfRefRatioStereo == 0.75
+    assert Parameters.kThNewKfRefRatioStereo == 0.90
 
     assert Parameters.kMaxReprojectionDistanceFrame == 7
     assert Parameters.kMaxReprojectionDistanceMapRgbd == 3
     assert Parameters.kLocalBAWindowSize == 20
-    assert Parameters.kLoopClosingGeometryCheckerMinKpsMatches == 20
+    assert Parameters.kLoopClosingGeometryCheckerMinKpsMatches == 9
     assert Parameters.kRelocalizationMinKpsMatches == 15
 
     assert Parameters.kChi2Mono == 5.991

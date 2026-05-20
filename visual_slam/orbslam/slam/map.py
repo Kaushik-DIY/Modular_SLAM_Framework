@@ -18,8 +18,6 @@ from visual_slam.orbslam.slam.keyframe import KeyFrame
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.optimizer_g2o import local_bundle_adjustment, global_bundle_adjustment
 
-kMaxLenFrameDeque = 20
-
 
 # Provide a lightweight ordered set for keyframes and map points.
 class OrderedSetLite:
@@ -146,7 +144,7 @@ class LocalCovisibilityMap:
 
         self.local_keyframes.add(reference_keyframe)
 
-        for kf in reference_keyframe.get_covisible_keyframes():
+        for kf in reference_keyframe.get_best_covisible_keyframes(num_best):
             if kf is not None and not kf.is_bad():
                 self.local_keyframes.add(kf)
 
@@ -182,7 +180,7 @@ class Map:
         self._lock = RLock()
         self._update_lock = RLock()
 
-        self.frames: deque[Frame] = deque(maxlen=kMaxLenFrameDeque)
+        self.frames: deque[Frame] = deque(maxlen=Parameters.kMaxLenFrameDeque)
         self.keyframes: OrderedSetLite = OrderedSetLite()
         self.points: OrderedSetLite = OrderedSetLite()
         self.keyframe_origins: OrderedSetLite = OrderedSetLite()
@@ -196,6 +194,15 @@ class Map:
         self.reloaded_session_map_info: ReloadedSessionMapInfo | None = None
         self.local_map = LocalCovisibilityMap(map=self)
         self.viewer_scale = -1
+        self._frame_view_stats_cache = {
+            "num_frame_views_total": 0,
+            "old_frame_views_total": 0,
+            "oldest_frame_view_id": -1,
+            "checked_points": 0,
+            "removed_frame_views": 0,
+            "remaining_frame_views": 0,
+            "oldest_remaining_frame_view_id": -1,
+        }
 
     @property
     def lock(self):
@@ -220,6 +227,7 @@ class Map:
                 self.max_point_id = 0
                 self.max_frame_id = 0
                 self.max_keyframe_id = 0
+                self._reset_frame_view_stats_cache()
 
     def reset_session(self) -> None:
         # Reset the in-memory map state for a fresh run.
@@ -290,6 +298,15 @@ class Map:
         with self._lock:
             return len(self.frames)
 
+    def _cleanup_evicted_frame(self, frame: Frame) -> None:
+        frame.remove_frame_views()
+        frame.reset_points()
+        release_rgb = Parameters.kReleaseNormalFrameImagesAfterUse or not Parameters.kStoreNormalFrameImages
+        release_depth = Parameters.kReleaseNormalFrameImagesAfterUse or not Parameters.kStoreNormalFrameImages
+        release_desc = Parameters.kReleaseEvictedFrameFeatureCache
+        frame.release_heavy_data(release_images=True, release_kd=True, release_descriptors=release_desc, release_points=True)
+        frame.release_images(release_rgb=release_rgb, release_right=release_rgb, release_depth=release_depth)
+
     def add_frame(self, frame: Frame, override_id: bool = False) -> int:
         with self._lock:
             ret = frame.id
@@ -300,8 +317,36 @@ class Map:
             else:
                 self.max_frame_id = max(self.max_frame_id, frame.id + 1)
 
+            if Parameters.kEnableFrameEvictionCleanup and len(self.frames) >= getattr(self.frames, 'maxlen', Parameters.kMaxLenFrameDeque):
+                old_frame = self.frames.popleft()
+                self._cleanup_evicted_frame(old_frame)
+
             self.frames.append(frame)
             return ret
+
+    def _reset_frame_view_stats_cache(self) -> None:
+        self._frame_view_stats_cache = {
+            "num_frame_views_total": 0,
+            "old_frame_views_total": 0,
+            "oldest_frame_view_id": -1,
+            "checked_points": 0,
+            "removed_frame_views": 0,
+            "remaining_frame_views": 0,
+            "oldest_remaining_frame_view_id": -1,
+        }
+
+    def _update_frame_view_stats_cache(self, stats: dict) -> None:
+        self._frame_view_stats_cache.update(
+            {
+                "num_frame_views_total": int(stats.get("num_frame_views_total", stats.get("remaining_frame_views", 0))),
+                "old_frame_views_total": int(stats.get("old_frame_views_total", 0)),
+                "oldest_frame_view_id": int(stats.get("oldest_frame_view_id", stats.get("oldest_remaining_frame_view_id", -1))),
+                "checked_points": int(stats.get("checked_points", 0)),
+                "removed_frame_views": int(stats.get("removed_frame_views", 0)),
+                "remaining_frame_views": int(stats.get("remaining_frame_views", stats.get("num_frame_views_total", 0))),
+                "oldest_remaining_frame_view_id": int(stats.get("oldest_remaining_frame_view_id", stats.get("oldest_frame_view_id", -1))),
+            }
+        )
 
     def remove_frame(self, frame: Frame) -> None:
         with self._lock:
@@ -379,9 +424,9 @@ class Map:
     # Local map
     # ------------------------------------------------------------------
 
-    def update_local_map(self, reference_keyframe: KeyFrame) -> None:
+    def update_local_map(self, reference_keyframe: KeyFrame, num_best: int = Parameters.kNumBestCovisibilityKeyFrames) -> None:
         with self._lock:
-            self.local_map.update(reference_keyframe)
+            self.local_map.update(reference_keyframe, num_best=num_best)
 
     def get_local_keyframes(self) -> OrderedSetLite:
         return self.local_map.get_keyframes()
@@ -505,6 +550,114 @@ class Map:
             count += 1
 
         return count
+
+    def prune_old_frame_views(self, current_frame_id: int | None = None, keep_last: int | None = None) -> dict:
+        with self._lock:
+            if current_frame_id is None:
+                current_frame_id = self.max_frame_id - 1
+            if keep_last is None:
+                keep_last = Parameters.kFrameViewRetention
+            min_frame_id = current_frame_id - keep_last + 1
+
+            checked_points = 0
+            removed_frame_views = 0
+            remaining_frame_views = 0
+            oldest_remaining_frame_view_id = -1
+
+            for p in self.points:
+                checked_points += 1
+                if hasattr(p, 'remove_frame_views_older_than'):
+                    removed = p.remove_frame_views_older_than(min_frame_id)
+                    removed_frame_views += removed
+                
+                if hasattr(p, 'get_frame_views'):
+                    views = p.get_frame_views()
+                    remaining_frame_views += len(views)
+                    for frame_id in views.keys():
+                        if oldest_remaining_frame_view_id == -1 or frame_id < oldest_remaining_frame_view_id:
+                            oldest_remaining_frame_view_id = frame_id
+
+            stats = {
+                "checked_points": checked_points,
+                "removed_frame_views": removed_frame_views,
+                "remaining_frame_views": remaining_frame_views,
+                "oldest_remaining_frame_view_id": oldest_remaining_frame_view_id
+            }
+            self._update_frame_view_stats_cache(stats)
+            return stats
+
+    def memory_stats(self, mode: str = "deep") -> dict:
+        with self._lock:
+            mode = "deep" if str(mode).lower() == "deep" else "cheap"
+            stats = {
+                "num_recent_frames": len(self.frames),
+                "recent_frame_ids_min": min((f.id for f in self.frames), default=-1),
+                "recent_frame_ids_max": max((f.id for f in self.frames), default=-1),
+                "max_len_frame_deque": getattr(self.frames, "maxlen", -1),
+                "num_keyframes": len(self.keyframes),
+                "num_map_points": len(self.points),
+                "num_frame_views_total": int(self._frame_view_stats_cache.get("num_frame_views_total", 0)),
+                "old_frame_views_total": int(self._frame_view_stats_cache.get("old_frame_views_total", 0)),
+                "oldest_frame_view_id": int(self._frame_view_stats_cache.get("oldest_frame_view_id", -1)),
+                "num_keyframe_observations_total": 0,
+                "num_bad_points": 0,
+                "num_recent_frame_images": 0,
+                "num_recent_frame_depth_images": 0,
+                "num_keyframe_images": 0,
+                "num_keyframe_depth_images": 0,
+                "estimated_frame_heavy_bytes": 0,
+                "estimated_keyframe_heavy_bytes": 0,
+                "estimated_total_heavy_bytes": 0
+            }
+
+            for f in self.frames:
+                if f.img is not None:
+                    stats["num_recent_frame_images"] += 1
+                if f.depth_img is not None:
+                    stats["num_recent_frame_depth_images"] += 1
+                if hasattr(f, "heavy_memory_bytes"):
+                    stats["estimated_frame_heavy_bytes"] += f.heavy_memory_bytes()
+
+            for kf in self.keyframes:
+                if kf.img is not None:
+                    stats["num_keyframe_images"] += 1
+                if kf.depth_img is not None:
+                    stats["num_keyframe_depth_images"] += 1
+                if hasattr(kf, "heavy_memory_bytes"):
+                    stats["estimated_keyframe_heavy_bytes"] += kf.heavy_memory_bytes()
+
+            stats["estimated_total_heavy_bytes"] = stats["estimated_frame_heavy_bytes"] + stats["estimated_keyframe_heavy_bytes"]
+
+            if mode == "cheap":
+                return stats
+
+            if len(self.frames) > 0:
+                min_recent_id = stats["recent_frame_ids_min"]
+            else:
+                min_recent_id = self.max_frame_id
+
+            stats["num_frame_views_total"] = 0
+            stats["old_frame_views_total"] = 0
+            stats["oldest_frame_view_id"] = -1
+
+            for p in self.points:
+                if hasattr(p, "is_bad") and p.is_bad():
+                    stats["num_bad_points"] += 1
+
+                if hasattr(p, "num_observations"):
+                    stats["num_keyframe_observations_total"] += p.num_observations()
+
+                if hasattr(p, "get_frame_views"):
+                    views = p.get_frame_views()
+                    stats["num_frame_views_total"] += len(views)
+                    for f_id in views.keys():
+                        if f_id < min_recent_id:
+                            stats["old_frame_views_total"] += 1
+                        if stats["oldest_frame_view_id"] == -1 or f_id < stats["oldest_frame_view_id"]:
+                            stats["oldest_frame_view_id"] = f_id
+
+            self._update_frame_view_stats_cache(stats)
+            return stats
 
     def __repr__(self) -> str:
         return (

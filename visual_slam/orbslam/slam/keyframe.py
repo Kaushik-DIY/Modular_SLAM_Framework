@@ -36,6 +36,8 @@ class KeyFrameGraph:
         # Covisibility graph
         self.connected_keyframes_weights = Counter()
         self.ordered_keyframes_weights = OrderedDict()
+        self.last_tracking_frame_id = -1
+        self.tracking_vote_count = 0
 
     # ------------------------------------------------------------------
     # Spanning tree
@@ -476,3 +478,21 @@ class KeyFrame(Frame, KeyFrameGraph):
                 replaced += 1
 
         return replaced
+
+    def release_depth_image(self) -> None:
+        self.depth_img = None
+
+    def release_rgb_image(self) -> None:
+        self.img = None
+        self.img_right = None
+
+    def release_heavy_data(self, release_rgb=False, release_depth=True, release_kd=False) -> None:
+        if release_rgb:
+            self.release_rgb_image()
+        if release_depth:
+            self.release_depth_image()
+        if release_kd:
+            self.kd = None
+
+    def heavy_memory_bytes(self) -> int:
+        return super().heavy_memory_bytes()

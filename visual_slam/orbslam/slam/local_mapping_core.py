@@ -175,8 +175,8 @@ class LocalMappingCore:
             kf_num_redundant_observations = 0
 
             idxs_and_points = [
-                (i, p)
-                for i, p in enumerate(kf.get_points())
+                (idx, p)
+                for p, idx in kf.get_matched_good_points_and_idxs()
                 if p is not None and not p.is_bad()
             ]
 

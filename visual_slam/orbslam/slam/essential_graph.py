@@ -1,6 +1,8 @@
 """
 Essential-graph correction utilities for loop closing.
-This module builds and optimizes the pose graph used to distribute loop corrections.
+This module builds and optimizes the pose graph used to distribute RGB-D
+scale-fixed SE3 loop corrections across the map.
+monocular Sim3 parity is not claimed by this implementation.
 """
 
 from __future__ import annotations

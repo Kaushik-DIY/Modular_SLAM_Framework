@@ -1,0 +1,1 @@
+../../pyslam_reference/cpp/solvers/sim3solver_module.cpp

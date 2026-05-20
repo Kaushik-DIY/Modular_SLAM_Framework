@@ -12,6 +12,7 @@ from tests.visual_slam.orbslam.test_checkpoint_2_21_loop_closing import (
     make_descriptors,
     make_slam_namespace,
     make_Tcw,
+    seed_consistency,
     setup_tracker,
 )
 from visual_slam.orbslam.slam import KeyFrameDatabase, Map, load_default_vocabulary
@@ -215,6 +216,7 @@ def test_tum_smoke_no_regression_after_fusion():
     slam_map, cam, loop_kf, current_kf = build_loop_scene(n=80)
     database.add(loop_kf)
     closing = LoopClosing(make_slam_namespace(slam_map, cam, database), database, consistency_threshold=0)
+    seed_consistency(closing, loop_kf)
 
     assert closing.process_keyframe(current_kf)
     fusion = closing.last_diagnostics.fusion_diagnostics

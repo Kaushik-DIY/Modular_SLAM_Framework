@@ -378,6 +378,8 @@ def _build_sparse_growth_panel(
     current_keyframes: int,
     panel_width: int,
     panel_height: int,
+    loop_flash: bool = False,
+    extra_stats: str | None = None,
 ) -> np.ndarray:
     panel = np.full((panel_height, panel_width, 3), (14, 14, 16), dtype=np.uint8)
     inner_margin = 20
@@ -417,11 +419,16 @@ def _build_sparse_growth_panel(
     if current_frame_idx < len(traj_px):
         cv2.circle(map_canvas, tuple(int(v) for v in traj_px[current_frame_idx]), 5, (60, 60, 255), -1, cv2.LINE_AA)
     cv2.circle(map_canvas, tuple(int(v) for v in traj_px[0]), 5, (70, 210, 100), -1, cv2.LINE_AA)
+    if loop_flash:
+        cv2.rectangle(map_canvas, (4, 4), (map_size - 5, map_size - 5), (40, 220, 220), 3, cv2.LINE_AA)
 
     panel[y0:y0 + map_size, x0:x0 + map_size] = map_canvas
     _put_line(panel, "Estimated Sparse Map Growth", 18, 24, (235, 235, 235), 0.72, 2)
     _put_line(panel, "progressively revealed exported sparse point cloud", 18, 42, (180, 200, 210), 0.5, 1)
-    _put_line(panel, f"visible sparse pts ~ {min(len(sparse_points_px), int(round(max(current_map_points, 0) / max(final_map_points_stat, 1) * len(sparse_points_px)))):,}", 18, panel_height - 18, (190, 190, 200), 0.55, 1)
+    sparse_pts_y = panel_height - (42 if extra_stats else 18)
+    _put_line(panel, f"visible sparse pts ~ {min(len(sparse_points_px), int(round(max(current_map_points, 0) / max(final_map_points_stat, 1) * len(sparse_points_px)))):,}", 18, sparse_pts_y, (190, 190, 200), 0.55, 1)
+    if extra_stats:
+        _put_line(panel, extra_stats, 18, panel_height - 18, (255, 205, 120), 0.68, 2)
     return panel
 
 
@@ -458,21 +465,27 @@ def render_video(
     if len(trajectory) != len(frame_log):
         raise RuntimeError(f"Trajectory length ({len(trajectory)}) does not match frame log length ({len(frame_log)})")
 
-    keyframe_projections = build_keyframe_projections(
-        dataset_dir,
-        associations,
-        camera,
-        keyframes,
-        depth_stride=depth_stride,
-        max_depth_m=max_depth_m,
-        min_depth_m=min_depth_m,
-    )
+    if layout != "side_by_side_sparse":
+        keyframe_projections = build_keyframe_projections(
+            dataset_dir,
+            associations,
+            camera,
+            keyframes,
+            depth_stride=depth_stride,
+            max_depth_m=max_depth_m,
+            min_depth_m=min_depth_m,
+        )
+    else:
+        keyframe_projections = []
 
     trajectory_xyz = trajectory[:, 1:4].astype(np.float32)
     sparse_map_points = filter_map_points_to_scene(sparse_map_points, trajectory_xyz, padding_m=3.0)
     trajectory_xz = trajectory[:, [1, 3]].astype(np.float32)
     sparse_map_xz = sparse_map_points[:, [0, 2]].astype(np.float32) if len(sparse_map_points) > 0 else np.empty((0, 2), dtype=np.float32)
-    bounds_lo, bounds_hi = _robust_bounds([kf.points_xz for kf in keyframe_projections] + ([sparse_map_xz] if len(sparse_map_xz) > 0 else []), trajectory_xz)
+    if keyframe_projections:
+        bounds_lo, bounds_hi = _robust_bounds([kf.points_xz for kf in keyframe_projections] + ([sparse_map_xz] if len(sparse_map_xz) > 0 else []), trajectory_xz)
+    else:
+        bounds_lo, bounds_hi = _robust_bounds([sparse_map_xz] if len(sparse_map_xz) > 0 else [], trajectory_xz)
 
     if layout == "tri_view":
         right_w = int(round(output_width * 0.52))
@@ -486,10 +499,16 @@ def render_video(
 
     traj_px = _world_to_px(trajectory_xz, bounds_lo, bounds_hi, map_size, map_size, map_margin)
     sparse_map_px = _world_to_px(sparse_map_xz, bounds_lo, bounds_hi, map_size, map_size, map_margin) if len(sparse_map_xz) > 0 else np.empty((0, 2), dtype=np.int32)
-    for kf in keyframe_projections:
-        kf.points_px = _world_to_px(kf.points_xz, bounds_lo, bounds_hi, map_size, map_size, map_margin)
-        kf.pos_px = _world_to_px(kf.position_xz[None, :], bounds_lo, bounds_hi, map_size, map_size, map_margin)[0]
-    keyframe_positions_xz = np.asarray([kf.position_xz for kf in keyframe_projections], dtype=np.float32) if keyframe_projections else np.empty((0, 2), dtype=np.float32)
+    if keyframe_projections:
+        for kf in keyframe_projections:
+            kf.points_px = _world_to_px(kf.points_xz, bounds_lo, bounds_hi, map_size, map_size, map_margin)
+            kf.pos_px = _world_to_px(kf.position_xz[None, :], bounds_lo, bounds_hi, map_size, map_size, map_margin)[0]
+        keyframe_positions_xz = np.asarray([kf.position_xz for kf in keyframe_projections], dtype=np.float32)
+    else:
+        keyframe_positions_xz = np.asarray(
+            [[float(kf["position"][0]), float(kf["position"][2])] for kf in keyframes if "position" in kf],
+            dtype=np.float32,
+        ) if keyframes else np.empty((0, 2), dtype=np.float32)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fps = fps_override if fps_override is not None else max(camera.fps / max(frame_step, 1), 1.0)
@@ -515,16 +534,17 @@ def render_video(
     end_frame = len(frame_log) if max_frames <= 0 else min(len(frame_log), max_frames)
 
     for frame_idx in range(0, end_frame, frame_step):
-        while next_kf < len(keyframe_projections) and keyframe_projections[next_kf].img_id <= frame_idx:
-            kf = keyframe_projections[next_kf]
-            _draw_points(map_layer, kf.points_px, kf.colors_bgr)
-            cv2.circle(map_layer, tuple(int(v) for v in kf.pos_px), 3, (0, 170, 255), -1, cv2.LINE_AA)
-            next_kf += 1
+        if layout != "side_by_side_sparse":
+            while next_kf < len(keyframe_projections) and keyframe_projections[next_kf].img_id <= frame_idx:
+                kf = keyframe_projections[next_kf]
+                _draw_points(map_layer, kf.points_px, kf.colors_bgr)
+                cv2.circle(map_layer, tuple(int(v) for v in kf.pos_px), 3, (0, 170, 255), -1, cv2.LINE_AA)
+                next_kf += 1
 
-        for step_idx in range(prev_frame_idx + 1, frame_idx + 1):
-            cur_px = traj_px[step_idx]
-            cv2.line(path_layer, tuple(int(v) for v in prev_pose_px), tuple(int(v) for v in cur_px), (240, 220, 70), 2, cv2.LINE_AA)
-            prev_pose_px = cur_px
+            for step_idx in range(prev_frame_idx + 1, frame_idx + 1):
+                cur_px = traj_px[step_idx]
+                cv2.line(path_layer, tuple(int(v) for v in prev_pose_px), tuple(int(v) for v in cur_px), (240, 220, 70), 2, cv2.LINE_AA)
+                prev_pose_px = cur_px
         prev_frame_idx = frame_idx
 
         row = frame_log[frame_idx]
@@ -567,23 +587,40 @@ def render_video(
             _put_line(left_panel, f"timestamp {assoc.timestamp:.6f}", 18, output_height - 64, (205, 205, 205), 0.6, 1)
         _put_line(left_panel, f"state {row['state']}   tracked {row['last_tracked']}", 18, output_height - 34, _state_color(row), 0.65, 2)
 
-        map_img = cv2.addWeighted(map_layer, 1.0, grid_layer, 0.35, 0.0)
-        map_img = cv2.addWeighted(map_img, 1.0, path_layer, 1.0, 0.0)
-        current_px = traj_px[frame_idx]
-        cv2.circle(map_img, tuple(int(v) for v in current_px), 7, (60, 60, 255), -1, cv2.LINE_AA)
-        cv2.circle(map_img, tuple(int(v) for v in traj_px[0]), 6, (70, 210, 100), -1, cv2.LINE_AA)
-        if frame_idx >= end_frame - frame_step:
-            cv2.circle(map_img, tuple(int(v) for v in traj_px[-1]), 7, (255, 70, 70), 2, cv2.LINE_AA)
-        if last_loop_flash_until >= frame_idx:
-            cv2.rectangle(map_img, (6, 6), (map_size - 7, map_size - 7), (40, 220, 220), 3, cv2.LINE_AA)
+        if layout == "side_by_side_sparse":
+            right_panel = _build_sparse_growth_panel(
+                sparse_map_xz,
+                trajectory_xz,
+                keyframe_positions_xz,
+                bounds_lo,
+                bounds_hi,
+                frame_idx,
+                int(row["points"]),
+                final_map_points_stat,
+                int(row["keyframes"]),
+                right_w,
+                output_height,
+                loop_flash=(last_loop_flash_until >= frame_idx),
+                extra_stats=f"keyframes {row['keyframes']}   map pts {row['points']}",
+            )
+        else:
+            map_img = cv2.addWeighted(map_layer, 1.0, grid_layer, 0.35, 0.0)
+            map_img = cv2.addWeighted(map_img, 1.0, path_layer, 1.0, 0.0)
+            current_px = traj_px[frame_idx]
+            cv2.circle(map_img, tuple(int(v) for v in current_px), 7, (60, 60, 255), -1, cv2.LINE_AA)
+            cv2.circle(map_img, tuple(int(v) for v in traj_px[0]), 6, (70, 210, 100), -1, cv2.LINE_AA)
+            if frame_idx >= end_frame - frame_step:
+                cv2.circle(map_img, tuple(int(v) for v in traj_px[-1]), 7, (255, 70, 70), 2, cv2.LINE_AA)
+            if last_loop_flash_until >= frame_idx:
+                cv2.rectangle(map_img, (6, 6), (map_size - 7, map_size - 7), (40, 220, 220), 3, cv2.LINE_AA)
 
-        map_y0 = 56
-        map_x0 = (right_w - map_size) // 2
-        right_panel[map_y0:map_y0 + map_size, map_x0:map_x0 + map_size] = map_img
-        _put_line(right_panel, "Incremental Top-Down Map Build", 20, 30, (235, 235, 235), 0.9, 2)
-        _put_line(right_panel, "SLAM keyframe poses + RGB-D accumulation", 20, 52, (180, 210, 210), 0.65, 1)
-        _put_line(right_panel, f"keyframes {row['keyframes']}   map points {row['points']}", 20, output_height - 66, (255, 205, 120), 0.7, 2)
-        _put_line(right_panel, f"tracked {row['last_tracked']}", 20, output_height - 38, (120, 220, 255), 0.7, 2)
+            map_y0 = 56
+            map_x0 = (right_w - map_size) // 2
+            right_panel[map_y0:map_y0 + map_size, map_x0:map_x0 + map_size] = map_img
+            _put_line(right_panel, "Incremental Top-Down Map Build", 20, 30, (235, 235, 235), 0.9, 2)
+            _put_line(right_panel, "SLAM keyframe poses + RGB-D accumulation", 20, 52, (180, 210, 210), 0.65, 1)
+            _put_line(right_panel, f"keyframes {row['keyframes']}   map points {row['points']}", 20, output_height - 66, (255, 205, 120), 0.7, 2)
+            _put_line(right_panel, f"tracked {row['last_tracked']}", 20, output_height - 38, (120, 220, 255), 0.7, 2)
 
         progress = (frame_idx + 1) / end_frame
         bar_w = output_width - 40
@@ -612,7 +649,7 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=1920, help="Output video width.")
     parser.add_argument("--height", type=int, default=1080, help="Output video height.")
     parser.add_argument("--fps", type=float, default=0.0, help="Override output fps. Default uses dataset_fps/frame_step.")
-    parser.add_argument("--layout", choices=("side_by_side", "tri_view"), default="side_by_side", help="Video layout preset.")
+    parser.add_argument("--layout", choices=("side_by_side", "tri_view", "side_by_side_sparse"), default="side_by_side", help="Video layout preset.")
     return parser
 
 

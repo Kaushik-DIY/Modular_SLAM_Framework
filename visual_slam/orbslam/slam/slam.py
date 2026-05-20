@@ -72,6 +72,7 @@ class Slam:
         self.slam_mode = slam_mode
         self.headless = headless
         self.viewer3d = viewer3d
+        self.runtime_profiler = None
 
         self.feature_tracker = None
         self.init_feature_tracker(self.feature_tracker_config)

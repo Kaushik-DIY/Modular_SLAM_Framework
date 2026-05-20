@@ -12,6 +12,7 @@ from tests.visual_slam.orbslam.test_checkpoint_2_21_loop_closing import (
     build_loop_scene,
     make_slam_namespace,
     make_Tcw,
+    seed_consistency,
 )
 
 
@@ -160,6 +161,7 @@ def test_loop_closing_uses_essential_graph_optimizer():
     slam_map, cam, loop_kf, current_kf = build_loop_scene(n=80)
     database.add(loop_kf)
     closing = LoopClosing(make_slam_namespace(slam_map, cam, database), database, consistency_threshold=0)
+    seed_consistency(closing, loop_kf)
 
     assert closing.process_keyframe(current_kf)
     result = closing.last_diagnostics.optimization_result

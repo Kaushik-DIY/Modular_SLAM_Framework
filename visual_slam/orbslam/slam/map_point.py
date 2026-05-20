@@ -123,6 +123,7 @@ class MapPointBase:
         self.num_times_visible = 1
         self.num_times_found = 1
         self.last_frame_id_seen = -1
+        self.last_track_reference_frame_id = -1
 
         self.replacement = None
 
@@ -625,6 +626,24 @@ class MapPoint(_make_map_point_base()):
         if n_scale >= feature_manager.num_levels:
             return feature_manager.num_levels - 1
         return n_scale
+
+    def remove_frame_views_older_than(self, min_frame_id: int) -> int:
+        removed = 0
+        frames_to_remove = []
+        for frame, idx in self.frame_views():
+            if getattr(frame, "id", -1) < min_frame_id:
+                frames_to_remove.append((frame, idx))
+        
+        for frame, idx in frames_to_remove:
+            self.remove_frame_view(frame, idx)
+            removed += 1
+        return removed
+
+    def num_frame_views(self) -> int:
+        return len(self.frame_views())
+
+    def get_frame_views(self) -> dict:
+        return {getattr(f, "id", -1): idx for f, idx in self.frame_views()}
 
     if _USE_CPP_MP:
         def get_normal(self) -> np.ndarray:

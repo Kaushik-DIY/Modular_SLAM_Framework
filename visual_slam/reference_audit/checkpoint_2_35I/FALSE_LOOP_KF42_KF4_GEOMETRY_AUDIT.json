@@ -1,0 +1,110 @@
+{
+  "run_folder": "/home/kaushik/slam_ws/visual_slam_outputs/checkpoint_2_35E_H/fr1_room_full_loop_no_gba_best_mode",
+  "pair_identity": {
+    "current_kf_id": 42,
+    "candidate_kf_id": 4,
+    "current_timestamp": 1305031949.768985,
+    "candidate_timestamp": 1305031913.665421,
+    "time_gap_sec": 36.10356402397156,
+    "gt_translation_distance_m": 1.5235715966110683,
+    "gt_rotation_angle_deg": 42.63793767760183,
+    "gt_loop_like": false,
+    "gt_near_loop": false,
+    "accepted": true
+  },
+  "candidate_retrieval_path": {
+    "candidate_source_mode": "classic_inverted",
+    "raw_dbow_present": true,
+    "raw_dbow_rank": 3,
+    "raw_dbow_score": 0.01816754765507136,
+    "inverted_shared_word_present": true,
+    "shared_words": 42,
+    "max_common_words": 44,
+    "common_word_ratio": 0.9545454545454546,
+    "bow_score": 0.01816754765507136,
+    "min_score": 0.009589279401483528,
+    "score_over_min_score": 1.894568600458207,
+    "accumulated_score": 0.03445191178910284,
+    "best_accumulated_score": 0.03445191178910284,
+    "accumulation_ratio": 1.0,
+    "retained_rank": 1,
+    "consistency_score": 3
+  },
+  "bow_guided_matching": {
+    "raw_bow_matches": 76,
+    "ratio_test_rejects": 0,
+    "orientation_rejects": 49,
+    "post_orientation_invalid_or_duplicate_rejects": 0,
+    "valid_map_point_matches": 27,
+    "num_3d_correspondences_entering_se3": 27
+  },
+  "se3_geometry_verification": {
+    "seed_correspondences": 27,
+    "seed_inliers": 8,
+    "seed_inlier_ratio": 0.2962962962962963,
+    "seed_error_stats_available": false,
+    "refined_correspondences": 108,
+    "refined_inliers": 106,
+    "refined_inlier_ratio": 0.9814814814814815,
+    "refined_error_stats_available": false,
+    "initial_se3_translation_norm": 2.6955654363695523,
+    "initial_se3_rotation_deg": 67.86087255265781,
+    "debug_estimated_pose_distance": 1.6757055817661657,
+    "debug_estimated_pose_rotation_deg": 37.43783096299437,
+    "geometry_reprojection_rmse": 0.08604695746068795,
+    "pose_distance_gate_threshold_runtime": 0.0,
+    "pose_rotation_gate_threshold_runtime": 0.0,
+    "passed_pose_distance_gate_runtime": true,
+    "old_pose_gate_distance_threshold": 0.75,
+    "old_pose_gate_rotation_threshold_deg": 45.0,
+    "old_pose_gate_would_reject": true
+  },
+  "guided_projection_expansion": {
+    "guided_projection_matches": 100,
+    "candidate_group_size": 8,
+    "candidate_group_keyframe_ids": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      8
+    ],
+    "candidate_group_map_points": 1583,
+    "visible_projected_group_points": 225,
+    "final_matched_map_points": 107,
+    "final_support_threshold": 60,
+    "final_support_ratio_visible": 0.47555555555555556,
+    "final_support_ratio_vs_gate": 1.7833333333333334,
+    "contributing_covisible_keyframes_available": false,
+    "support_from_multiple_keyframes_inferred": true
+  },
+  "spatial_distribution": {
+    "available": false,
+    "missing_fields": [
+      "image_grid_coverage",
+      "x_spread",
+      "y_spread",
+      "occupied_grid_cells",
+      "regional_concentration_measure"
+    ]
+  },
+  "why_it_passed": {
+    "retrieval": "Passed raw DBOW visibility, shared-word presence, common-word filter, minScore filter, and accumulation retention.",
+    "consistency": "Consistency advanced from 2 to 3 and met the threshold of 3.",
+    "seed_se3": "Seed geometry kept 8 / 27 correspondences, meeting the minimum seed-inlier gate.",
+    "refined_se3": "Guided projection expanded to 108 correspondences with 106 refined inliers.",
+    "projection_expansion": "Candidate covisibility group size 8 produced 225 visible projected group points and 100 guided projection matches.",
+    "final_support": "Final support reached 107 matched map points against a gate of 60."
+  },
+  "missing_diagnostics": [
+    "Seed-stage residual distribution (mean / median / max).",
+    "Refined-stage residual distribution (mean / median / max).",
+    "Per-match pixel coordinates or grid occupancy for spatial coverage.",
+    "Per-keyframe contribution counts inside the candidate covisibility group.",
+    "Bidirectional projection agreement metrics.",
+    "Support ratio metrics emitted directly by runtime instead of only count-based acceptance."
+  ]
+}
