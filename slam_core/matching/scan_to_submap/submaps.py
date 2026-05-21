@@ -9,7 +9,13 @@ from slam_core.common.se2 import inverse_pose, transform_points_pose
 
 
 class ProbabilityGrid:
-    def __init__(self, size_m: float, res: float, l0=0.0, l_occ=0.85, l_free=-0.1, l_min=-5.0, l_max=5.0):
+    def __init__(self, size_m: float, res: float = None, l0=0.0, l_occ=0.85, l_free=-0.1, l_min=-5.0, l_max=5.0, resolution: float = None):
+        # `resolution` is a backward-compatible alias for `res` (eval scripts
+        # historically constructed ProbabilityGrid with resolution=...).
+        if res is None:
+            res = resolution
+        if res is None:
+            raise TypeError("ProbabilityGrid requires `res` (or `resolution`)")
         self.size_m = float(size_m)
         self.res = float(res)
         self.w = int(np.round(size_m / res))

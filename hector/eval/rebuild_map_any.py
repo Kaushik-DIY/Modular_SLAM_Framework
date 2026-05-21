@@ -24,7 +24,7 @@ import hector.config as cfg
 
 from slam_core.common.types import Pose2
 from slam_core.matching.scan_to_map import GridMap, _transform_points
-from slam_core.matching.scan_to_submap_old import ProbabilityGrid, SubmapBuilder2D
+from slam_core.matching.scan_to_submap.submaps import ProbabilityGrid, SubmapBuilder2D
 
 from hector.eval._generic_eval_common import (
     configure_dataset,

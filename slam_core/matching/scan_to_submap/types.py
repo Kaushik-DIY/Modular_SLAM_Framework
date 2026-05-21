@@ -61,6 +61,20 @@ class ScanToSubmapBackendConfig:
     refine_step_clip_th: float = float(np.deg2rad(5.0))
     refine_verbose: bool = False
 
+    # Local refinement backend for the two-stage scan-to-submap matcher.
+    # "native"  -> native GaussNewtonLM on the occupancy grid (no pyceres dep).
+    # "pyceres" -> PyCeres local scan matcher (legacy, optional).
+    # g2o is reserved for the pose graph; the 3-DOF local match stays native.
+    local_refine_backend: str = "native"
+
+    # If True, the two-stage backend returns FALLBACK (success=False, predicted
+    # pose) when the correlative coarse score is below `min_score`, instead of
+    # refining from the prediction and accepting. This reproduces the legacy
+    # Hector scan-to-submap behaviour (reject low-confidence matches, hold the
+    # last good pose) and avoids accepting ambiguous matches during fast turns.
+    # Default False keeps the Cartographer always-refine behaviour.
+    reject_below_min_score: bool = False
+
     # Search windows.
     coarse: Optional[SubmapSearchWindow] = None
     fine: Optional[SubmapSearchWindow] = None

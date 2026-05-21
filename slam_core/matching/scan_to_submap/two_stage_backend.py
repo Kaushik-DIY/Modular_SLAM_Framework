@@ -4,10 +4,8 @@ import numpy as np
 
 from slam_core.common.se2 import inverse_pose, pose_compose, wrap_angle
 from slam_core.common.types import Pose2
+from slam_core.optimisers.gn_lm import GaussNewtonLM, GNLMConfig
 from slam_core.matching.scan_to_submap.backend_base import IScanToSubmapBackend
-from slam_core.matching.scan_to_submap.local_pyceres_matcher import (
-    PyCeresLocalScanMatcher2D,
-)
 from slam_core.matching.scan_to_submap.types import (
     ScanToSubmapBackendConfig,
     SubmapMatchDebug,
@@ -15,7 +13,11 @@ from slam_core.matching.scan_to_submap.types import (
     SubmapMatchResponse,
     SubmapSearchWindow,
 )
-from slam_core.matching.scan_to_submap_old import correlative_match_two_stage
+from slam_core.matching.scan_to_submap.refine import (
+    CartoRefinementProblem,
+    refine_pose_submap,
+)
+from slam_core.matching.scan_to_submap.correlative import correlative_match_two_stage
 
 
 class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
@@ -61,18 +63,117 @@ class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
         )
 
         # Local continuous matcher.
-        self.local_matcher = PyCeresLocalScanMatcher2D(
-            translation_weight=float(self.config.refine_w_trans),
-            rotation_weight=float(self.config.refine_w_rot),
-            max_num_iterations=int(self.config.refine_iters),
-            num_threads=1,
-            minimizer_progress_to_stdout=bool(self.config.refine_verbose),
-            function_tolerance=float(self.config.refine_eps_stop),
-            gradient_tolerance=1e-10,
-            parameter_tolerance=1e-8,
-            linear_solver_type="DENSE_QR",
-            invalid_point_residual=1.0,
+        # Default: native GaussNewtonLM on the occupancy grid (no pyceres dep).
+        # g2o is reserved for the pose graph; the 3-DOF local match stays native.
+        self.local_refine_backend = str(
+            getattr(self.config, "local_refine_backend", "native")
         )
+
+        self._native_solver = refine_solver or GaussNewtonLM(
+            GNLMConfig(
+                iters=int(self.config.refine_iters),
+                damping=float(self.config.refine_damping),
+                eps_stop=float(self.config.refine_eps_stop),
+                step_clip=np.array(
+                    [
+                        float(self.config.refine_step_clip_xy),
+                        float(self.config.refine_step_clip_xy),
+                        float(self.config.refine_step_clip_th),
+                    ],
+                    dtype=float,
+                ),
+                verbose=bool(self.config.refine_verbose),
+            )
+        )
+
+        self.local_matcher = None
+        if self.local_refine_backend == "pyceres":
+            # Optional legacy path. Imported lazily so the package has no hard
+            # pyceres dependency for the default native flow.
+            from slam_core.matching.scan_to_submap.local_pyceres_matcher import (
+                PyCeresLocalScanMatcher2D,
+            )
+
+            self.local_matcher = PyCeresLocalScanMatcher2D(
+                translation_weight=float(self.config.refine_w_trans),
+                rotation_weight=float(self.config.refine_w_rot),
+                max_num_iterations=int(self.config.refine_iters),
+                num_threads=1,
+                minimizer_progress_to_stdout=bool(self.config.refine_verbose),
+                function_tolerance=float(self.config.refine_eps_stop),
+                gradient_tolerance=1e-10,
+                parameter_tolerance=1e-8,
+                linear_solver_type="DENSE_QR",
+                invalid_point_residual=1.0,
+            )
+
+    @staticmethod
+    def _score_pose_on_grid(grid, points_local: np.ndarray, pose_sub: Pose2):
+        """Mean occupancy probability at the scan endpoints under pose_sub.
+
+        Returns (mean_prob, valid_point_count). Mirrors the diagnostic score
+        the pyceres local matcher reported, so downstream behaviour is unchanged.
+        """
+        pts = np.asarray(points_local, dtype=float)
+        if pts.shape[0] == 0:
+            return -1.0, 0
+
+        prob_grid = grid.probability()
+        c = np.cos(float(pose_sub.theta))
+        s = np.sin(float(pose_sub.theta))
+
+        qx = c * pts[:, 0] - s * pts[:, 1] + float(pose_sub.x)
+        qy = s * pts[:, 0] + c * pts[:, 1] + float(pose_sub.y)
+
+        gx = np.floor((qx - float(grid.origin_world[0])) / float(grid.res)).astype(int)
+        gy = np.floor((qy - float(grid.origin_world[1])) / float(grid.res)).astype(int)
+
+        mask = (gx >= 0) & (gx < int(grid.w)) & (gy >= 0) & (gy < int(grid.h))
+        n = int(mask.sum())
+        if n == 0:
+            return -1.0, 0
+        return float(prob_grid[gy[mask], gx[mask]].mean()), n
+
+    def _refine_native(
+        self,
+        grid,
+        points_local: np.ndarray,
+        pred_pose_sub: Pose2,
+        initial_pose_sub: Pose2,
+        min_valid_points: int,
+    ):
+        """Native GaussNewtonLM local refinement on the occupancy grid.
+
+        Returns (success, pose_sub, valid_points, refined_score, reason).
+        """
+        pts = np.asarray(points_local, dtype=float)
+        if pts.shape[0] == 0:
+            return False, pred_pose_sub, 0, -1.0, "empty_scan"
+
+        problem = CartoRefinementProblem(
+            grid=grid,
+            pts_local=pts,
+            pred_pose_sub=np.array(
+                [pred_pose_sub.x, pred_pose_sub.y, pred_pose_sub.theta], dtype=float
+            ),
+            min_points=int(min_valid_points),
+            w_trans=float(self.config.refine_w_trans),
+            w_rot=float(self.config.refine_w_rot),
+        )
+
+        pose_sub = refine_pose_submap(self._native_solver, problem, initial_pose_sub)
+
+        finite = np.all(
+            np.isfinite([pose_sub.x, pose_sub.y, pose_sub.theta])
+        )
+        refined_score, valid_points = self._score_pose_on_grid(grid, pts, pose_sub)
+
+        if not finite:
+            return False, pred_pose_sub, int(valid_points), float(refined_score), "nonfinite_solution"
+        if int(valid_points) < int(min_valid_points):
+            return False, pred_pose_sub, int(valid_points), float(refined_score), "insufficient_valid_support"
+
+        return True, pose_sub, int(valid_points), float(refined_score), "ok"
 
     def match(self, request: SubmapMatchRequest) -> SubmapMatchResponse:
         submap = request.submap
@@ -149,6 +250,32 @@ class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
 
         coarse_trusted = bool(coarse_available and (coarse_score_f >= float(self.config.min_score)))
 
+        # Legacy Hector behaviour: reject low-confidence matches (FALLBACK to the
+        # predicted pose) instead of refining from the prediction. Avoids accepting
+        # ambiguous matches during fast turns. Off by default (Cartographer refines).
+        if (not coarse_trusted) and bool(getattr(self.config, "reject_below_min_score", False)) \
+                and not bool(request.match_full_submap):
+            debug = SubmapMatchDebug(
+                backend_type="two_stage_bruteforce",
+                coarse_score=float(coarse_score_f),
+                refined=False,
+                num_points_match=int(points_match.shape[0]),
+                num_points_refine=0,
+                extra={
+                    "match_full_submap": bool(request.match_full_submap),
+                    "coarse_trusted": bool(coarse_available),
+                    "coarse_valid": bool(coarse_trusted),
+                    "raw_coarse_score": float(raw_coarse_score),
+                    "refine_reason": "coarse_below_min_score",
+                },
+            )
+            return SubmapMatchResponse(
+                success=False,
+                score=float(coarse_score_f),
+                pose_world=request.predicted_pose_world,
+                debug=debug,
+            )
+
         if coarse_trusted:
             initial_refine_pose_sub = coarse_pose_sub
             used_pred_initializer = False
@@ -157,15 +284,50 @@ class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
             used_pred_initializer = True
 
         # Continuous local refinement: this is the actual local estimate.
-        pyceres_result = self.local_matcher.match(
-            grid=submap.grid,
-            points_local=points_local,
-            pred_pose_sub=pred_sub,
-            initial_pose_sub=initial_refine_pose_sub,
-            min_valid_points=int(self.config.refine_min_points),
-        )
+        if self.local_refine_backend == "native":
+            # Downsample for the native GN refine (matches legacy Hector behaviour).
+            refine_pts = points_local
+            max_refine = int(self.config.max_refine_points)
+            if refine_pts.shape[0] > max_refine:
+                stride = max(1, refine_pts.shape[0] // max_refine)
+                refine_pts = refine_pts[::stride]
 
-        final_pose_sub = pyceres_result.pose_sub
+            (
+                refine_success,
+                final_pose_sub,
+                refine_valid,
+                refined_score,
+                refine_reason,
+            ) = self._refine_native(
+                grid=submap.grid,
+                points_local=refine_pts,
+                pred_pose_sub=pred_sub,
+                initial_pose_sub=initial_refine_pose_sub,
+                min_valid_points=int(self.config.refine_min_points),
+            )
+            summary_brief = None
+        else:
+            pyceres_result = self.local_matcher.match(
+                grid=submap.grid,
+                points_local=points_local,
+                pred_pose_sub=pred_sub,
+                initial_pose_sub=initial_refine_pose_sub,
+                min_valid_points=int(self.config.refine_min_points),
+            )
+            refine_success = bool(pyceres_result.success)
+            final_pose_sub = pyceres_result.pose_sub
+            refine_valid = int(pyceres_result.valid_points)
+            refined_score = float(pyceres_result.refined_score)
+            refine_reason = str(pyceres_result.reason)
+            summary = self.local_matcher.get_last_summary()
+            if summary is not None:
+                try:
+                    summary_brief = summary.BriefReport()
+                except Exception:
+                    summary_brief = str(summary)
+            else:
+                summary_brief = None
+
         final_pose_world = pose_compose(submap_pose_world, final_pose_sub)
 
         refine_delta = np.array(
@@ -176,15 +338,6 @@ class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
             ],
             dtype=float,
         )
-
-        summary = self.local_matcher.get_last_summary()
-        if summary is not None:
-            try:
-                summary_brief = summary.BriefReport()
-            except Exception:
-                summary_brief = str(summary)
-        else:
-            summary_brief = None
 
         debug = SubmapMatchDebug(
             backend_type="two_stage_bruteforce",
@@ -201,15 +354,16 @@ class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
                 "coarse_pose_sub": coarse_pose_sub,
                 "initial_refine_pose_sub": initial_refine_pose_sub,
                 "final_pose_sub": final_pose_sub,
-                "refined_score": float(pyceres_result.refined_score),
+                "refined_score": float(refined_score),
                 "refine_delta": refine_delta,
-                "refine_inliers": int(pyceres_result.valid_points),
-                "pyceres_reason": str(pyceres_result.reason),
-                "pyceres_summary": summary_brief,
+                "refine_inliers": int(refine_valid),
+                "refine_backend": self.local_refine_backend,
+                "refine_reason": str(refine_reason),
+                "refine_summary": summary_brief,
             },
         )
 
-        if not pyceres_result.success:
+        if not refine_success:
             return SubmapMatchResponse(
                 success=False,
                 score=-1.0,
