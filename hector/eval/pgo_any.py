@@ -30,15 +30,14 @@ import hector.config as cfg
 from slam_core.common.types import Pose2
 from slam_core.common.se2 import wrap_angle
 from slam_core.matching.scan_to_map import ScanToMapMatcher, _transform_points
-from slam_core.matching.scan_to_submap_old import (
-    CartoRefinementProblem,
-    GaussNewtonLM,
-    GNLMConfig,
+from slam_core.optimisers.gn_lm import GaussNewtonLM, GNLMConfig
+from slam_core.matching.scan_to_submap.submaps import (
     ProbabilityGrid,
     Submap2D,
     SubmapBuilder2D,
-    correlative_match_two_stage,
 )
+from slam_core.matching.scan_to_submap.refine import CartoRefinementProblem
+from slam_core.matching.scan_to_submap.correlative import correlative_match_two_stage
 
 from hector.eval._generic_eval_common import (
     configure_dataset,

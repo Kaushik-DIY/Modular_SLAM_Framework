@@ -1,0 +1,16 @@
+ .gitignore                                         |   4 +
+ visual_slam/orbslam/local_features/__init__.py     |  14 +
+ .../orbslam/local_features/feature_manager.py      |  20 +-
+ .../orbslam/local_features/feature_orbslam2.py     |  49 +--
+ .../orbslam/local_features/feature_tracker.py      |   3 +
+ .../local_features/feature_tracker_configs.py      |   8 +-
+ visual_slam/orbslam/slam/__init__.py               |  23 +-
+ visual_slam/orbslam/slam/frame.py                  |  18 ++
+ visual_slam/orbslam/slam/geometry_matchers.py      | 331 ++++++++++++++++++++-
+ visual_slam/orbslam/slam/keyframe.py               |  73 +++--
+ visual_slam/orbslam/slam/map.py                    |  27 +-
+ visual_slam/orbslam/slam/map_point.py              |   2 +-
+ visual_slam/orbslam/slam/optimizer_g2o.py          | 287 ++++++++++++++----
+ visual_slam/orbslam/slam/slam.py                   |   4 +
+ visual_slam/orbslam/slam/tracking.py               | 122 ++++++--
+ 15 files changed, 845 insertions(+), 140 deletions(-)

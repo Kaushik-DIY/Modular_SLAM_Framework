@@ -1,0 +1,101 @@
+{
+  "accepted_loops": 0,
+  "avg_fps": 1.7569013143549497,
+  "dominant_loop_rejection_reasons": {
+    "estimated pose distance too large for guided SE3 loop seed": 3,
+    "not enough SE3 RANSAC seed inliers": 28,
+    "not enough final guided loop matches": 1,
+    "rejected_by_consistency": 65,
+    "too few loop geometry matches": 6,
+    "too few matched map points after covisibility expansion (37 < 60)": 1,
+    "too few matched map points after covisibility expansion (38 < 60)": 1
+  },
+  "elapsed_sec": 775.2285167480004,
+  "final_keyframes": 46,
+  "final_map_points": 4649,
+  "final_rss_mb": 1621.17578125,
+  "final_state": "OK",
+  "frames_attempted": 1362,
+  "global_ba_started": 0,
+  "global_ba_success": 0,
+  "local_ba_aborted": 0,
+  "local_ba_completed": 45,
+  "local_ba_started": 45,
+  "loop_candidate_events": 105,
+  "peak_rss_mb": 1621.05078125,
+  "rejected_loops": 105,
+  "runtime_top_sections": [
+    {
+      "calls": 1362,
+      "max_sec": 12.07673118499224,
+      "mean_sec": 0.5691444129844965,
+      "section": "frame.total",
+      "total_sec": 775.1746904848842
+    },
+    {
+      "calls": 1362,
+      "max_sec": 3.8596282310027163,
+      "mean_sec": 0.3666872598662631,
+      "section": "slam.track",
+      "total_sec": 499.42804793785035
+    },
+    {
+      "calls": 45,
+      "max_sec": 9.162760238992632,
+      "mean_sec": 5.4452560226646405,
+      "section": "local_mapping.step",
+      "total_sec": 245.03652101990883
+    },
+    {
+      "calls": 1361,
+      "max_sec": 0.2595753370114835,
+      "mean_sec": 0.13293569633866323,
+      "section": "tracking.track_local_map",
+      "total_sec": 180.92548271692067
+    },
+    {
+      "calls": 45,
+      "max_sec": 6.128112361999229,
+      "mean_sec": 3.3790716530671085,
+      "section": "local_mapping.cull_map_points",
+      "total_sec": 152.05822438801988
+    },
+    {
+      "calls": 1361,
+      "max_sec": 0.49331015200004913,
+      "mean_sec": 0.10787818027859936,
+      "section": "tracking.track_previous_frame",
+      "total_sec": 146.82220335917373
+    },
+    {
+      "calls": 45,
+      "max_sec": 3.647094883999671,
+      "mean_sec": 2.433922986377729,
+      "section": "tracking.create_new_keyframe",
+      "total_sec": 109.52653438699781
+    },
+    {
+      "calls": 45,
+      "max_sec": 5.131021298002452,
+      "mean_sec": 1.9164632558667412,
+      "section": "local_mapping.local_BA",
+      "total_sec": 86.24084651400335
+    },
+    {
+      "calls": 1362,
+      "max_sec": 0.02289044900680892,
+      "mean_sec": 0.012933826977077656,
+      "section": "frame.load_rgb",
+      "total_sec": 17.615872342779767
+    },
+    {
+      "calls": 1362,
+      "max_sec": 0.017260473003261723,
+      "mean_sec": 0.005804857815690708,
+      "section": "frame.load_depth",
+      "total_sec": 7.906216344970744
+    }
+  ],
+  "tracking_lost_count": 0,
+  "tracking_ok_count": 1362
+}

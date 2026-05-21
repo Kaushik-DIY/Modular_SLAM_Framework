@@ -1,0 +1,149 @@
+============================================================
+Dataset      : lab_run_2
+Scan variant : raw
+Scan file    : /home/kaushik/slam_ws/datasets/lab_run_2/scans.carmen
+Geometry     : beams=909  angle=[-180.0°, 180.0°]  range=[0.10, 16.00] m  has_odom=False
+IMU file     : /home/kaushik/slam_ws/datasets/lab_run_2/imu.csv
+Total scans  : 1052
+Matcher      : scan_to_submap
+Extrapolator : OFF (raw odom / last pose)
+Odom alpha   : 0.0
+Voxel filter : True
+============================================================
+Online PGO   : ON (g2o pose graph + loop closure)
+MotionFilter thresholds:  time=0.100s  dist=0.100m  angle=4.50deg
+Using PGO backend: G2oBackend2D
+  ┌─── SUBMAP #0 CREATED at scan k=0  (pose=(0.00,0.00,0.00))  active=2  finished=0
+  ┌─── SUBMAP #1 CREATED at scan k=0  (pose=(0.00,0.00,0.00))  active=2  finished=0
+k=    0 FALLBACK  pose=(0.00,0.00,0.0°)  score=-1.000  d=None  inl=None  raw=656  pts=201  di=1
+k=   10 MATCH     pose=(-0.10,-0.07,0.1°)  score=0.936  d=(-0.000,-0.004,0.001)  inl=193  raw=670  pts=201  di=1
+k=   20 MATCH     pose=(-0.12,-0.09,0.1°)  score=0.961  d=(-0.003,-0.004,0.000)  inl=195  raw=664  pts=200  di=1
+k=   30 MATCH     pose=(-0.14,-0.10,0.1°)  score=0.972  d=(-0.001,0.002,0.000)  inl=196  raw=670  pts=203  di=1
+k=   40 MATCH     pose=(-0.15,-0.12,0.0°)  score=0.984  d=(-0.001,-0.000,-0.001)  inl=196  raw=666  pts=202  di=0
+k=   50 MATCH     pose=(-0.16,-0.13,0.1°)  score=0.976  d=(-0.002,0.001,-0.001)  inl=195  raw=658  pts=201  di=1
+k=   60 MATCH     pose=(-0.17,-0.14,-0.0°)  score=0.970  d=(-0.002,-0.004,0.001)  inl=196  raw=671  pts=202  di=1
+k=   70 MATCH     pose=(-0.18,-0.15,0.0°)  score=0.983  d=(0.000,0.000,0.001)  inl=200  raw=660  pts=205  di=1
+k=   80 MATCH     pose=(-0.19,-0.16,0.0°)  score=0.977  d=(0.002,-0.000,0.000)  inl=197  raw=665  pts=203  di=0
+k=   90 MATCH     pose=(-0.20,-0.18,0.1°)  score=0.976  d=(-0.000,-0.001,-0.000)  inl=196  raw=662  pts=201  di=1
+k=  100 MATCH     pose=(-0.21,-0.19,0.0°)  score=0.984  d=(-0.001,-0.004,0.001)  inl=197  raw=663  pts=204  di=1
+k=  110 MATCH     pose=(-0.22,-0.19,0.0°)  score=0.981  d=(0.001,-0.001,-0.001)  inl=196  raw=660  pts=202  di=1
+k=  120 MATCH     pose=(-0.23,-0.21,-0.1°)  score=0.967  d=(-0.001,-0.005,-0.002)  inl=201  raw=669  pts=208  di=1
+k=  130 MATCH     pose=(-0.08,-0.21,-1.5°)  score=0.886  d=(0.030,-0.003,-0.005)  inl=196  raw=656  pts=203  di=1
+k=  140 MATCH     pose=(0.31,-0.22,-3.9°)  score=0.808  d=(0.033,-0.007,-0.004)  inl=204  raw=679  pts=206  di=1
+k=  150 MATCH     pose=(0.53,-0.25,-5.7°)  score=0.835  d=(0.018,0.001,-0.003)  inl=199  raw=633  pts=206  di=1
+k=  160 MATCH     pose=(0.72,-0.27,-7.1°)  score=0.815  d=(0.027,-0.006,-0.003)  inl=202  raw=634  pts=207  di=1
+k=  170 MATCH     pose=(1.01,-0.30,-8.5°)  score=0.840  d=(0.037,0.003,-0.002)  inl=202  raw=589  pts=205  di=1
+k=  180 MATCH     pose=(1.31,-0.36,-10.4°)  score=0.818  d=(0.032,-0.006,-0.002)  inl=199  raw=597  pts=204  di=1
+k=  190 MATCH     pose=(1.62,-0.43,-13.0°)  score=0.766  d=(0.022,-0.015,-0.011)  inl=202  raw=603  pts=202  di=1
+k=  200 MATCH     pose=(1.80,-0.62,-49.6°)  score=0.747  d=(0.011,-0.018,-0.064)  inl=194  raw=568  pts=206  di=1
+k=  210 MATCH     pose=(1.92,-0.87,-68.8°)  score=0.858  d=(0.015,-0.034,-0.017)  inl=191  raw=551  pts=208  di=1
+k=  220 MATCH     pose=(1.98,-1.23,-80.2°)  score=0.731  d=(0.023,-0.024,0.065)  inl=198  raw=591  pts=207  di=1
+k=  230 MATCH     pose=(2.17,-1.51,-48.2°)  score=0.726  d=(0.021,-0.025,0.048)  inl=193  raw=544  pts=201  di=1
+k=  240 MATCH     pose=(2.41,-1.64,-20.2°)  score=0.795  d=(0.024,-0.007,0.047)  inl=194  raw=489  pts=204  di=1
+k=  250 MATCH     pose=(2.72,-1.61,2.1°)  score=0.787  d=(0.045,0.011,-0.002)  inl=193  raw=517  pts=204  di=1
+k=  260 MATCH     pose=(3.11,-1.69,-13.0°)  score=0.732  d=(0.052,0.001,0.024)  inl=180  raw=543  pts=200  di=1
+k=  270 MATCH     pose=(3.52,-1.66,2.0°)  score=0.800  d=(0.050,0.012,0.043)  inl=195  raw=545  pts=207  di=1
+  ┌─── SUBMAP #2 CREATED at scan k=273  (pose=(3.63,-1.63,0.18))  active=2  finished=2
+  ┌─── SUBMAP #3 CREATED at scan k=273  (pose=(3.63,-1.63,0.18))  active=2  finished=2
+k=  280 MATCH     pose=(3.94,-1.56,8.7°)  score=0.775  d=(0.048,0.014,-0.006)  inl=188  raw=510  pts=200  di=1
+k=  290 MATCH     pose=(4.46,-1.43,14.2°)  score=0.710  d=(0.049,0.017,0.083)  inl=188  raw=481  pts=203  di=1
+k=  300 MATCH     pose=(4.69,-1.20,46.9°)  score=0.643  d=(0.014,0.011,0.043)  inl=198  raw=518  pts=206  di=1
+k=  310 MATCH     pose=(4.77,-0.94,71.4°)  score=0.616  d=(0.004,0.027,0.044)  inl=200  raw=568  pts=207  di=1
+k=  320 MATCH     pose=(4.78,-0.61,82.3°)  score=0.640  d=(-0.000,0.038,0.010)  inl=212  raw=604  pts=214  di=1
+k=  330 MATCH     pose=(4.71,-0.25,100.0°)  score=0.657  d=(-0.002,0.039,0.001)  inl=196  raw=575  pts=204  di=0
+k=  340 MATCH     pose=(4.60,0.20,97.8°)  score=0.631  d=(-0.006,0.025,-0.026)  inl=189  raw=562  pts=200  di=0
+k=  350 MATCH     pose=(4.68,0.60,69.6°)  score=0.628  d=(0.018,0.033,-0.062)  inl=195  raw=591  pts=204  di=1
+k=  360 MATCH     pose=(4.89,0.80,30.4°)  score=0.574  d=(0.015,0.017,-0.026)  inl=197  raw=612  pts=204  di=1
+k=  370 MATCH     pose=(5.45,0.87,-0.1°)  score=0.597  d=(0.236,0.052,0.004)  inl=190  raw=612  pts=203  di=1
+k=  380 MATCH     pose=(5.90,0.81,-17.0°)  score=0.609  d=(-0.022,-0.017,0.002)  inl=203  raw=605  pts=214  di=1
+k=  390 MATCH     pose=(6.38,0.74,-8.2°)  score=0.573  d=(0.012,-0.023,-0.013)  inl=189  raw=595  pts=203  di=1
+k=  400 MATCH     pose=(6.94,0.80,1.0°)  score=0.558  d=(0.060,0.015,0.002)  inl=183  raw=559  pts=202  di=0
+k=  410 MATCH     pose=(7.47,0.84,-0.4°)  score=0.588  d=(0.117,0.095,0.024)  inl=169  raw=550  pts=201  di=1
+k=  420 MATCH     pose=(7.95,0.84,-2.3°)  score=0.777  d=(-0.003,0.014,0.013)  inl=201  raw=559  pts=201  di=1
+k=  430 MATCH     pose=(8.42,0.79,-10.4°)  score=0.710  d=(0.032,-0.009,-0.075)  inl=203  raw=557  pts=203  di=1
+k=  440 MATCH     pose=(8.68,0.47,-69.0°)  score=0.874  d=(-0.001,-0.039,-0.095)  inl=204  raw=595  pts=204  di=1
+k=  450 MATCH     pose=(8.63,0.10,-113.6°)  score=0.857  d=(0.001,-0.035,-0.026)  inl=208  raw=575  pts=208  di=0
+k=  460 MATCH     pose=(8.56,-0.31,-101.9°)  score=0.833  d=(-0.015,-0.043,-0.001)  inl=202  raw=637  pts=202  di=1
+k=  470 MATCH     pose=(8.44,-0.76,-113.4°)  score=0.847  d=(-0.034,-0.034,-0.101)  inl=212  raw=575  pts=212  di=1
+k=  480 MATCH     pose=(8.14,-1.06,-149.4°)  score=0.809  d=(-0.035,-0.016,-0.020)  inl=211  raw=592  pts=211  di=1
+k=  490 MATCH     pose=(7.73,-1.30,-159.2°)  score=0.760  d=(-0.061,-0.025,-0.027)  inl=201  raw=570  pts=201  di=1
+k=  500 MATCH     pose=(7.25,-1.27,164.0°)  score=0.770  d=(-0.053,0.019,-0.020)  inl=206  raw=513  pts=206  di=1
+k=  510 MATCH     pose=(6.85,-1.28,-168.4°)  score=0.754  d=(0.012,0.021,0.027)  inl=202  raw=531  pts=202  di=1
+k=  520 MATCH     pose=(6.58,-1.52,-139.0°)  score=0.769  d=(-0.020,-0.021,0.043)  inl=203  raw=581  pts=203  di=0
+k=  530 MATCH     pose=(6.46,-1.78,-114.3°)  score=0.812  d=(-0.010,-0.018,0.044)  inl=209  raw=560  pts=209  di=1
+k=  540 MATCH     pose=(6.37,-2.14,-109.5°)  score=0.861  d=(-0.023,-0.044,0.002)  inl=203  raw=390  pts=203  di=1
+k=  550 MATCH     pose=(6.24,-2.57,-110.8°)  score=0.799  d=(-0.014,-0.024,-0.001)  inl=202  raw=503  pts=202  di=1
+k=  560 MATCH     pose=(6.09,-2.88,-129.0°)  score=0.807  d=(-0.035,-0.027,-0.094)  inl=189  raw=454  pts=189  di=1
+  ┌─── SUBMAP #4 CREATED at scan k=566  (pose=(5.88,-3.00,-2.81))  active=2  finished=3
+k=  570 MATCH     pose=(5.71,-3.04,-169.4°)  score=0.784  d=(-0.043,-0.014,-0.013)  inl=195  raw=421  pts=195  di=1
+k=  580 MATCH     pose=(5.26,-3.07,159.7°)  score=0.785  d=(-0.036,0.006,-0.069)  inl=200  raw=438  pts=200  di=0
+k=  590 MATCH     pose=(5.04,-2.81,108.5°)  score=0.733  d=(-0.014,0.036,-0.090)  inl=200  raw=529  pts=200  di=1
+k=  600 MATCH     pose=(4.99,-2.41,87.4°)  score=0.773  d=(-0.005,0.048,-0.021)  inl=202  raw=549  pts=206  di=1
+k=  610 MATCH     pose=(5.02,-1.94,76.6°)  score=0.781  d=(-0.001,0.045,-0.022)  inl=197  raw=537  pts=202  di=1
+k=  620 MATCH     pose=(5.25,-1.32,65.5°)  score=0.716  d=(0.120,0.211,-0.024)  inl=206  raw=572  pts=208  di=1
+k=  630 MATCH     pose=(5.37,-0.90,72.9°)  score=0.647  d=(0.013,0.031,-0.022)  inl=219  raw=637  pts=219  di=1
+k=  640 MATCH     pose=(5.67,-0.67,14.3°)  score=0.718  d=(0.054,0.017,-0.079)  inl=205  raw=612  pts=205  di=1
+k=  650 MATCH     pose=(6.11,-0.56,8.8°)  score=0.756  d=(0.051,0.006,-0.016)  inl=200  raw=491  pts=200  di=1
+k=  660 MATCH     pose=(6.53,-0.47,1.1°)  score=0.740  d=(0.033,-0.003,-0.089)  inl=203  raw=612  pts=203  di=1
+k=  670 MATCH     pose=(6.89,-0.63,-29.7°)  score=0.766  d=(0.038,-0.023,-0.020)  inl=202  raw=597  pts=202  di=1
+k=  680 MATCH     pose=(7.06,-1.01,-79.6°)  score=0.716  d=(0.005,-0.041,-0.088)  inl=204  raw=508  pts=204  di=1
+k=  690 MATCH     pose=(6.98,-1.41,-114.0°)  score=0.655  d=(-0.035,-0.050,-0.041)  inl=206  raw=502  pts=206  di=1
+k=  700 MATCH     pose=(6.67,-1.62,-176.0°)  score=0.828  d=(-0.042,-0.012,-0.107)  inl=208  raw=519  pts=209  di=0
+k=  710 MATCH     pose=(6.20,-1.56,173.7°)  score=0.803  d=(-0.041,-0.002,0.068)  inl=205  raw=556  pts=206  di=1
+  ┌─── SUBMAP #5 CREATED at scan k=716  (pose=(5.93,-1.60,-3.13))  active=2  finished=4
+k=  720 MATCH     pose=(5.81,-1.54,174.5°)  score=0.797  d=(0.046,-0.017,-0.035)  inl=202  raw=460  pts=202  di=1
+k=  730 MATCH     pose=(5.51,-1.31,170.2°)  score=0.704  d=(0.042,-0.030,-0.015)  inl=201  raw=561  pts=201  di=1
+k=  740 MATCH     pose=(5.05,-1.23,168.4°)  score=0.815  d=(0.037,-0.025,-0.004)  inl=206  raw=574  pts=206  di=1
+k=  750 MATCH     pose=(4.78,-1.20,174.3°)  score=0.853  d=(0.008,-0.003,-0.001)  inl=212  raw=539  pts=212  di=0
+k=  760 MATCH     pose=(4.64,-1.18,174.0°)  score=0.831  d=(0.032,-0.009,-0.002)  inl=202  raw=506  pts=202  di=1
+k=  770 MATCH     pose=(4.24,-1.14,172.9°)  score=0.794  d=(0.034,-0.018,0.002)  inl=200  raw=487  pts=200  di=0
+k=  780 MATCH     pose=(3.78,-1.09,171.0°)  score=0.769  d=(0.050,-0.011,-0.007)  inl=213  raw=553  pts=213  di=1
+k=  790 MATCH     pose=(3.28,-1.01,169.5°)  score=0.761  d=(0.040,-0.031,-0.004)  inl=200  raw=539  pts=200  di=1
+k=  800 MATCH     pose=(2.77,-0.92,168.0°)  score=0.783  d=(0.044,-0.026,-0.001)  inl=210  raw=579  pts=210  di=1
+k=  810 MATCH     pose=(2.31,-0.81,164.3°)  score=0.749  d=(0.020,-0.032,-0.038)  inl=206  raw=596  pts=206  di=1
+k=  820 MATCH     pose=(2.07,-0.52,118.6°)  score=0.793  d=(0.002,-0.029,-0.066)  inl=200  raw=601  pts=200  di=1
+k=  830 MATCH     pose=(1.99,-0.34,84.3°)  score=0.740  d=(-0.053,-0.042,-0.023)  inl=197  raw=597  pts=200  di=1
+k=  840 MATCH     pose=(1.95,0.04,104.0°)  score=0.767  d=(-0.009,-0.040,0.053)  inl=189  raw=571  pts=200  di=1
+k=  850 MATCH     pose=(1.75,0.24,131.2°)  score=0.783  d=(0.022,-0.029,0.044)  inl=188  raw=601  pts=201  di=0
+k=  860 MATCH     pose=(1.51,0.39,159.3°)  score=0.803  d=(0.021,-0.015,0.049)  inl=187  raw=593  pts=205  di=1
+  ┌─── SUBMAP #6 CREATED at scan k=861  (pose=(1.49,0.39,2.82))  active=2  finished=5
+k=  870 MATCH     pose=(1.27,0.38,-175.4°)  score=0.794  d=(0.026,0.005,0.039)  inl=182  raw=577  pts=202  di=1
+k=  880 MATCH     pose=(1.07,0.31,-163.8°)  score=0.792  d=(0.028,0.001,0.002)  inl=182  raw=592  pts=200  di=1
+k=  890 MATCH     pose=(0.66,0.29,178.9°)  score=0.752  d=(0.054,0.010,0.054)  inl=182  raw=625  pts=201  di=1
+k=  900 MATCH     pose=(0.26,0.29,-179.6°)  score=0.822  d=(0.046,-0.004,-0.004)  inl=176  raw=643  pts=201  di=1
+k=  910 MATCH     pose=(-0.18,0.29,177.9°)  score=0.860  d=(0.048,-0.004,-0.000)  inl=179  raw=628  pts=201  di=1
+k=  920 MATCH     pose=(-0.25,0.31,177.4°)  score=0.925  d=(-0.008,-0.003,0.001)  inl=184  raw=624  pts=207  di=1
+k=  930 MATCH     pose=(-0.24,0.33,177.5°)  score=0.941  d=(-0.004,-0.004,-0.001)  inl=184  raw=618  pts=206  di=1
+k=  940 MATCH     pose=(-0.32,0.15,179.2°)  score=0.954  d=(-0.005,-0.004,0.002)  inl=182  raw=628  pts=205  di=1
+k=  950 MATCH     pose=(-0.31,0.16,179.3°)  score=0.954  d=(-0.001,-0.000,0.003)  inl=182  raw=628  pts=205  di=1
+k=  960 MATCH     pose=(-0.29,0.18,179.1°)  score=0.966  d=(-0.006,-0.004,-0.001)  inl=182  raw=621  pts=206  di=1
+k=  970 MATCH     pose=(-0.28,0.19,178.9°)  score=0.983  d=(-0.001,0.000,-0.002)  inl=188  raw=624  pts=211  di=1
+k=  980 MATCH     pose=(-0.28,0.20,179.0°)  score=0.958  d=(0.011,0.002,0.002)  inl=178  raw=629  pts=201  di=0
+k=  990 MATCH     pose=(-0.26,0.21,178.9°)  score=0.966  d=(0.001,-0.001,-0.002)  inl=177  raw=630  pts=201  di=0
+k= 1000 MATCH     pose=(-0.25,0.23,179.1°)  score=0.973  d=(-0.003,-0.001,0.001)  inl=179  raw=625  pts=205  di=1
+  ┌─── SUBMAP #7 CREATED at scan k=1010  (pose=(-0.25,0.24,3.12))  active=2  finished=6
+k= 1010 MATCH     pose=(-0.25,0.24,178.9°)  score=0.982  d=(0.002,0.000,-0.002)  inl=180  raw=626  pts=203  di=1
+k= 1020 MATCH     pose=(-0.22,0.24,178.9°)  score=0.974  d=(0.001,-0.002,-0.000)  inl=204  raw=636  pts=206  di=1
+k= 1030 MATCH     pose=(-0.22,0.25,178.9°)  score=0.975  d=(0.005,0.006,-0.001)  inl=202  raw=626  pts=204  di=1
+k= 1040 MATCH     pose=(-0.20,0.26,178.9°)  score=0.970  d=(0.000,-0.002,0.002)  inl=204  raw=632  pts=206  di=1
+k= 1050 MATCH     pose=(-0.19,0.24,178.4°)  score=0.971  d=(-0.001,0.001,0.001)  inl=200  raw=633  pts=201  di=1
+
+Wrote trajectory : hector_outputs/trajectory_lab_run_2_raw_scan_to_submap_1052.txt
+Wrote debug log  : hector_outputs/trajectory_lab_run_2_raw_scan_to_submap_1052_debug.txt
+
+Running final pose-graph optimization...
+  Pose graph: 908 nodes, 8 submaps, constraints total=2024 intra=1816 loop=208
+  Loop closure: candidates=843 accepted=208 rejected=635
+Wrote optimized PGO trajectory : hector_outputs/trajectory_lab_run_2_raw_scan_to_submap_1052_pgo.txt  (1052 scans, 908 keyframes, max correction=0.328m)
+
+============================================================
+  Submap summary: 8 total  (6 finished, 2 still active)
+    submap # 0  FINISHED  scans= 250  origin=(0.00, 0.00)
+    submap # 1  FINISHED  scans= 250  origin=(-0.02, -0.00)
+    submap # 2  FINISHED  scans= 250  origin=(3.66, -1.63)
+    submap # 3  FINISHED  scans= 250  origin=(8.13, 1.13)
+    submap # 4  FINISHED  scans= 250  origin=(6.27, -2.62)
+    submap # 5  FINISHED  scans= 250  origin=(6.09, -1.48)
+    submap # 6  ACTIVE    scans= 159  origin=(1.39, 0.21)
+    submap # 7  ACTIVE    scans=  34  origin=(-0.25, 0.22)
+============================================================

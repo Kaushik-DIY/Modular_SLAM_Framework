@@ -39,7 +39,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from slam_core.matching.scan_to_submap_old import ProbabilityGrid, SubmapBuilder2D
+from slam_core.matching.scan_to_submap.submaps import ProbabilityGrid, SubmapBuilder2D
 from slam_core.common.types import Pose2
 from carto.local_slam.range_to_points import ranges_to_points
 

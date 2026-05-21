@@ -62,7 +62,9 @@ if str(_REPO_ROOT) not in sys.path:
 from slam_core.common.types import Pose2
 from slam_core.common.se2 import wrap_angle, pose_inverse, pose_compose
 from slam_core.matching.scan_to_map import _transform_points
-from slam_core.matching.scan_to_submap_old import ProbabilityGrid, SubmapBuilder2D, Submap2D, correlative_match_two_stage, CartoRefinementProblem
+from slam_core.matching.scan_to_submap.submaps import ProbabilityGrid, SubmapBuilder2D, Submap2D
+from slam_core.matching.scan_to_submap.correlative import correlative_match_two_stage
+from slam_core.matching.scan_to_submap.refine import CartoRefinementProblem
 from slam_core.optimisers.gn_lm import GaussNewtonLM, GNLMConfig
 from carto.local_slam.range_to_points import ranges_to_points
 
@@ -470,7 +472,7 @@ def rebuild_map_from_poses(
     l_occ: float = 1.0,
     ray_steps: int = 20,
 ):
-    from slam_core.matching.scan_to_submap_old import SubmapBuilder2D, ProbabilityGrid
+    from slam_core.matching.scan_to_submap.submaps import SubmapBuilder2D, ProbabilityGrid
     from slam_core.common.types import Pose2
 
     # Import config params for submaps if desired, or use defaults

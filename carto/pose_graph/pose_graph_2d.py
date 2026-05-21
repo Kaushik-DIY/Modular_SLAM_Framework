@@ -120,9 +120,16 @@ class PoseGraph2D:
         self.nodes.append(node)
         self.backend.add_node(node)
 
-        # If the backend supports local-pose tracking (PyCeresBackend2D), register it.
-        if local_pose is not None and hasattr(self.backend, "update_node_local_pose"):
-            self.backend.update_node_local_pose(node_id, local_pose)
+        # Register the spine reference for consecutive-node local-trajectory
+        # regularization. We pass the GLOBAL online pose (not the submap-relative
+        # local_pose): the backend forms z_ij = ref_i^{-1} * ref_j. Within a single
+        # submap the global and submap-relative forms are identical, but at a submap
+        # boundary the submap-relative form is corrupted by the submap pose offset
+        # (the two consecutive nodes reference different submaps), injecting a large
+        # spurious constraint at weight 1e5. Using the global online pose keeps the
+        # spine measurement consistent everywhere.
+        if hasattr(self.backend, "update_node_local_pose"):
+            self.backend.update_node_local_pose(node_id, node_pose_world)
 
         self.drifted_nodes[node_id] = node_pose_world
 

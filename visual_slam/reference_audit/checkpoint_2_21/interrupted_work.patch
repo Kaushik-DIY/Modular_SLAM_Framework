@@ -1,0 +1,1590 @@
+diff --git a/.gitignore b/.gitignore
+index 4e20d53..f444e3a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -18,9 +18,13 @@ dist/
+ 
+ # Local build artifacts
+ third_party/build/
++third_party/vocabs/
+ third_party/local/orbslam2_features/*.so
+ third_party/local/orbslam2_features/*.pyd
+ third_party/local/orbslam2_features/*.dylib
++third_party/local/pydbow3/*.so
++third_party/local/pydbow3/*.pyd
++third_party/local/pydbow3/*.dylib
+ 
+ # Local environment backups
+ .venv_backup_before_orbslam2_features/
+diff --git a/visual_slam/orbslam/local_features/__init__.py b/visual_slam/orbslam/local_features/__init__.py
+index c5cbbb7..cc49d56 100644
+--- a/visual_slam/orbslam/local_features/__init__.py
++++ b/visual_slam/orbslam/local_features/__init__.py
+@@ -9,6 +9,14 @@ from visual_slam.orbslam.local_features.feature_matcher import (
+     FeatureMatchingResult,
+     feature_matcher_factory,
+ )
++from visual_slam.orbslam.local_features.extractor_backends import (
++    BackendUnavailableError,
++    DEFAULT_EXTRACTOR_BACKEND,
++    FeatureExtractionResult,
++    OpenCVORBBackend,
++    PySLAMORB2Backend,
++    create_extractor_backend,
++)
+ from visual_slam.orbslam.local_features.feature_manager import (
+     FeatureManager,
+     feature_manager_factory,
+@@ -33,6 +41,12 @@ __all__ = [
+     "FeatureMatcherTypes",
+     "FeatureMatchingResult",
+     "feature_matcher_factory",
++    "BackendUnavailableError",
++    "DEFAULT_EXTRACTOR_BACKEND",
++    "FeatureExtractionResult",
++    "OpenCVORBBackend",
++    "PySLAMORB2Backend",
++    "create_extractor_backend",
+     "FeatureManager",
+     "feature_manager_factory",
+     "FeatureTracker",
+diff --git a/visual_slam/orbslam/local_features/feature_manager.py b/visual_slam/orbslam/local_features/feature_manager.py
+index 1d19c57..76a16e1 100644
+--- a/visual_slam/orbslam/local_features/feature_manager.py
++++ b/visual_slam/orbslam/local_features/feature_manager.py
+@@ -26,6 +26,11 @@ from enum import Enum
+ import cv2
+ import numpy as np
+ 
++from visual_slam.orbslam.local_features.extractor_backends import (
++    DEFAULT_EXTRACTOR_BACKEND,
++    FeatureExtractionResult,
++    normalize_backend_name,
++)
+ from visual_slam.orbslam.local_features.feature_orbslam2 import Orbslam2Feature2D
+ from visual_slam.orbslam.local_features.feature_types import (
+     FeatureDescriptorTypes,
+@@ -89,6 +94,7 @@ class FeatureManager:
+         deterministic: bool = Parameters.kORBDeterministic,
+         ini_th_fast: int = 20,
+         min_th_fast: int = 7,
++        extractor_backend: str = DEFAULT_EXTRACTOR_BACKEND,
+     ):
+         self.num_features = int(num_features)
+         self.num_levels = int(num_levels)
+@@ -103,6 +109,7 @@ class FeatureManager:
+         self.norm_type = cv2.NORM_HAMMING
+         self.oriented_features = FeatureInfo.is_oriented_features(detector_type)
+         self.deterministic = bool(deterministic)
++        self.extractor_backend_name = normalize_backend_name(extractor_backend)
+ 
+         self.init_sigma_levels()
+ 
+@@ -113,7 +120,9 @@ class FeatureManager:
+             ini_th_fast=ini_th_fast,
+             min_th_fast=min_th_fast,
+             deterministic=deterministic,
++            backend_name=self.extractor_backend_name,
+         )
++        self.extractor_backend = self.feature.backend
+ 
+         self.descriptor_distance = hamming_distance
+         self.descriptor_distances = hamming_distances
+@@ -150,14 +159,17 @@ class FeatureManager:
+         return self.feature.compute(image, keypoints)
+ 
+     def detectAndCompute(self, image: np.ndarray, mask=None):
+-        return self.feature.detectAndCompute(image, mask)
++        return self.extract(image, mask).as_tuple()
++
++    def extract(self, image: np.ndarray, mask=None) -> FeatureExtractionResult:
++        return self.extractor_backend.extract(image, mask)
+ 
+     def debug_print(self) -> None:
+         print(
+             "FeatureManager("
+             f"detector={self.detector_type}, descriptor={self.descriptor_type}, "
+             f"num_features={self.num_features}, levels={self.num_levels}, "
+-            f"scale_factor={self.scale_factor})"
++            f"scale_factor={self.scale_factor}, extractor_backend={self.extractor_backend_name})"
+         )
+ 
+ 
+@@ -179,4 +191,8 @@ def feature_manager_factory(**config) -> FeatureManager:
+         detector_type=detector_type,
+         descriptor_type=descriptor_type,
+         deterministic=config.get("deterministic", Parameters.kORBDeterministic),
++        extractor_backend=config.get(
++            "extractor_backend",
++            config.get("backend_name", config.get("feature_backend", DEFAULT_EXTRACTOR_BACKEND)),
++        ),
+     )
+diff --git a/visual_slam/orbslam/local_features/feature_orbslam2.py b/visual_slam/orbslam/local_features/feature_orbslam2.py
+index 4b42bdb..a51c7a1 100644
+--- a/visual_slam/orbslam/local_features/feature_orbslam2.py
++++ b/visual_slam/orbslam/local_features/feature_orbslam2.py
+@@ -7,17 +7,22 @@ ORB2-compatible feature extractor wrapper.
+ Reference:
+ - pySLAM: pyslam/local_features/feature_orbslam2.py
+ 
+-pySLAM uses an external ORB-SLAM2 C++ ORBextractor. This self-contained port
+-uses OpenCV ORB while preserving the same class/module role. This is the only
+-deliberate dependency adaptation in this checkpoint.
++pySLAM uses an external ORB-SLAM2 C++ ORBextractor. This compatibility class
++now delegates to the local backend abstraction so callers can select the stable
++OpenCV default or explicitly request the optional pySLAM C++ ORB2 backend.
+ =============================================================================
+ """
+ 
+ from __future__ import annotations
+ 
+-import cv2
+ import numpy as np
+ 
++from visual_slam.orbslam.local_features.extractor_backends import (
++    DEFAULT_EXTRACTOR_BACKEND,
++    FeatureExtractionResult,
++    create_extractor_backend,
++)
++
+ 
+ class Orbslam2Feature2D:
+     def __init__(
+@@ -28,6 +33,7 @@ class Orbslam2Feature2D:
+         ini_th_fast: int = 20,
+         min_th_fast: int = 7,
+         deterministic: bool = False,
++        backend_name: str = DEFAULT_EXTRACTOR_BACKEND,
+     ):
+         self.num_features = int(num_features)
+         self.scale_factor = float(scale_factor)
+@@ -35,33 +41,30 @@ class Orbslam2Feature2D:
+         self.ini_th_fast = int(ini_th_fast)
+         self.min_th_fast = int(min_th_fast)
+         self.deterministic = bool(deterministic)
++        self.backend_name = backend_name
+ 
+-        self._orb = cv2.ORB_create(
+-            nfeatures=self.num_features,
+-            scaleFactor=self.scale_factor,
+-            nlevels=self.num_levels,
+-            edgeThreshold=31,
+-            firstLevel=0,
+-            WTA_K=2,
+-            scoreType=cv2.ORB_HARRIS_SCORE,
+-            patchSize=31,
+-            fastThreshold=self.ini_th_fast,
++        self.backend = create_extractor_backend(
++            backend_name,
++            num_features=self.num_features,
++            scale_factor=self.scale_factor,
++            num_levels=self.num_levels,
++            ini_th_fast=self.ini_th_fast,
++            min_th_fast=self.min_th_fast,
++            deterministic=self.deterministic,
+         )
+ 
+     def setMaxFeatures(self, num_features: int) -> None:
+         self.num_features = int(num_features)
+-        self._orb.setMaxFeatures(self.num_features)
++        self.backend.setMaxFeatures(self.num_features)
+ 
+     def detect(self, image: np.ndarray, mask=None):
+-        return self._orb.detect(image, mask)
++        return self.backend.detect(image, mask)
+ 
+     def compute(self, image: np.ndarray, keypoints):
+-        return self._orb.compute(image, keypoints)
++        return self.backend.compute(image, keypoints)
+ 
+     def detectAndCompute(self, image: np.ndarray, mask=None):
+-        if image.ndim == 3:
+-            image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+-        keypoints, descriptors = self._orb.detectAndCompute(image, mask)
+-        if descriptors is None:
+-            descriptors = np.empty((0, 32), dtype=np.uint8)
+-        return keypoints, descriptors
++        return self.extract(image, mask).as_tuple()
++
++    def extract(self, image: np.ndarray, mask=None) -> FeatureExtractionResult:
++        return self.backend.extract(image, mask)
+diff --git a/visual_slam/orbslam/local_features/feature_tracker.py b/visual_slam/orbslam/local_features/feature_tracker.py
+index d8ceb46..fb94e9e 100644
+--- a/visual_slam/orbslam/local_features/feature_tracker.py
++++ b/visual_slam/orbslam/local_features/feature_tracker.py
+@@ -78,6 +78,9 @@ class FeatureTracker:
+     def detectAndCompute(self, image: np.ndarray, mask=None):
+         return self.feature_manager.detectAndCompute(image, mask)
+ 
++    def extract(self, image: np.ndarray, mask=None):
++        return self.feature_manager.extract(image, mask)
++
+     def track(self, image_ref, image_cur, kps_ref, des_ref):
+         kps_cur, des_cur = self.detectAndCompute(image_cur)
+         result = self.matcher.match(
+diff --git a/visual_slam/orbslam/local_features/feature_tracker_configs.py b/visual_slam/orbslam/local_features/feature_tracker_configs.py
+index d2c5cdf..550dce5 100644
+--- a/visual_slam/orbslam/local_features/feature_tracker_configs.py
++++ b/visual_slam/orbslam/local_features/feature_tracker_configs.py
+@@ -13,6 +13,7 @@ Only ORB2 is retained for the thesis ORB/RGB-D SLAM target.
+ 
+ from __future__ import annotations
+ 
++from visual_slam.orbslam.local_features.extractor_backends import DEFAULT_EXTRACTOR_BACKEND
+ from visual_slam.orbslam.local_features.feature_manager import feature_manager_factory
+ from visual_slam.orbslam.local_features.feature_tracker import (
+     FeatureTrackerTypes,
+@@ -50,8 +51,11 @@ class FeatureTrackerConfigs:
+         tracker_type=kTrackerType,
+         matcher_type=FeatureMatcherTypes.DES_BF,
+         deterministic=False,
++        extractor_backend=DEFAULT_EXTRACTOR_BACKEND,
+     )
+ 
+ 
+-def create_orb2_feature_tracker():
+-    return feature_tracker_factory(**FeatureTrackerConfigs.get_config_from_name("ORB2"))
++def create_orb2_feature_tracker(**overrides):
++    config = FeatureTrackerConfigs.get_config_from_name("ORB2")
++    config.update(overrides)
++    return feature_tracker_factory(**config)
+diff --git a/visual_slam/orbslam/slam/__init__.py b/visual_slam/orbslam/slam/__init__.py
+index 948c867..4c507fb 100644
+--- a/visual_slam/orbslam/slam/__init__.py
++++ b/visual_slam/orbslam/slam/__init__.py
+@@ -28,11 +28,23 @@ from visual_slam.orbslam.slam.optimizer_g2o import OptimizerResult, pose_optimiz
+ from visual_slam.orbslam.slam.motion_model import MotionModelBase, MotionModel, MotionModelDamping
+ from visual_slam.orbslam.slam.rotation_histogram import RotationHistogram
+ from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher, EpipolarMatcher
++from visual_slam.orbslam.slam.bow import DBoW3Vocabulary, BoWBackendStatus, get_bow_backend_status, get_default_vocabulary_path, load_default_vocabulary
++from visual_slam.orbslam.slam.keyframe_database import KeyFrameDatabase
++from visual_slam.orbslam.slam.relocalizer import Relocalizer, TemporaryRelocalizationKeyFrameDatabase, PnPResult
+ from visual_slam.orbslam.slam.tracking_core import TrackingCore
+ from visual_slam.orbslam.slam.tracking import TrackingHistory, Tracking
+ from visual_slam.orbslam.slam.local_mapping_core import LocalMappingCore
+ from visual_slam.orbslam.slam.local_mapping import LocalMapping
+-from visual_slam.orbslam.slam.slam import Slam, SlamMode
++
++
++def __getattr__(name):
++    if name in {"Slam", "SlamMode"}:
++        from visual_slam.orbslam.slam.slam import Slam, SlamMode
++
++        globals()["Slam"] = Slam
++        globals()["SlamMode"] = SlamMode
++        return globals()[name]
++    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+ 
+ __all__ = [
+     "DatasetEnvironmentType",
+@@ -74,6 +86,15 @@ __all__ = [
+     "RotationHistogram",
+     "ProjectionMatcher",
+     "EpipolarMatcher",
++    "DBoW3Vocabulary",
++    "BoWBackendStatus",
++    "get_bow_backend_status",
++    "get_default_vocabulary_path",
++    "load_default_vocabulary",
++    "KeyFrameDatabase",
++    "Relocalizer",
++    "TemporaryRelocalizationKeyFrameDatabase",
++    "PnPResult",
+     "TrackingCore",
+     "TrackingHistory",
+     "Tracking",
+diff --git a/visual_slam/orbslam/slam/frame.py b/visual_slam/orbslam/slam/frame.py
+index f15ae63..08df80d 100644
+--- a/visual_slam/orbslam/slam/frame.py
++++ b/visual_slam/orbslam/slam/frame.py
+@@ -347,6 +347,9 @@ class Frame(FrameBase):
+ 
+         self.depths: np.ndarray = np.empty((0,), dtype=np.float32)
+         self.uRs: np.ndarray = np.empty((0,), dtype=np.float32)
++        self.octaves: np.ndarray = np.empty((0,), dtype=np.int32)
++        self.angles: np.ndarray = np.empty((0,), dtype=np.float32)
++        self.sizes: np.ndarray = np.empty((0,), dtype=np.float32)
+ 
+         self.points: list[Any | None] = []
+         self.outliers: np.ndarray = np.empty((0,), dtype=bool)
+@@ -356,6 +359,12 @@ class Frame(FrameBase):
+         self._is_deleted = False
+         self.is_keyframe = False
+         self.kf_ref = None
++
++        # BoW/global descriptor fields used by relocalization and loop closing.
++        self.g_des = None
++        self.f_des = None
++        self.bow_vector = None
++        self.feature_vector = None
+         self.is_blurry = False
+         self.laplacian_var = None
+ 
+@@ -381,6 +390,9 @@ class Frame(FrameBase):
+         self.des = np.ascontiguousarray(self.des)
+         self.depths = np.ascontiguousarray(self.depths)
+         self.uRs = np.ascontiguousarray(self.uRs)
++        self.octaves = np.ascontiguousarray(self.octaves)
++        self.angles = np.ascontiguousarray(self.angles)
++        self.sizes = np.ascontiguousarray(self.sizes)
+         self.outliers = np.ascontiguousarray(self.outliers)
+         self.idxs = np.ascontiguousarray(self.idxs)
+ 
+@@ -398,6 +410,7 @@ class Frame(FrameBase):
+         self.idxs = np.arange(n, dtype=np.int32)
+         self.octaves = np.array([max(0, int(getattr(kp, 'octave', 0))) for kp in self.kps], dtype=np.int32)
+         self.angles = np.array([float(getattr(kp, 'angle', -1.0)) for kp in self.kps], dtype=np.float32)
++        self.sizes = np.array([float(getattr(kp, 'size', 0.0)) for kp in self.kps], dtype=np.float32)
+         pts = np.array([kp.pt for kp in self.kps], dtype=np.float64).reshape(-1, 2)
+         self.kpsn = self.camera.unproject_points(pts) if len(pts) > 0 else np.empty((0, 2), dtype=np.float64)
+         self.kps_ur = self.uRs
+@@ -533,6 +546,11 @@ class Frame(FrameBase):
+     def get_unmatched_points_idxs(self) -> np.ndarray:
+         return np.array([i for i, p in enumerate(self.points) if p is None], dtype=np.int32)
+ 
++    def compute_bow(self, vocabulary):
++        from visual_slam.orbslam.slam.bow import compute_bow_for_frame
++
++        return compute_bow_for_frame(self, vocabulary)
++
+ 
+     def get_matched_good_points_and_idxs(self):
+         """
+diff --git a/visual_slam/orbslam/slam/geometry_matchers.py b/visual_slam/orbslam/slam/geometry_matchers.py
+index 6f686d2..f73092f 100644
+--- a/visual_slam/orbslam/slam/geometry_matchers.py
++++ b/visual_slam/orbslam/slam/geometry_matchers.py
+@@ -188,6 +188,274 @@ class EpipolarMatcher:
+         return idxs1_out, idxs2_out, len(idxs1_out)
+ 
+ 
++
++
++
++
++def _map_point_position(mp):
++    """Return MapPoint world position using pySLAM-compatible method names."""
++    if mp is None:
++        return None
++
++    for name in ("pt", "get_position"):
++        if hasattr(mp, name):
++            try:
++                value = getattr(mp, name)()
++                return np.asarray(value, dtype=np.float64).reshape(3)
++            except Exception:
++                pass
++
++    for name in ("position", "position_world"):
++        if hasattr(mp, name):
++            try:
++                value = getattr(mp, name)
++                return np.asarray(value, dtype=np.float64).reshape(3)
++            except Exception:
++                pass
++
++    return None
++
++
++def _map_point_visibility_info(mp, fallback_position):
++    """
++    Extract pySLAM-style visibility data:
++        position, normal, min_distance, max_distance
++
++    pySLAM uses MapPoint.get_all_pos_info() where available. This helper keeps
++    that same interface but tolerates partially initialized points.
++    """
++    position = fallback_position
++    normal = None
++    min_dist = 0.0
++    max_dist = np.inf
++
++    if mp is not None and hasattr(mp, "get_all_pos_info"):
++        try:
++            info = mp.get_all_pos_info()
++            if info is not None and len(info) >= 4:
++                position = np.asarray(info[0], dtype=np.float64).reshape(3)
++                normal = np.asarray(info[1], dtype=np.float64).reshape(3)
++                min_dist = float(info[2])
++                max_dist = float(info[3])
++        except Exception:
++            pass
++
++    if normal is None or not np.all(np.isfinite(normal)) or np.linalg.norm(normal) < 1e-12:
++        normal = None
++
++    if not np.isfinite(min_dist):
++        min_dist = 0.0
++
++    if not np.isfinite(max_dist) or max_dist <= 0.0:
++        max_dist = np.inf
++
++    return position, normal, min_dist, max_dist
++
++
++def _prepare_visible_projection_candidates(
++    frame,
++    idxs_ref,
++    map_points,
++    do_stereo_project=False,
++):
++    """
++    pySLAM-style candidate preparation before projection search.
++
++    Invalid/non-finite map points are rejected before transform/project. This
++    prevents NaN/Inf projections from entering cKDTree and matches the pySLAM
++    design where projection search uses only visible candidate map points.
++    """
++    idxs_ref = np.asarray(idxs_ref, dtype=np.int32).reshape(-1)
++    map_points = list(map_points)
++
++    if len(idxs_ref) != len(map_points):
++        raise ValueError(
++            f"idxs_ref/map_points length mismatch: {len(idxs_ref)} vs {len(map_points)}"
++        )
++
++    candidate_idxs = []
++    candidate_points = []
++    candidate_positions = []
++    candidate_normals = []
++    candidate_min_dists = []
++    candidate_max_dists = []
++
++    for idx_ref, mp in zip(idxs_ref, map_points):
++        if mp is None:
++            continue
++        if hasattr(mp, "is_bad") and mp.is_bad():
++            continue
++
++        pw0 = _map_point_position(mp)
++        if pw0 is None:
++            continue
++
++        pw, normal, min_dist, max_dist = _map_point_visibility_info(mp, pw0)
++
++        if pw is None or pw.shape != (3,):
++            continue
++        if not np.all(np.isfinite(pw)):
++            continue
++
++        # Reject impossible numeric values before matrix multiplication.
++        if np.linalg.norm(pw) > 1.0e9:
++            continue
++
++        candidate_idxs.append(int(idx_ref))
++        candidate_points.append(mp)
++        candidate_positions.append(pw)
++        candidate_normals.append(normal)
++        candidate_min_dists.append(min_dist)
++        candidate_max_dists.append(max_dist)
++
++    proj_dim = 3 if do_stereo_project else 2
++
++    if len(candidate_points) == 0:
++        return (
++            np.empty((0,), dtype=np.int32),
++            [],
++            np.empty((0, proj_dim), dtype=np.float64),
++            np.empty((0,), dtype=np.float64),
++            np.empty((0,), dtype=np.float64),
++        )
++
++    points_w = np.ascontiguousarray(candidate_positions, dtype=np.float64)
++
++    # Only finite world points reach transform_points().
++    points_c = frame.transform_points(points_w)
++
++    finite_camera = np.all(np.isfinite(points_c), axis=1)
++    positive_depth = finite_camera & (points_c[:, 2] > Parameters.kMinDepth)
++
++    projs = np.zeros((len(candidate_points), proj_dim), dtype=np.float64)
++    depths = np.zeros((len(candidate_points),), dtype=np.float64)
++
++    if np.any(positive_depth):
++        if do_stereo_project:
++            projs_good, depths_good = frame.camera.project_stereo(points_c[positive_depth])
++        else:
++            projs_good, depths_good = frame.camera.project(points_c[positive_depth])
++
++        projs[positive_depth] = np.asarray(projs_good, dtype=np.float64)
++        depths[positive_depth] = np.asarray(depths_good, dtype=np.float64).reshape(-1)
++
++    try:
++        Ow = np.asarray(frame.Ow(), dtype=np.float64).reshape(3)
++    except Exception:
++        Twc = np.linalg.inv(frame.pose())
++        Ow = Twc[:3, 3]
++
++    PO = points_w - Ow.reshape(1, 3)
++    dists = np.linalg.norm(PO, axis=1)
++
++    valid = (
++        positive_depth
++        & np.all(np.isfinite(projs[:, :2]), axis=1)
++        & np.isfinite(depths)
++        & np.isfinite(dists)
++    )
++
++    try:
++        valid &= frame.are_in_image(projs[:, :2], depths)
++    except Exception:
++        width = getattr(frame.camera, "width", None)
++        height = getattr(frame.camera, "height", None)
++        if width is not None and height is not None:
++            valid &= (
++                (projs[:, 0] >= 0.0)
++                & (projs[:, 0] < float(width))
++                & (projs[:, 1] >= 0.0)
++                & (projs[:, 1] < float(height))
++            )
++
++    # pySLAM-style viewing-angle gate when normals are available.
++    normals_available = np.array([n is not None for n in candidate_normals], dtype=bool)
++    if np.any(normals_available):
++        safe_dists = np.maximum(dists, 1e-12)
++        dirs = PO / safe_dists.reshape(-1, 1)
++
++        cos_view = np.ones(len(candidate_points), dtype=np.float64)
++        for i, normal in enumerate(candidate_normals):
++            if normal is not None:
++                cos_view[i] = float(np.dot(normal, dirs[i]))
++
++        valid &= (~normals_available) | (cos_view > Parameters.kViewingCosLimitForPoint)
++
++    min_dists = np.asarray(candidate_min_dists, dtype=np.float64)
++    max_dists = np.asarray(candidate_max_dists, dtype=np.float64)
++
++    valid &= dists > min_dists
++    valid &= dists < max_dists
++
++    idxs_ref_valid = np.asarray(candidate_idxs, dtype=np.int32)[valid]
++    map_points_valid = [mp for mp, keep in zip(candidate_points, valid) if keep]
++    projs_valid = projs[valid]
++    depths_valid = depths[valid]
++    dists_valid = dists[valid]
++
++    return idxs_ref_valid, map_points_valid, projs_valid, depths_valid, dists_valid
++
++
++def _make_projection_query_safe(frame, projs, depths, radiuses):
++    """
++    pySLAM-style defensive visibility gate before KD-tree projection search.
++
++    pySLAM projection matching does not pass arbitrary projected points directly
++    to the spatial search. Candidate map points are filtered by finite projection,
++    positive depth, image bounds, and valid search radius before descriptor
++    matching.
++
++    This helper preserves the original candidate indexing while making invalid
++    candidates produce no KD-tree matches.
++    """
++    projs = np.asarray(projs, dtype=np.float64)
++    depths = np.asarray(depths, dtype=np.float64).reshape(-1)
++    radiuses = np.asarray(radiuses, dtype=np.float64).reshape(-1)
++
++    if projs.ndim != 2 or projs.shape[1] < 2:
++        raise ValueError(f"Expected projs shape Nx2/Nx3, got {projs.shape}")
++
++    n = len(projs)
++    if len(depths) != n or len(radiuses) != n:
++        raise ValueError(
++            f"Inconsistent projection arrays: projs={len(projs)}, "
++            f"depths={len(depths)}, radiuses={len(radiuses)}"
++        )
++
++    valid = (
++        np.all(np.isfinite(projs[:, :2]), axis=1)
++        & np.isfinite(depths)
++        & (depths > Parameters.kMinDepth)
++        & np.isfinite(radiuses)
++        & (radiuses > 0.0)
++    )
++
++    try:
++        valid &= frame.are_in_image(projs[:, :2], depths)
++    except Exception:
++        width = getattr(frame.camera, "width", None)
++        height = getattr(frame.camera, "height", None)
++        if width is not None and height is not None:
++            valid &= (
++                (projs[:, 0] >= 0.0)
++                & (projs[:, 0] < float(width))
++                & (projs[:, 1] >= 0.0)
++                & (projs[:, 1] < float(height))
++            )
++
++    safe_points = np.ascontiguousarray(projs[:, :2], dtype=np.float64)
++    safe_radiuses = np.ascontiguousarray(radiuses, dtype=np.float64)
++
++    invalid = ~valid
++    if np.any(invalid):
++        # cKDTree requires finite query points. Use a finite out-of-image dummy
++        # with zero radius so invalid map-point candidates return no matches.
++        safe_points[invalid, :] = -1.0e9
++        safe_radiuses[invalid] = 0.0
++
++    return safe_points, safe_radiuses, valid
++
++
+ def _max_descriptor_distance(value):
+     return Parameters.kMaxDescriptorDistance if value is None else value
+ 
+@@ -237,14 +505,29 @@ def _search_frame_by_projection(
+ 
+     matched_ref_points = [f_ref.points[i] for i in matched_ref_idxs]
+ 
+-    projs, depths = f_cur.project_map_points(matched_ref_points, f_cur.camera.is_stereo())
+-    is_visible = f_cur.are_in_image(projs[:, :2], depths)
++    matched_ref_idxs, matched_ref_points, projs, depths, dists = _prepare_visible_projection_candidates(
++        f_cur,
++        matched_ref_idxs,
++        matched_ref_points,
++        do_stereo_project=f_cur.camera.is_stereo(),
++    )
++
++    if len(matched_ref_idxs) == 0:
++        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
++
++    is_visible = np.ones(len(matched_ref_idxs), dtype=bool)
+ 
+     kp_ref_octaves = f_ref.octaves[matched_ref_idxs]
+     kp_ref_scale_factors = FeatureTrackerShared.feature_manager.scale_factors[kp_ref_octaves]
+     radiuses = max_reproj_distance * kp_ref_scale_factors
+ 
+-    kd_cur_idxs = f_cur.kd.query_ball_point(projs[:, :2], radiuses)
++    safe_query_points, safe_radiuses, valid_projection_mask = _make_projection_query_safe(
++        f_cur,
++        projs,
++        depths,
++        radiuses,
++    )
++    kd_cur_idxs = f_cur.kd.query_ball_point(safe_query_points, safe_radiuses)
+ 
+     idxs_ref = []
+     idxs_cur = []
+@@ -327,11 +610,28 @@ def _search_keyframe_by_projection(
+     if len(matched_ref_points) == 0:
+         return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
+ 
+-    visible, projs, depths, dists = f_cur.are_visible(matched_ref_points, f_cur.camera.is_stereo())
++    matched_ref_idxs, matched_ref_points, projs, depths, dists = _prepare_visible_projection_candidates(
++        f_cur,
++        matched_ref_idxs,
++        matched_ref_points,
++        do_stereo_project=f_cur.camera.is_stereo(),
++    )
++
++    if len(matched_ref_points) == 0:
++        return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
++
++    visible = np.ones(len(matched_ref_points), dtype=bool)
+     predicted_levels = MapPoint.predict_detection_levels(matched_ref_points, dists)
+     kp_scale_factors = FeatureTrackerShared.feature_manager.scale_factors[predicted_levels]
+     radiuses = max_reproj_distance * kp_scale_factors
+-    kd_cur_idxs = f_cur.kd.query_ball_point(projs[:, :2], radiuses)
++
++    safe_query_points, safe_radiuses, valid_projection_mask = _make_projection_query_safe(
++        f_cur,
++        projs,
++        depths,
++        radiuses,
++    )
++    kd_cur_idxs = f_cur.kd.query_ball_point(safe_query_points, safe_radiuses)
+ 
+     idxs_ref = []
+     idxs_cur = []
+@@ -394,13 +694,30 @@ def _search_map_by_projection(
+ 
+     ensure_frame_feature_arrays(f_cur)
+ 
+-    visibility_flags, projs, depths, dists = f_cur.are_visible(points, f_cur.camera.is_stereo())
++    input_idxs = np.arange(len(points), dtype=np.int32)
++    input_idxs, points, projs, depths, dists = _prepare_visible_projection_candidates(
++        f_cur,
++        input_idxs,
++        points,
++        do_stereo_project=f_cur.camera.is_stereo(),
++    )
++
++    if len(points) == 0:
++        return 0, []
++
++    visibility_flags = np.ones(len(points), dtype=bool)
+     predicted_levels = MapPoint.predict_detection_levels(points, dists)
+ 
+     kp_scale_factors = FeatureTrackerShared.feature_manager.scale_factors[predicted_levels]
+     radiuses = max_reproj_distance * kp_scale_factors
+ 
+-    kd_cur_idxs = f_cur.kd.query_ball_point(projs[:, :2], radiuses)
++    safe_query_points, safe_radiuses, valid_projection_mask = _make_projection_query_safe(
++        f_cur,
++        projs,
++        depths,
++        radiuses,
++    )
++    kd_cur_idxs = f_cur.kd.query_ball_point(safe_query_points, safe_radiuses)
+ 
+     if far_points_threshold is not None:
+         visibility_flags = np.logical_and(visibility_flags, depths < far_points_threshold)
+diff --git a/visual_slam/orbslam/slam/keyframe.py b/visual_slam/orbslam/slam/keyframe.py
+index 49e6499..e65620d 100644
+--- a/visual_slam/orbslam/slam/keyframe.py
++++ b/visual_slam/orbslam/slam/keyframe.py
+@@ -254,6 +254,9 @@ class KeyFrame(Frame, KeyFrameGraph):
+ 
+         # Loop closing fields
+         self.g_des = None
++        self.f_des = None
++        self.bow_vector = None
++        self.feature_vector = None
+         self.loop_query_id = None
+         self.num_loop_words = 0
+         self.loop_score = 0.0
+@@ -349,6 +352,11 @@ class KeyFrame(Frame, KeyFrameGraph):
+         with self._lock_connections:
+             return self._is_bad
+ 
++    def compute_bow(self, vocabulary):
++        from visual_slam.orbslam.slam.bow import compute_bow_for_frame
++
++        return compute_bow_for_frame(self, vocabulary)
++
+     def set_not_erase(self) -> None:
+         with self._lock_connections:
+             self.not_to_erase = True
+@@ -412,18 +420,16 @@ class KeyFrame(Frame, KeyFrameGraph):
+ 
+     def get_matched_good_points_and_idxs(self):
+         """
+-        Return pySLAM-compatible matched good point/index pairs.
++        pySLAM-compatible matched good point/index pairs.
+ 
+-        pySLAM LocalMappingCore expects:
+-            for p, idx in keyframe.get_matched_good_points_and_idxs():
+-                ...
++        Returns:
++            list[(MapPoint, keypoint_idx)]
+ 
+-        Therefore this method must return a list of (MapPoint, keypoint_idx)
+-        tuples, not a tuple of separate lists.
++        The index must be the original keypoint index in self.points, not the
++        compact index of get_points().
+         """
+         pairs = []
+-
+-        points = self.get_points() if hasattr(self, "get_points") else getattr(self, "points", [])
++        points = getattr(self, "points", [])
+         outliers = getattr(self, "outliers", None)
+ 
+         for idx, p in enumerate(points):
+@@ -437,23 +443,19 @@ class KeyFrame(Frame, KeyFrameGraph):
+ 
+         return pairs
+ 
+-
+     def get_matched_good_points(self):
+-        """Return non-bad matched map points, pySLAM-compatible."""
++        """Return non-bad matched map points."""
+         return [p for p, _ in self.get_matched_good_points_and_idxs()]
+ 
+-
+     def get_matched_good_points_idxs(self):
+-        """Return indices of non-bad matched map points, pySLAM-compatible."""
+-        return [idx for _, idx in self.get_matched_good_points_and_idxs()]
+-
++        """Return original keypoint indices of non-bad matched map points."""
++        return np.asarray(
++            [idx for _, idx in self.get_matched_good_points_and_idxs()],
++            dtype=np.int32,
++        )
+ 
+     def num_tracked_points(self, min_num_observations=0):
+-        """
+-        Count tracked map points with at least min_num_observations.
+-
+-        This is required by pySLAM LocalMappingCore.local_BA().
+-        """
++        """Count tracked map points with at least min_num_observations."""
+         count = 0
+ 
+         for p, _ in self.get_matched_good_points_and_idxs():
+@@ -467,3 +469,36 @@ class KeyFrame(Frame, KeyFrameGraph):
+ 
+         return count
+ 
++    def check_replaced_map_points(self):
++        """
++        Replace frame associations when a MapPoint has been substituted.
++
++        pySLAM calls this before tracking from the previous frame, because local
++        mapping / fusion can replace map points between frames.
++        """
++        replaced = 0
++
++        points = getattr(self, "points", [])
++        for idx, p in enumerate(list(points)):
++            if p is None:
++                continue
++
++            replacement = None
++
++            if hasattr(p, "get_replacement"):
++                try:
++                    replacement = p.get_replacement()
++                except Exception:
++                    replacement = None
++            elif hasattr(p, "replacement"):
++                replacement = p.replacement
++
++            if replacement is not None and replacement is not p:
++                points[idx] = replacement
++                try:
++                    replacement.add_frame_view(self, idx)
++                except Exception:
++                    pass
++                replaced += 1
++
++        return replaced
+diff --git a/visual_slam/orbslam/slam/map.py b/visual_slam/orbslam/slam/map.py
+index e4fd656..118b725 100644
+--- a/visual_slam/orbslam/slam/map.py
++++ b/visual_slam/orbslam/slam/map.py
+@@ -141,16 +141,19 @@ class LocalCovisibilityMap:
+         self.reference_keyframe = None
+         self.local_keyframes = OrderedSetLite()
+         self.local_points = OrderedSetLite()
++        self.ref_keyframes = OrderedSetLite()
+ 
+     def reset(self) -> None:
+         self.reference_keyframe = None
+         self.local_keyframes.clear()
+         self.local_points.clear()
++        self.ref_keyframes.clear()
+ 
+     def reset_session(self, keyframes_to_remove=None, points_to_remove=None) -> None:
+         if keyframes_to_remove:
+             for kf in keyframes_to_remove:
+                 self.local_keyframes.discard(kf)
++                self.ref_keyframes.discard(kf)
+         if points_to_remove:
+             for p in points_to_remove:
+                 self.local_points.discard(p)
+@@ -160,11 +163,11 @@ class LocalCovisibilityMap:
+         self.reference_keyframe = reference_keyframe
+ 
+         if reference_keyframe is None:
+-            return
++            return self.get_keyframes(), self.get_points(), self.ref_keyframes.copy()
+ 
+         self.local_keyframes.add(reference_keyframe)
+ 
+-        for kf in reference_keyframe.get_best_covisible_keyframes(num_best):
++        for kf in reference_keyframe.get_covisible_keyframes():
+             if kf is not None and not kf.is_bad():
+                 self.local_keyframes.add(kf)
+ 
+@@ -173,6 +176,13 @@ class LocalCovisibilityMap:
+                 if p is not None and not p.is_bad():
+                     self.local_points.add(p)
+ 
++        for p in self.local_points:
++            for kf, _ in p.observations():
++                if kf is not None and not kf.is_bad() and kf not in self.local_keyframes:
++                    self.ref_keyframes.add(kf)
++
++        return self.get_keyframes(), self.get_points(), self.ref_keyframes.copy()
++
+     def get_keyframes(self) -> OrderedSetLite:
+         return self.local_keyframes.copy()
+ 
+@@ -410,7 +420,18 @@ class Map:
+         pySLAM LocalMappingCore calls map.locally_optimize(kf_ref=...).
+         This port routes it to the g2o local_bundle_adjustment implementation.
+         """
+-        result = local_bundle_adjustment(kf_ref, abort_flag=abort_flag)
++        keyframes, points, ref_keyframes = self.local_map.update(kf_ref)
++        result = local_bundle_adjustment(
++            keyframes,
++            points,
++            ref_keyframes,
++            False,
++            False,
++            10,
++            abort_flag=abort_flag,
++            mp_abort_flag=mp_abort_flag,
++            map_lock=self.update_lock,
++        )
+         return result.mean_squared_error
+ 
+     def optimize(self, local_window_size=None, abort_flag=None):
+diff --git a/visual_slam/orbslam/slam/map_point.py b/visual_slam/orbslam/slam/map_point.py
+index 36a19ad..9b06073 100644
+--- a/visual_slam/orbslam/slam/map_point.py
++++ b/visual_slam/orbslam/slam/map_point.py
+@@ -430,7 +430,7 @@ class MapPoint(MapPointBase):
+ 
+     def set_position(self, position: np.ndarray) -> None:
+         with self._lock_pos:
+-            self._position = np.asarray(position, dtype=np.float64).reshape(3)
++            self._position = np.array(position, dtype=np.float64, copy=True).reshape(3)
+ 
+     def update_position(self, position: np.ndarray) -> None:
+         self.set_position(position)
+diff --git a/visual_slam/orbslam/slam/optimizer_g2o.py b/visual_slam/orbslam/slam/optimizer_g2o.py
+index 244ed7f..0eaa9a7 100644
+--- a/visual_slam/orbslam/slam/optimizer_g2o.py
++++ b/visual_slam/orbslam/slam/optimizer_g2o.py
+@@ -29,6 +29,7 @@ Important adaptation:
+ 
+ from __future__ import annotations
+ 
++from contextlib import nullcontext
+ from dataclasses import dataclass
+ from typing import Iterable, Optional
+ 
+@@ -91,11 +92,15 @@ def _camera_to_g2o(camera) -> G2OCamera:
+ 
+ 
+ def _get_observation_uv(frame_or_kf, idx: int) -> np.ndarray:
+-    kps = getattr(frame_or_kf, "kps", getattr(frame_or_kf, "keypoints", None))
++    kps = getattr(frame_or_kf, "kpsu", None)
++    if kps is None:
++        kps = getattr(frame_or_kf, "kps", getattr(frame_or_kf, "keypoints", None))
+     if kps is None:
+         raise ValueError("Frame/keyframe has no keypoints.")
+     kp = kps[int(idx)]
+-    return np.array([kp.pt[0], kp.pt[1]], dtype=np.float64)
++    if hasattr(kp, "pt"):
++        return np.array([kp.pt[0], kp.pt[1]], dtype=np.float64)
++    return np.asarray(kp, dtype=np.float64).reshape(2)
+ 
+ 
+ def _get_observation_ur(frame_or_kf, idx: int) -> float:
+@@ -133,6 +138,59 @@ def _set_frame_pose_from_vertex(frame_or_kf, pose_vertex) -> None:
+     frame_or_kf.update_pose(g2o.Isometry3d(Tcw))
+ 
+ 
++def _pose_vertex_point_depth(pose_vertex, point_vertex) -> float:
++    Tcw = _extract_Tcw_from_pose_vertex(pose_vertex)
++    point_w = np.asarray(point_vertex.estimate(), dtype=np.float64).reshape(3)
++    point_c = Tcw[:3, :3] @ point_w + Tcw[:3, 3]
++    return float(point_c[2])
++
++
++def _is_depth_positive(edge, pose_vertex, point_vertex) -> bool:
++    is_depth_positive = getattr(edge, "is_depth_positive", None)
++    if callable(is_depth_positive):
++        try:
++            return bool(is_depth_positive())
++        except Exception:
++            pass
++
++    # Binding adaptation: this workspace's g2o projection edges do not expose
++    # is_depth_positive(), so mirror pySLAM by checking optimized camera depth.
++    depth = _pose_vertex_point_depth(pose_vertex, point_vertex)
++    return bool(np.isfinite(depth) and depth > 0.0)
++
++
++def _manual_reprojection_chi2(frame_or_kf, idx: int, pose_vertex, point_vertex, is_stereo: bool) -> float:
++    Tcw = _extract_Tcw_from_pose_vertex(pose_vertex)
++    point_w = np.asarray(point_vertex.estimate(), dtype=np.float64).reshape(3)
++    point_c = Tcw[:3, :3] @ point_w + Tcw[:3, 3]
++
++    if not np.all(np.isfinite(point_c)):
++        return float("inf")
++
++    z = float(point_c[2])
++    if z <= 0.0:
++        return float("inf")
++
++    camera = frame_or_kf.camera
++    u = float(camera.fx) * float(point_c[0]) / z + float(camera.cx)
++    v = float(camera.fy) * float(point_c[1]) / z + float(camera.cy)
++
++    if not np.isfinite(u) or not np.isfinite(v):
++        return float("inf")
++
++    uv = _get_observation_uv(frame_or_kf, idx)
++    inv_sigma2 = _get_inv_sigma2(frame_or_kf, idx)
++    err2 = (u - float(uv[0])) ** 2 + (v - float(uv[1])) ** 2
++
++    if is_stereo:
++        ur_obs = _get_observation_ur(frame_or_kf, idx)
++        if ur_obs >= 0.0:
++            ur = u - float(getattr(camera, "bf", 0.0)) / z
++            err2 += (ur - ur_obs) ** 2
++
++    return float(err2 * inv_sigma2)
++
++
+ def _add_reprojection_edge(
+     optimizer,
+     edge_id: int,
+@@ -297,6 +355,8 @@ def _bundle_adjustment_core(
+     fixed_points: bool = False,
+     rounds: int = 10,
+     use_robust_kernel: bool = False,
++    abort_flag=None,
++    map_lock=None,
+     verbose: bool = False,
+     result_dict: Optional[dict] = None,
+     print=print,
+@@ -309,45 +369,52 @@ def _bundle_adjustment_core(
+         return OptimizerResult(0, 0, 0, float("inf"), False)
+ 
+     optimizer = make_optimizer(verbose=verbose)
++    if abort_flag is not None:
++        if hasattr(optimizer, "set_force_stop_flag") and abort_flag.__class__.__module__ == "g2o":
++            optimizer.set_force_stop_flag(abort_flag)
+     add_camera_parameters(optimizer, _camera_to_g2o(local_keyframes[0].camera), parameter_id=0)
+ 
+     pose_vertices = {}
+     point_vertices = {}
++    graph_edges = {}
+ 
+-    vertex_id = 0
++    # pySLAM uses stable even keyframe vertex ids and odd map-point ids. This
++    # makes graph construction traceable across local and global BA windows.
++    good_keyframes = []
+ 
+     for kf in local_keyframes:
++        if kf in pose_vertices:
++            continue
+         v = add_pose_vertex(
+             optimizer=optimizer,
+-            vertex_id=vertex_id,
++            vertex_id=int(kf.kid) * 2,
+             Tcw=kf.Tcw(),
+             fixed=(kf.kid == 0),
+         )
+         pose_vertices[kf] = v
+-        vertex_id += 1
++        good_keyframes.append(kf)
+ 
+     for kf in fixed_keyframes:
+         if kf in pose_vertices:
+             continue
+         v = add_pose_vertex(
+             optimizer=optimizer,
+-            vertex_id=vertex_id,
++            vertex_id=int(kf.kid) * 2,
+             Tcw=kf.Tcw(),
+             fixed=True,
+         )
+         pose_vertices[kf] = v
+-        vertex_id += 1
++        good_keyframes.append(kf)
+ 
+     for point in points:
+         v = add_point_vertex(
+             optimizer=optimizer,
+-            vertex_id=vertex_id,
++            vertex_id=int(point.id) * 2 + 1,
+             point_w=point.get_position(),
+             fixed=bool(fixed_points),
+             marginalized=True,
+         )
+         point_vertices[point] = v
+-        vertex_id += 1
+ 
+     edges = []
+     edge_id = 0
+@@ -358,9 +425,15 @@ def _bundle_adjustment_core(
+             continue
+ 
+         for kf, idx in point.observations():
++            if _is_bad_keyframe(kf):
++                continue
+             pose_vertex = pose_vertices.get(kf)
+             if pose_vertex is None:
+                 continue
++            if idx < 0 or idx >= len(getattr(kf, "points", [])):
++                continue
++            if kf.get_point_match(idx) is not point:
++                continue
+ 
+             edge, chi2_threshold, is_stereo = _add_reprojection_edge(
+                 optimizer=optimizer,
+@@ -373,50 +446,121 @@ def _bundle_adjustment_core(
+                 use_robust_kernel=use_robust_kernel,
+             )
+ 
+-            edges.append((edge, point, kf, idx, chi2_threshold, is_stereo))
++            edge_data = (point, kf, idx, chi2_threshold, is_stereo, point_vertex, pose_vertex)
++            edges.append((edge, *edge_data))
++            graph_edges[edge] = edge_data
+             edge_id += 1
+ 
+     if len(edges) == 0:
+         return OptimizerResult(0, 0, 0, float("inf"), False)
+ 
++    if verbose:
++        optimizer.set_verbose(True)
++
++    def _abort_requested() -> bool:
++        return bool(getattr(abort_flag, "value", False))
++
++    if _abort_requested():
++        return OptimizerResult(len(edges), 0, len(edges), float("inf"), False)
++
++    num_bad_edges = 0
++
+     try:
+-        optimize(optimizer, iterations=rounds, verbose=verbose)
++        optimizer.initialize_optimization()
++        optimizer.compute_active_errors()
++        initial_active_chi2 = float(optimizer.active_chi2())
++
++        if use_robust_kernel:
++            optimizer.optimize(5)
++
++            for edge, (
++                point,
++                kf,
++                idx,
++                chi2_threshold,
++                is_stereo,
++                point_vertex,
++                pose_vertex,
++            ) in graph_edges.items():
++                chi2 = _manual_reprojection_chi2(kf, idx, pose_vertex, point_vertex, is_stereo)
++                is_bad_edge = (
++                    (not np.isfinite(chi2))
++                    or chi2 > float(chi2_threshold)
++                    or not _is_depth_positive(edge, pose_vertex, point_vertex)
++                )
++                if is_bad_edge:
++                    edge.set_level(1)
++                    num_bad_edges += 1
++                edge.set_robust_kernel(None)
++
++            if _abort_requested():
++                return OptimizerResult(len(edges), 0, len(edges), float("inf"), False)
++
++            optimizer.initialize_optimization()
++            optimizer.optimize(int(rounds))
++        else:
++            optimizer.initialize_optimization()
++            optimizer.optimize(int(rounds))
+     except Exception as exc:
+         print(f"bundle_adjustment: g2o failed: {exc}")
+         return OptimizerResult(len(edges), 0, len(edges), float("inf"), False)
+ 
+-    inliers = []
+-    outliers = []
++    outlier_observations = []
++    inlier_chi2 = []
+ 
+-    for edge, point, kf, idx, chi2_threshold, _ in edges:
+-        chi2 = float(edge.chi2())
+-        if np.isfinite(chi2) and chi2 <= chi2_threshold:
+-            inliers.append(edge)
++    for edge, point, kf, idx, chi2_threshold, is_stereo, point_vertex, pose_vertex in edges:
++        if _is_bad_point(point) or _is_bad_keyframe(kf):
++            continue
++        if idx < 0 or idx >= len(getattr(kf, "points", [])):
++            continue
++        if kf.get_point_match(idx) is not point:
++            continue
++        chi2 = _manual_reprojection_chi2(kf, idx, pose_vertex, point_vertex, is_stereo)
++        is_bad_observation = (
++            (not np.isfinite(chi2))
++            or chi2 > float(chi2_threshold)
++            or not _is_depth_positive(edge, pose_vertex, point_vertex)
++        )
++        if is_bad_observation:
++            outlier_observations.append((point, kf, idx, is_stereo))
+         else:
+-            outliers.append((edge, point, kf, idx))
+-
+-    for kf, vertex in pose_vertices.items():
+-        # Fixed vertices can be updated too, but their estimate is unchanged.
+-        if kf in local_keyframes:
+-            _set_frame_pose_from_vertex(kf, vertex)
++            inlier_chi2.append(chi2)
+ 
+-    if not fixed_points:
+-        for point, vertex in point_vertices.items():
+-            point.set_position(np.asarray(vertex.estimate(), dtype=np.float64).reshape(3))
+-            point.update_normal_and_depth()
++    lock_context = map_lock if map_lock is not None else nullcontext()
++    with lock_context:
++        for point, kf, idx, _ in outlier_observations:
++            if _is_bad_point(point) or _is_bad_keyframe(kf):
++                continue
++            if idx < 0 or idx >= len(getattr(kf, "points", [])):
++                continue
++            if kf.get_point_match(idx) is point:
++                point.remove_observation(kf, idx, map_no_lock=True)
++
++        for kf, vertex in pose_vertices.items():
++            if kf in local_keyframes and not _is_bad_keyframe(kf):
++                _set_frame_pose_from_vertex(kf, vertex)
++                if hasattr(kf, "lba_count"):
++                    kf.lba_count += 1
++
++        if not fixed_points:
++            for point, vertex in point_vertices.items():
++                if _is_bad_point(point):
++                    continue
++                point.update_position(np.array(vertex.estimate(), dtype=np.float64, copy=True).reshape(3))
++                point.update_normal_and_depth()
+ 
+     if result_dict is not None:
+         result_dict["keyframes"] = {kf.kid: kf.Tcw() for kf in pose_vertices.keys()}
+-        result_dict["points"] = {p.id: p.get_position() for p in point_vertices.keys()}
++        result_dict["points"] = {p.id: p.get_position().copy() for p in point_vertices.keys()}
+ 
+-    mse = float(np.mean([float(edge.chi2()) for edge in inliers])) if inliers else float("inf")
++    mse = float(np.mean(inlier_chi2)) if inlier_chi2 else float("inf")
+ 
+     return OptimizerResult(
+         num_edges=len(edges),
+-        num_inliers=len(inliers),
+-        num_outliers=len(outliers),
++        num_inliers=len(inlier_chi2),
++        num_outliers=len(outlier_observations),
+         mean_squared_error=mse,
+-        success=len(inliers) > 0,
++        success=len(inlier_chi2) > 0 and np.isfinite(initial_active_chi2),
+     )
+ 
+ 
+@@ -461,6 +605,8 @@ def bundle_adjustment(
+         fixed_points=fixed_points,
+         rounds=rounds,
+         use_robust_kernel=use_robust_kernel,
++        abort_flag=abort_flag,
++        map_lock=None,
+         verbose=verbose,
+         result_dict=result_dict,
+         print=print,
+@@ -470,43 +616,56 @@ def bundle_adjustment(
+ 
+ 
+ def local_bundle_adjustment(
+-    keyframe: KeyFrame,
+-    abort_flag=None,
+-    rounds: int = Parameters.kLocalBAWindowSize,
++    keyframes,
++    points: Optional[Iterable[MapPoint]] = None,
++    keyframes_ref: Optional[Iterable[KeyFrame]] = None,
++    fixed_points: bool = False,
+     verbose: bool = False,
++    rounds: int = 10,
++    abort_flag=None,
++    mp_abort_flag=None,
++    map_lock=None,
+     print=print,
+ ) -> OptimizerResult:
+     """
+-    pySLAM-style local BA from a reference keyframe.
++    pySLAM-style local BA.
+ 
+-    Local keyframes:
+-    - reference keyframe
+-    - best covisible keyframes
++    Preferred pySLAM-compatible call:
++        local_bundle_adjustment(keyframes, points, keyframes_ref, ...)
+ 
+-    Fixed keyframes:
+-    - other keyframes observing local map points
++    Compatibility call retained for existing tests:
++        local_bundle_adjustment(reference_keyframe, ...)
+     """
+-    if keyframe is None or keyframe.is_bad():
+-        return OptimizerResult(0, 0, 0, float("inf"), False)
+-
+-    local_keyframes = [keyframe]
+-
+-    for kf in keyframe.get_best_covisible_keyframes(Parameters.kNumBestCovisibilityKeyFrames):
+-        if kf is not None and not kf.is_bad() and kf not in local_keyframes:
+-            local_keyframes.append(kf)
+-
+-    local_points = []
+-    for kf in local_keyframes:
+-        for point in kf.get_matched_good_points():
+-            if point is not None and not point.is_bad() and point not in local_points:
+-                local_points.append(point)
++    if isinstance(keyframes, KeyFrame):
++        keyframe = keyframes
++        if keyframe is None or keyframe.is_bad():
++            return OptimizerResult(0, 0, 0, float("inf"), False)
++
++        local_keyframes = [keyframe]
++
++        for kf in keyframe.get_covisible_keyframes():
++            if kf is not None and not kf.is_bad() and kf not in local_keyframes:
++                local_keyframes.append(kf)
++
++        local_points = []
++        for kf in local_keyframes:
++            for point in kf.get_matched_good_points():
++                if point is not None and not point.is_bad() and point not in local_points:
++                    local_points.append(point)
++
++        fixed_keyframes = []
++        for point in local_points:
++            for observing_kf, _ in point.observations():
++                if observing_kf not in local_keyframes and observing_kf not in fixed_keyframes:
++                    if not observing_kf.is_bad():
++                        fixed_keyframes.append(observing_kf)
++    else:
++        local_keyframes = _as_list(keyframes)
++        local_points = _as_list(points)
++        fixed_keyframes = _as_list(keyframes_ref)
+ 
+-    fixed_keyframes = []
+-    for point in local_points:
+-        for observing_kf, _ in point.observations():
+-            if observing_kf not in local_keyframes and observing_kf not in fixed_keyframes:
+-                if not observing_kf.is_bad():
+-                    fixed_keyframes.append(observing_kf)
++    if len(local_keyframes) == 0 or len(local_points) == 0:
++        return OptimizerResult(0, 0, 0, float("inf"), False)
+ 
+     # If there are no boundary fixed keyframes and the root is not in local set,
+     # fix the first local keyframe to remove gauge freedom.
+@@ -518,9 +677,11 @@ def local_bundle_adjustment(
+         local_keyframes=local_keyframes,
+         fixed_keyframes=fixed_keyframes,
+         points=local_points,
+-        fixed_points=False,
+-        rounds=min(int(rounds), 10),
++        fixed_points=fixed_points,
++        rounds=int(rounds),
+         use_robust_kernel=True,
++        abort_flag=abort_flag,
++        map_lock=map_lock,
+         verbose=verbose,
+         result_dict=None,
+         print=print,
+diff --git a/visual_slam/orbslam/slam/slam.py b/visual_slam/orbslam/slam/slam.py
+index bb729a1..b5c354e 100644
+--- a/visual_slam/orbslam/slam/slam.py
++++ b/visual_slam/orbslam/slam/slam.py
+@@ -30,6 +30,8 @@ import traceback
+ from visual_slam.orbslam.local_features import create_orb2_feature_tracker
+ from visual_slam.orbslam.slam.config_parameters import Parameters
+ from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
++from visual_slam.orbslam.slam.bow import load_default_vocabulary
++from visual_slam.orbslam.slam.keyframe_database import KeyFrameDatabase
+ from visual_slam.orbslam.slam.local_mapping import LocalMapping
+ from visual_slam.orbslam.slam.map import Map
+ from visual_slam.orbslam.slam.sensor_types import SensorType
+@@ -87,6 +89,8 @@ class Slam:
+         self.init_feature_tracker(self.feature_tracker_config)
+ 
+         self.map = Map()
++        self.bow_vocabulary = load_default_vocabulary()
++        self.keyframe_database = KeyFrameDatabase(self.bow_vocabulary)
+ 
+         self.semantic_mapping = None
+         self.loop_closing = None
+diff --git a/visual_slam/orbslam/slam/tracking.py b/visual_slam/orbslam/slam/tracking.py
+index fc96e7e..f9f2c94 100644
+--- a/visual_slam/orbslam/slam/tracking.py
++++ b/visual_slam/orbslam/slam/tracking.py
+@@ -50,6 +50,7 @@ from visual_slam.orbslam.slam.map import Map
+ from visual_slam.orbslam.slam.map_point import MapPoint
+ from visual_slam.orbslam.slam.motion_model import MotionModel
+ from visual_slam.orbslam.slam.optimizer_g2o import pose_optimization as g2o_pose_optimization
++from visual_slam.orbslam.slam.relocalizer import Relocalizer
+ from visual_slam.orbslam.slam.rotation_histogram import RotationHistogram
+ from visual_slam.orbslam.slam.sensor_types import SensorType
+ from visual_slam.orbslam.slam.slam_commons import SlamState
+@@ -90,6 +91,7 @@ class Tracking:
+     def __init__(self, slam):
+         self.slam = slam
+         self.motion_model = MotionModel()
++        self.relocalizer = Relocalizer(self.map)
+ 
+         self.descriptor_distance_sigma = FeatureTrackerShared.feature_manager.max_descriptor_distance
+         self.reproj_err_frame_map_sigma = Parameters.kMaxReprojectionDistanceMap
+@@ -412,7 +414,18 @@ class Tracking:
+         return True
+ 
+     def track_keyframe(self, keyframe: KeyFrame, f_cur: Frame, name="match-frame-keyframe"):
+-        f_cur.update_pose(keyframe.pose())
++        """
++        Track current frame against reference keyframe.
++
++        pySLAM starts this optimization from the previous frame/current initial
++        pose, not blindly from the keyframe pose. This avoids a large pose jump
++        when the keyframe is older than the previous frame.
++        """
++        if self.f_ref is not None:
++            f_cur.update_pose(self.f_ref.pose())
++        else:
++            f_cur.update_pose(keyframe.pose())
++
+         return self.track_reference_frame(keyframe, f_cur, name)
+ 
+     def update_local_map(self):
+@@ -523,6 +536,7 @@ class Tracking:
+ 
+         kf_new = KeyFrame(self.f_cur, img=img)
+         self.map.add_keyframe(kf_new)
++        self._add_keyframe_to_database(kf_new)
+ 
+         kf_new.init_observations()
+ 
+@@ -544,8 +558,13 @@ class Tracking:
+         return kf_new
+ 
+     def relocalize(self, frame: Frame):
+-        Printer.orange("Relocalization is deferred until keyframe database / loop-closing port.")
+-        return False
++        Printer.green(f"Relocalizing frame id: {frame.id}...")
++        keyframe_database = getattr(self.slam, "keyframe_database", None)
++        return self.relocalizer.relocalize(
++            frame,
++            keyframe_database=keyframe_database,
++            keyframes_map=self.map.keyframes_map,
++        )
+ 
+     def create_vo_points_on_last_frame(self):
+         if self.f_ref is None:
+@@ -580,6 +599,7 @@ class Tracking:
+ 
+         kf0 = KeyFrame(f_cur, img=img)
+         self.map.add_keyframe(kf0)
++        self._add_keyframe_to_database(kf0)
+ 
+         num_created = TrackingCore.create_and_add_stereo_map_points_on_new_kf(
+             f_cur,
+@@ -603,6 +623,14 @@ class Tracking:
+ 
+         return num_created >= Parameters.kInitializerNumMinTriangulatedPointsStereo
+ 
++    def _add_keyframe_to_database(self, keyframe: KeyFrame) -> None:
++        keyframe_database = getattr(self.slam, "keyframe_database", None)
++        if keyframe_database is None:
++            return
++        if not getattr(keyframe_database, "available", False):
++            return
++        keyframe_database.add(keyframe)
++
+     def track(
+         self,
+         img,
+@@ -616,11 +644,14 @@ class Tracking:
+         """
+         pySLAM-style tracking entry point.
+ 
+-        Signature follows pySLAM:
+-            track(img, img_right, depth, img_id, timestamp, mask, mask_right)
+-
+-        The mask arguments are accepted for API compatibility and are reserved
+-        for the later masked feature-extraction path.
++        Main state flow:
++          1. Build current frame.
++          2. Initialize first RGB-D keyframe if needed.
++          3. Use previous frame from the map as f_ref.
++          4. Try previous-frame tracking.
++          5. If that fails, fall back to reference-keyframe tracking.
++          6. If pose is valid, track local map.
++          7. Only then update state, motion model, and keyframe insertion.
+         """
+         f_cur = Frame(
+             camera=self.camera,
+@@ -632,35 +663,88 @@ class Tracking:
+             img_right=img_right,
+         )
+ 
+-        self.map.add_frame(f_cur)
+         self.f_cur = f_cur
++        self.idxs_ref = []
++        self.idxs_cur = []
++        self.pose_is_ok = False
++        self.num_matched_map_points = 0
++        self.mean_pose_opt_chi2_error = float("inf")
+ 
++        # First frame: create initial RGB-D keyframe/map.
+         if self.state in (SlamState.NO_IMAGES_YET, SlamState.NOT_INITIALIZED):
++            self.map.add_frame(f_cur)
+             ok = self._create_initial_rgbd_map(f_cur, img=img)
+             self.update_history()
+             return ok
+ 
+-        if self.motion_model.is_ok:
+-            predicted_pose, _ = self.motion_model.predict_pose(timestamp)
+-            f_cur.update_pose(predicted_pose)
+-        elif self.f_ref is not None:
+-            f_cur.update_pose(self.f_ref.pose())
++        # pySLAM uses previous frame from the map before adding current frame.
++        f_ref = self.map.get_frame(-1)
++        self.f_ref = f_ref
++
++        self.map.add_frame(f_cur)
++        f_cur.kf_ref = self.kf_ref
++
++        if self.state == SlamState.OK:
++            if self.f_ref is not None and hasattr(self.f_ref, "check_replaced_map_points"):
++                self.f_ref.check_replaced_map_points()
++
++            if self.motion_model.is_ok:
++                predicted_pose, _ = self.motion_model.predict_pose(timestamp)
++                f_cur.update_pose(predicted_pose)
++            elif self.f_ref is not None:
++                f_cur.update_pose(self.f_ref.pose())
++            elif self.kf_ref is not None:
++                f_cur.update_pose(self.kf_ref.pose())
++
++            # pySLAM: if motion model is not reliable, track keyframe directly.
++            if (not self.motion_model.is_ok) and self.kf_ref is not None:
++                self.track_keyframe(self.kf_ref, f_cur, "match-frame-keyframe")
++            else:
++                if self.f_ref is not None:
++                    self.track_previous_frame(self.f_ref, f_cur)
++
++                # pySLAM fallback: previous-frame failure -> keyframe tracking.
++                if (not self.pose_is_ok) and self.kf_ref is not None:
++                    self.track_keyframe(self.kf_ref, f_cur, "match-frame-keyframe")
+ 
+-        ok_prev = self.track_previous_frame(self.f_ref, f_cur) if self.f_ref is not None else False
++            # pySLAM: after a pose is recovered, search/optimize against local map.
++            if self.pose_is_ok:
++                self.track_local_map()
+ 
+-        if ok_prev:
+-            self.track_local_map()
++        else:
++            if self.state != SlamState.INIT_RELOCALIZE:
++                self.state = SlamState.RELOCALIZE
++
++            if self.relocalize(f_cur):
++                self.last_reloc_frame_id = f_cur.id
++                self.state = SlamState.OK
++                self.pose_is_ok = True
++                self.kf_ref = f_cur.kf_ref
++                self.kf_last = self.kf_ref
++                self.map.update_local_map(self.kf_ref)
++                self.motion_model.reset()
++                Printer.green(
++                    f"Relocalization successful, frame id {f_cur.id} "
++                    f"reconnected to keyframe id {self.kf_ref.id}"
++                )
++            else:
++                self.pose_is_ok = False
++                Printer.red("Relocalization failed")
+ 
+         if self.pose_is_ok:
+-            self.motion_model.update_pose_from_matrix(timestamp, f_cur.pose())
+             self.state = SlamState.OK
++            self.motion_model.update_pose_from_matrix(timestamp, f_cur.pose())
++            if f_cur.id <= self.last_reloc_frame_id + 1:
++                self.motion_model.is_ok = False
+ 
+             if self.need_new_keyframe():
+                 self.create_new_keyframe(img=img)
+         else:
+             self.state = SlamState.LOST
++            self.motion_model.is_ok = False
+ 
+-        self.f_ref = f_cur
++        # Important: do not assign self.f_ref = f_cur here.
++        # The next call will retrieve the previous frame from the map, matching pySLAM.
+         self.update_history()
+ 
+         return self.pose_is_ok

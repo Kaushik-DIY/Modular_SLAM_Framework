@@ -101,11 +101,27 @@ class HectorLocalSlamAdapter:
         extrapolator,
         motion_params: Optional[MotionFilterParams] = None,
         use_extrapolator: bool = True,
+        pose_graph=None,
+        global_slam=None,
+        solve_every_n_nodes: int = 20,
     ):
         self.matcher_manager = matcher_manager
         self.extrap = extrapolator
         self.motion_params = motion_params
         self.use_extrapolator = use_extrapolator
+
+        # Optional online pose-graph back-end (Cartographer-style global SLAM).
+        # When set, every accepted scan-to-submap node is added to the graph and
+        # the global_slam orchestrator runs loop search + periodic optimization
+        # with optimized submap poses written back into the live submap builder.
+        self.pose_graph = pose_graph
+        self.global_slam = global_slam
+        self.solve_every_n_nodes = int(solve_every_n_nodes)
+        self.node_count: int = 0
+        # Id of the most recently created pose-graph node (-1 before any node).
+        # Used by the runner to reconstruct a dense optimized trajectory: each
+        # scan inherits the correction of its most recent keyframe node.
+        self.last_node_id: int = -1
 
         self.last_insert_pose: Optional[Pose2] = None
         self.last_insert_time: Optional[float] = None
@@ -244,6 +260,16 @@ class HectorLocalSlamAdapter:
             if did_insert:
                 self.last_insert_pose = final_pose
                 self.last_insert_time = t
+                # Online pose-graph back-end (only for the submap matcher and only
+                # on a genuine match — FALLBACK poses must not become nodes).
+                self._maybe_add_pose_graph_node(
+                    t=t,
+                    final_pose=final_pose,
+                    scan_points_local=scan_points_local,
+                    active_matcher=active_matcher,
+                    matcher_name=matcher_name,
+                    scan_matched=bool(result.success),
+                )
 
         self._last_did_insert = bool(did_insert)
 
@@ -266,6 +292,65 @@ class HectorLocalSlamAdapter:
         }
 
         return final_pose, result, bool(do_insert), bool(did_insert)
+
+    def _maybe_add_pose_graph_node(
+        self,
+        t: float,
+        final_pose: Pose2,
+        scan_points_local: np.ndarray,
+        active_matcher,
+        matcher_name: str,
+        scan_matched: bool,
+    ) -> None:
+        """Add a pose-graph node + intra constraints for an accepted submap scan,
+        then forward to the global-SLAM orchestrator (loop search + optimize).
+
+        Mirrors CartoLocalSlamAdapter's node-insertion logic so the Hector
+        front-end gains the Cartographer back-end without changing its
+        prediction/matching/insertion behaviour.
+        """
+        if self.pose_graph is None:
+            return
+        if matcher_name == "scan_to_map":
+            return
+        if not scan_matched:
+            return
+
+        if hasattr(active_matcher, "get_last_inserted_submaps"):
+            insertion_submaps = active_matcher.get_last_inserted_submaps()
+        elif hasattr(active_matcher, "get_active_submaps"):
+            insertion_submaps = active_matcher.get_active_submaps()
+        else:
+            insertion_submaps = []
+
+        if not insertion_submaps:
+            return
+
+        node_id = self.pose_graph.add_node_with_intra_constraints(
+            t=t,
+            node_pose_world=final_pose,
+            active_submaps=insertion_submaps,
+        )
+        self.node_count += 1
+        self.last_node_id = int(node_id)
+
+        if self.global_slam is not None:
+            self.global_slam.on_node_inserted(
+                node_id=node_id,
+                timestamp=t,
+                scan_points=scan_points_local,
+                pose_global=final_pose,
+                insertion_submaps=insertion_submaps,
+            )
+        elif self.node_count % self.solve_every_n_nodes == 0:
+            self.pose_graph.solve()
+
+    def finalize(self) -> None:
+        """Run the final global optimization pass at end of mapping."""
+        if self.global_slam is not None:
+            self.global_slam.finalize()
+        elif self.pose_graph is not None and self.node_count > 0:
+            self.pose_graph.solve()
 
     def last_motion_debug(self) -> Optional[dict]:
         return self._last_motion_debug

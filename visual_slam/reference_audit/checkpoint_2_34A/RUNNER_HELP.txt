@@ -1,0 +1,81 @@
+usage: run_rgbd_slam.py [-h] [--dataset-type {auto,tum_rgbd,lab_rgbd}]
+                        [--camera-profile CAMERA_PROFILE]
+                        [--camera-config CAMERA_CONFIG]
+                        [--associations ASSOCIATIONS] --output OUTPUT
+                        [--max-frames MAX_FRAMES] [--start-index START_INDEX]
+                        [--print-every PRINT_EVERY]
+                        [--feature-backend {opencv_orb,pyslam_orb2,auto}]
+                        [--enable-loop-closing | --disable-loop-closing]
+                        [--enable-global-ba | --disable-global-ba]
+                        [--global-ba-after-loop]
+                        [--global-ba-iterations GLOBAL_BA_ITERATIONS]
+                        [--loop-debug]
+                        [--stop-after-loop-events STOP_AFTER_LOOP_EVENTS]
+                        [--stop-after-accepted-loops STOP_AFTER_ACCEPTED_LOOPS]
+                        [--dump-loop-candidate-reports]
+                        [--start-local-mapping-thread]
+                        [--lm-wait-timeout LM_WAIT_TIMEOUT] [--profile-memory]
+                        [--memory-profile-every MEMORY_PROFILE_EVERY]
+                        [--memory-profile-mode {cheap,deep}]
+                        [--profile-runtime]
+                        [--runtime-profile-every RUNTIME_PROFILE_EVERY]
+                        [--profile-local-map] [--profile-keyframes]
+                        [--memory-limit-gb MEMORY_LIMIT_GB]
+                        [--frame-view-prune-every FRAME_VIEW_PRUNE_EVERY]
+                        [--lean-memory] [--no-map-export]
+                        [--no-heavy-loop-reports]
+                        [--no-loop-candidate-pair-reports]
+                        dataset
+
+Run the final RGB-D ORB-SLAM pipeline on TUM or lab datasets.
+
+positional arguments:
+  dataset               Path to the RGB-D dataset root.
+
+options:
+  -h, --help            show this help message and exit
+  --dataset-type {auto,tum_rgbd,lab_rgbd}
+                        Dataset layout selector. Use auto unless detection is
+                        ambiguous.
+  --camera-profile CAMERA_PROFILE
+                        Camera profile for TUM datasets. Use auto to preserve
+                        the current Freiburg detection logic.
+  --camera-config CAMERA_CONFIG
+                        Optional camera.yaml for lab_rgbd datasets.
+  --associations ASSOCIATIONS
+                        Optional associations.txt override.
+  --output OUTPUT       Output directory for trajectory, logs, and map export.
+  --max-frames MAX_FRAMES
+                        Max frames to process. Use 0 or -1 for full sequence.
+  --start-index START_INDEX
+  --print-every PRINT_EVERY
+  --feature-backend {opencv_orb,pyslam_orb2,auto}
+                        Feature extractor backend override.
+  --enable-loop-closing
+                        Enable loop closing.
+  --disable-loop-closing
+                        Disable loop closing.
+  --enable-global-ba    Enable loop-triggered Global BA.
+  --disable-global-ba   Disable loop-triggered Global BA.
+  --global-ba-after-loop
+                        Run Global BA after accepted loop closures.
+  --global-ba-iterations GLOBAL_BA_ITERATIONS
+  --loop-debug
+  --stop-after-loop-events STOP_AFTER_LOOP_EVENTS
+  --stop-after-accepted-loops STOP_AFTER_ACCEPTED_LOOPS
+  --dump-loop-candidate-reports
+  --start-local-mapping-thread
+  --lm-wait-timeout LM_WAIT_TIMEOUT
+  --profile-memory
+  --memory-profile-every MEMORY_PROFILE_EVERY
+  --memory-profile-mode {cheap,deep}
+  --profile-runtime
+  --runtime-profile-every RUNTIME_PROFILE_EVERY
+  --profile-local-map
+  --profile-keyframes
+  --memory-limit-gb MEMORY_LIMIT_GB
+  --frame-view-prune-every FRAME_VIEW_PRUNE_EVERY
+  --lean-memory
+  --no-map-export
+  --no-heavy-loop-reports
+  --no-loop-candidate-pair-reports

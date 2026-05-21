@@ -16,11 +16,26 @@ __pycache__/
 build/
 dist/
 
+# Local build artifacts
+third_party/build/
+third_party/vocabs/
+third_party/local/orbslam2_features/*.so
+third_party/local/orbslam2_features/*.pyd
+third_party/local/orbslam2_features/*.dylib
+third_party/local/pydbow3/*.so
+third_party/local/pydbow3/*.pyd
+third_party/local/pydbow3/*.dylib
+
+# Local environment backups
+.venv_backup_before_orbslam2_features/
+.venv_backup*/
+
 # Data and generated results
 datasets/
 carto_outputs/
 hector_outputs/
 outputs/
+visual_slam_outputs/
 
 # Nested generated folders
 **/outputs/
@@ -31,4 +46,10 @@ outputs/
 Thumbs.db
 
 # Jupyter
-.ipynb_checkpoints/
+.ipynb_checkpoints/visual_slam_outputs/
+
+# Large local backup archives
+visual_slam.zip
+slam_ws*.zip
+
+third_party/pyslam_reference/

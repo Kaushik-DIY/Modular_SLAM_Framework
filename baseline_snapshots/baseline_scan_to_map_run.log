@@ -1,0 +1,122 @@
+============================================================
+Dataset      : lab_run_2
+Scan variant : raw
+Scan file    : /home/kaushik/slam_ws/datasets/lab_run_2/scans.carmen
+Geometry     : beams=909  angle=[-180.0°, 180.0°]  range=[0.10, 16.00] m  has_odom=False
+IMU file     : /home/kaushik/slam_ws/datasets/lab_run_2/imu.csv
+Total scans  : 1052
+Matcher      : scan_to_map
+Extrapolator : OFF (raw odom / last pose)
+Odom alpha   : 0.0
+Voxel filter : True
+============================================================
+MotionFilter thresholds:  time=0.100s  dist=0.100m  angle=4.50deg
+k=    0 FALLBACK  pose=(0.00,0.00,0.0°)  score=-1.000  d=None  inl=None  raw=656  pts=201  di=0
+k=   10 MATCH     pose=(-0.02,0.01,-0.3°)  score=0.900  d=(-0.005,0.008,-0.005)  inl=201  raw=670  pts=201  di=1
+k=   20 MATCH     pose=(-0.01,0.01,-0.2°)  score=0.942  d=(0.005,-0.003,0.002)  inl=200  raw=664  pts=200  di=1
+k=   30 MATCH     pose=(-0.00,0.00,-0.2°)  score=0.937  d=(-0.000,-0.000,0.002)  inl=203  raw=670  pts=203  di=1
+k=   40 MATCH     pose=(-0.00,-0.00,-0.3°)  score=0.930  d=(0.005,-0.010,-0.001)  inl=202  raw=666  pts=202  di=1
+k=   50 MATCH     pose=(-0.00,0.01,-0.2°)  score=0.936  d=(0.003,0.003,-0.001)  inl=201  raw=658  pts=201  di=1
+k=   60 MATCH     pose=(-0.00,0.01,-0.3°)  score=0.937  d=(-0.001,0.006,-0.002)  inl=202  raw=671  pts=202  di=1
+k=   70 MATCH     pose=(0.00,0.00,-0.2°)  score=0.927  d=(0.004,-0.014,-0.000)  inl=205  raw=660  pts=205  di=1
+k=   80 MATCH     pose=(-0.00,0.01,-0.3°)  score=0.947  d=(-0.001,-0.003,0.000)  inl=203  raw=665  pts=203  di=1
+k=   90 MATCH     pose=(-0.00,0.01,-0.2°)  score=0.941  d=(0.001,-0.003,0.001)  inl=201  raw=662  pts=201  di=1
+k=  100 MATCH     pose=(-0.00,0.01,-0.3°)  score=0.945  d=(-0.003,0.003,-0.001)  inl=204  raw=663  pts=204  di=1
+k=  110 MATCH     pose=(-0.00,0.02,-0.3°)  score=0.934  d=(0.000,0.002,-0.001)  inl=202  raw=660  pts=202  di=1
+k=  120 MATCH     pose=(0.00,0.01,-0.2°)  score=0.935  d=(0.005,-0.007,0.001)  inl=208  raw=669  pts=208  di=1
+k=  130 MATCH     pose=(0.15,0.02,-1.5°)  score=0.879  d=(0.036,0.001,-0.004)  inl=203  raw=656  pts=203  di=1
+k=  140 MATCH     pose=(0.58,0.03,-3.8°)  score=0.865  d=(0.049,0.001,-0.005)  inl=206  raw=679  pts=206  di=1
+k=  150 MATCH     pose=(0.80,0.04,-5.5°)  score=0.869  d=(0.015,0.000,-0.002)  inl=206  raw=633  pts=206  di=1
+k=  160 MATCH     pose=(1.01,0.02,-6.9°)  score=0.867  d=(0.030,-0.012,-0.004)  inl=207  raw=634  pts=207  di=1
+k=  170 MATCH     pose=(1.31,0.01,-8.1°)  score=0.878  d=(0.028,-0.006,-0.002)  inl=205  raw=589  pts=205  di=1
+k=  180 MATCH     pose=(1.63,-0.02,-9.9°)  score=0.874  d=(0.035,-0.006,0.001)  inl=204  raw=597  pts=204  di=1
+k=  190 MATCH     pose=(1.95,-0.07,-12.6°)  score=0.858  d=(0.016,-0.008,-0.010)  inl=202  raw=603  pts=202  di=1
+k=  200 MATCH     pose=(2.16,-0.21,-49.6°)  score=0.811  d=(0.015,-0.005,-0.070)  inl=206  raw=568  pts=206  di=1
+k=  210 MATCH     pose=(2.29,-0.47,-68.0°)  score=0.929  d=(0.013,-0.032,-0.015)  inl=208  raw=551  pts=208  di=1
+k=  220 MATCH     pose=(2.38,-0.84,-79.1°)  score=0.855  d=(0.022,-0.030,0.063)  inl=207  raw=591  pts=207  di=1
+k=  230 MATCH     pose=(2.58,-1.06,-46.9°)  score=0.869  d=(0.025,-0.017,0.051)  inl=201  raw=544  pts=201  di=1
+k=  240 MATCH     pose=(2.85,-1.17,-19.2°)  score=0.916  d=(0.027,-0.008,0.050)  inl=204  raw=489  pts=204  di=1
+k=  250 MATCH     pose=(3.15,-1.15,3.9°)  score=0.880  d=(0.039,0.008,0.000)  inl=204  raw=517  pts=204  di=1
+k=  260 MATCH     pose=(3.58,-1.18,-11.6°)  score=0.818  d=(0.058,0.009,0.025)  inl=200  raw=543  pts=200  di=1
+k=  270 MATCH     pose=(4.00,-1.13,3.4°)  score=0.819  d=(0.054,0.019,0.035)  inl=207  raw=545  pts=207  di=1
+k=  280 MATCH     pose=(4.42,-1.02,10.4°)  score=0.896  d=(0.048,0.011,-0.006)  inl=200  raw=510  pts=200  di=1
+k=  290 MATCH     pose=(4.93,-0.88,15.8°)  score=0.805  d=(0.043,0.022,0.084)  inl=203  raw=481  pts=203  di=1
+k=  300 MATCH     pose=(5.16,-0.64,48.8°)  score=0.857  d=(0.011,0.025,0.047)  inl=206  raw=518  pts=206  di=1
+k=  310 MATCH     pose=(5.23,-0.40,72.9°)  score=0.861  d=(0.003,0.023,0.048)  inl=207  raw=568  pts=207  di=1
+k=  320 MATCH     pose=(5.24,-0.07,83.9°)  score=0.874  d=(-0.004,0.059,0.007)  inl=214  raw=604  pts=214  di=1
+k=  330 MATCH     pose=(5.15,0.28,101.4°)  score=0.895  d=(-0.011,0.035,-0.002)  inl=204  raw=575  pts=204  di=1
+k=  340 MATCH     pose=(5.04,0.70,98.1°)  score=0.836  d=(-0.003,0.039,-0.023)  inl=200  raw=562  pts=200  di=1
+k=  350 MATCH     pose=(5.10,1.08,70.0°)  score=0.849  d=(0.019,0.034,-0.063)  inl=204  raw=591  pts=204  di=1
+k=  360 MATCH     pose=(5.32,1.31,30.9°)  score=0.874  d=(0.036,0.012,-0.076)  inl=204  raw=612  pts=204  di=1
+k=  370 MATCH     pose=(5.65,1.38,1.3°)  score=0.906  d=(0.043,0.002,-0.013)  inl=203  raw=612  pts=203  di=1
+k=  380 MATCH     pose=(6.10,1.36,-14.3°)  score=0.888  d=(0.053,-0.007,-0.024)  inl=214  raw=605  pts=214  di=1
+k=  390 MATCH     pose=(6.58,1.34,-3.9°)  score=0.911  d=(0.048,-0.013,0.003)  inl=203  raw=595  pts=203  di=1
+k=  400 MATCH     pose=(7.07,1.38,3.5°)  score=0.872  d=(0.051,0.008,-0.001)  inl=202  raw=559  pts=202  di=1
+k=  410 MATCH     pose=(7.57,1.44,2.8°)  score=0.851  d=(0.055,-0.008,-0.004)  inl=201  raw=550  pts=201  di=1
+k=  420 MATCH     pose=(8.09,1.50,0.9°)  score=0.879  d=(0.046,0.010,-0.001)  inl=201  raw=559  pts=201  di=1
+k=  430 MATCH     pose=(8.60,1.51,-5.4°)  score=0.745  d=(0.041,-0.030,-0.055)  inl=203  raw=557  pts=203  di=1
+k=  440 MATCH     pose=(8.93,1.25,-65.5°)  score=0.870  d=(0.013,-0.036,-0.095)  inl=204  raw=595  pts=204  di=1
+k=  450 MATCH     pose=(8.90,0.89,-109.1°)  score=0.902  d=(-0.010,-0.040,-0.012)  inl=208  raw=575  pts=208  di=1
+k=  460 MATCH     pose=(8.86,0.50,-97.0°)  score=0.920  d=(-0.009,-0.038,-0.005)  inl=202  raw=637  pts=202  di=1
+k=  470 MATCH     pose=(8.80,0.05,-108.9°)  score=0.844  d=(-0.019,-0.039,-0.102)  inl=212  raw=575  pts=212  di=1
+k=  480 MATCH     pose=(8.54,-0.25,-144.6°)  score=0.908  d=(-0.020,-0.030,-0.010)  inl=211  raw=592  pts=211  di=1
+k=  490 MATCH     pose=(8.17,-0.48,-154.7°)  score=0.907  d=(-0.051,-0.023,-0.024)  inl=201  raw=570  pts=201  di=1
+k=  500 MATCH     pose=(7.70,-0.48,167.9°)  score=0.926  d=(-0.043,0.010,-0.022)  inl=206  raw=513  pts=206  di=1
+k=  510 MATCH     pose=(7.28,-0.56,-162.9°)  score=0.918  d=(-0.032,-0.014,0.061)  inl=202  raw=531  pts=202  di=1
+k=  520 MATCH     pose=(7.07,-0.75,-134.9°)  score=0.926  d=(-0.015,-0.015,0.045)  inl=203  raw=581  pts=203  di=1
+k=  530 MATCH     pose=(6.97,-0.99,-109.9°)  score=0.924  d=(-0.002,-0.024,0.046)  inl=209  raw=560  pts=209  di=1
+k=  540 MATCH     pose=(6.91,-1.35,-105.9°)  score=0.907  d=(-0.010,-0.046,0.002)  inl=203  raw=390  pts=203  di=1
+k=  550 MATCH     pose=(6.81,-1.75,-107.2°)  score=0.898  d=(0.002,-0.016,0.002)  inl=202  raw=503  pts=202  di=1
+k=  560 MATCH     pose=(6.69,-2.02,-126.0°)  score=0.844  d=(-0.022,-0.028,-0.085)  inl=189  raw=454  pts=189  di=1
+k=  570 MATCH     pose=(6.37,-2.20,-164.8°)  score=0.907  d=(-0.040,-0.017,-0.014)  inl=195  raw=421  pts=195  di=1
+k=  580 MATCH     pose=(5.93,-2.24,163.1°)  score=0.887  d=(-0.039,0.009,-0.070)  inl=200  raw=438  pts=200  di=1
+k=  590 MATCH     pose=(5.71,-1.98,111.9°)  score=0.906  d=(-0.014,0.037,-0.090)  inl=200  raw=529  pts=200  di=1
+k=  600 MATCH     pose=(5.64,-1.56,90.3°)  score=0.920  d=(-0.006,0.049,-0.022)  inl=206  raw=549  pts=206  di=1
+k=  610 MATCH     pose=(5.66,-1.06,79.2°)  score=0.949  d=(-0.000,0.052,-0.023)  inl=202  raw=537  pts=202  di=1
+k=  620 MATCH     pose=(5.78,-0.58,68.5°)  score=0.945  d=(0.014,0.047,-0.018)  inl=208  raw=572  pts=208  di=1
+k=  630 MATCH     pose=(5.89,-0.13,75.9°)  score=0.908  d=(0.011,0.025,-0.020)  inl=219  raw=637  pts=219  di=1
+k=  640 MATCH     pose=(6.19,0.12,16.9°)  score=0.934  d=(0.051,0.012,-0.067)  inl=205  raw=612  pts=205  di=1
+k=  650 MATCH     pose=(6.63,0.26,11.4°)  score=0.969  d=(0.046,0.006,-0.012)  inl=200  raw=491  pts=200  di=1
+k=  660 MATCH     pose=(7.08,0.40,4.4°)  score=0.883  d=(0.042,0.000,-0.086)  inl=203  raw=612  pts=203  di=1
+k=  670 MATCH     pose=(7.47,0.29,-26.8°)  score=0.947  d=(0.035,-0.011,-0.022)  inl=202  raw=597  pts=202  di=1
+k=  680 MATCH     pose=(7.70,-0.05,-77.8°)  score=0.881  d=(0.009,-0.037,-0.091)  inl=204  raw=508  pts=204  di=1
+k=  690 MATCH     pose=(7.67,-0.43,-112.0°)  score=0.868  d=(-0.021,-0.032,-0.071)  inl=206  raw=502  pts=206  di=1
+k=  700 MATCH     pose=(7.36,-0.63,-170.5°)  score=0.931  d=(-0.037,-0.010,-0.109)  inl=209  raw=519  pts=209  di=1
+k=  710 MATCH     pose=(6.90,-0.64,178.3°)  score=0.955  d=(-0.044,-0.005,0.075)  inl=206  raw=556  pts=206  di=1
+k=  720 MATCH     pose=(6.48,-0.69,179.2°)  score=0.955  d=(-0.058,-0.007,-0.036)  inl=202  raw=460  pts=202  di=1
+k=  730 MATCH     pose=(5.96,-0.68,175.9°)  score=0.946  d=(-0.048,0.003,-0.001)  inl=201  raw=561  pts=201  di=1
+k=  740 MATCH     pose=(5.49,-0.68,173.5°)  score=0.941  d=(-0.044,0.006,-0.004)  inl=206  raw=574  pts=206  di=1
+k=  750 MATCH     pose=(5.19,-0.69,179.2°)  score=0.963  d=(-0.009,-0.001,-0.002)  inl=212  raw=539  pts=212  di=1
+k=  760 MATCH     pose=(5.06,-0.70,179.0°)  score=0.942  d=(-0.029,-0.004,-0.002)  inl=202  raw=506  pts=202  di=1
+k=  770 MATCH     pose=(4.65,-0.71,178.3°)  score=0.899  d=(-0.040,0.001,0.001)  inl=200  raw=487  pts=200  di=1
+k=  780 MATCH     pose=(4.16,-0.72,176.4°)  score=0.912  d=(-0.054,-0.000,-0.005)  inl=213  raw=553  pts=213  di=1
+k=  790 MATCH     pose=(3.64,-0.71,175.1°)  score=0.926  d=(-0.051,0.004,-0.001)  inl=200  raw=539  pts=200  di=1
+k=  800 MATCH     pose=(3.12,-0.70,173.3°)  score=0.951  d=(-0.049,-0.002,-0.003)  inl=210  raw=579  pts=210  di=1
+k=  810 MATCH     pose=(2.64,-0.65,170.3°)  score=0.899  d=(-0.037,0.019,-0.030)  inl=206  raw=596  pts=206  di=1
+k=  820 MATCH     pose=(2.37,-0.43,124.1°)  score=0.896  d=(-0.014,0.026,-0.064)  inl=200  raw=601  pts=200  di=1
+k=  830 MATCH     pose=(2.29,-0.12,88.6°)  score=0.936  d=(-0.002,0.047,-0.031)  inl=200  raw=597  pts=200  di=1
+k=  840 MATCH     pose=(2.19,0.20,108.9°)  score=0.891  d=(-0.011,0.027,0.050)  inl=200  raw=571  pts=200  di=1
+k=  850 MATCH     pose=(2.00,0.42,136.7°)  score=0.922  d=(-0.028,0.024,0.046)  inl=201  raw=601  pts=201  di=1
+k=  860 MATCH     pose=(1.73,0.50,164.4°)  score=0.920  d=(-0.025,0.007,0.049)  inl=205  raw=593  pts=205  di=1
+k=  870 MATCH     pose=(1.48,0.46,-170.0°)  score=0.916  d=(-0.020,-0.012,0.040)  inl=202  raw=577  pts=202  di=1
+k=  880 MATCH     pose=(1.26,0.35,-158.7°)  score=0.933  d=(-0.027,-0.015,-0.005)  inl=200  raw=592  pts=200  di=1
+k=  890 MATCH     pose=(0.84,0.28,-174.9°)  score=0.876  d=(-0.041,-0.015,0.057)  inl=201  raw=625  pts=201  di=1
+k=  900 MATCH     pose=(0.41,0.19,-173.6°)  score=0.913  d=(-0.044,-0.008,-0.007)  inl=201  raw=643  pts=201  di=1
+k=  910 MATCH     pose=(-0.06,0.11,-175.8°)  score=0.895  d=(-0.051,-0.007,-0.006)  inl=201  raw=628  pts=201  di=1
+k=  920 MATCH     pose=(-0.15,0.10,-176.4°)  score=0.902  d=(-0.002,-0.001,-0.004)  inl=207  raw=624  pts=207  di=1
+k=  930 MATCH     pose=(-0.15,0.10,-176.1°)  score=0.924  d=(-0.001,-0.001,-0.001)  inl=206  raw=618  pts=206  di=1
+k=  940 MATCH     pose=(-0.15,0.10,-176.0°)  score=0.931  d=(-0.002,-0.001,0.003)  inl=205  raw=628  pts=205  di=1
+k=  950 MATCH     pose=(-0.15,0.10,-176.0°)  score=0.931  d=(-0.005,0.002,0.001)  inl=205  raw=628  pts=205  di=1
+k=  960 MATCH     pose=(-0.15,0.10,-176.2°)  score=0.931  d=(-0.002,0.002,-0.002)  inl=206  raw=621  pts=206  di=1
+k=  970 MATCH     pose=(-0.15,0.11,-176.2°)  score=0.940  d=(0.001,0.001,-0.001)  inl=211  raw=624  pts=211  di=1
+k=  980 MATCH     pose=(-0.15,0.11,-176.1°)  score=0.944  d=(-0.003,-0.001,0.001)  inl=201  raw=629  pts=201  di=1
+k=  990 MATCH     pose=(-0.15,0.11,-176.1°)  score=0.943  d=(0.001,0.000,0.001)  inl=201  raw=630  pts=201  di=1
+k= 1000 MATCH     pose=(-0.15,0.11,-176.1°)  score=0.934  d=(0.003,0.000,-0.001)  inl=205  raw=625  pts=205  di=1
+k= 1010 MATCH     pose=(-0.15,0.11,-176.2°)  score=0.945  d=(0.001,0.001,-0.003)  inl=203  raw=626  pts=203  di=1
+k= 1020 MATCH     pose=(-0.15,0.11,-176.1°)  score=0.947  d=(0.001,-0.001,0.000)  inl=206  raw=636  pts=206  di=1
+k= 1030 MATCH     pose=(-0.16,0.11,-176.1°)  score=0.945  d=(-0.006,-0.001,0.001)  inl=204  raw=626  pts=204  di=1
+k= 1040 MATCH     pose=(-0.15,0.11,-176.2°)  score=0.939  d=(0.005,-0.001,-0.000)  inl=206  raw=632  pts=206  di=1
+k= 1050 MATCH     pose=(-0.15,0.11,-176.1°)  score=0.944  d=(-0.000,0.000,-0.001)  inl=201  raw=633  pts=201  di=1
+
+Wrote trajectory : hector_outputs/trajectory_lab_run_2_raw_scan_to_map_1052.txt
+Wrote debug log  : hector_outputs/trajectory_lab_run_2_raw_scan_to_map_1052_debug.txt

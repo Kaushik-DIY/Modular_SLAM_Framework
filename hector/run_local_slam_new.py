@@ -14,11 +14,10 @@ from slam_core.matching.core import MatcherManager
 from slam_core.matching.preprocessing import PointCloudProcessor, PointCloudProcessorConfig
 from slam_core.matching.scan_to_submap import (
     SubmapBuilder2D,
-    ScanToSubmapMatcher as _NewScanToSubmapMatcher,  # PyCeres-backed (not used here)
+    ScanToSubmapMatcher,
+    ScanToSubmapBackendConfig,
+    SubmapSearchWindow,
 )
-# The old pure-numpy matcher accepts a corr_params dict and has no PyCeres dependency.
-# It is the correct backend for the Hector runner's scan_to_submap mode.
-from slam_core.matching.scan_to_submap_old import ScanToSubmapMatcher as OldScanToSubmapMatcher
 from slam_core.matching.scan_to_map import ScanToMapMatcher
 
 from hector.adapter import (
@@ -57,6 +56,21 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Matcher type (overrides MATCHER_TYPE in config.py)",
     )
+    p.add_argument(
+        "--enable-pgo",
+        action="store_true",
+        dest="enable_pgo",
+        help="Enable online g2o pose-graph optimization (Cartographer-style global "
+             "SLAM: intra-submap + loop-closure constraints). Only for scan_to_submap.",
+    )
+    p.add_argument(
+        "--scans-per-submap",
+        type=int,
+        default=None,
+        dest="scans_per_submap",
+        help="Override SCANS_PER_SUBMAP. Smaller -> more submaps -> more loop-closure "
+             "opportunities for PGO (Cartographer uses ~90).",
+    )
     return p.parse_args()
 
 
@@ -71,6 +85,8 @@ def _apply_cli_overrides(args: argparse.Namespace) -> None:
         cfg.MAX_SCANS = args.max_scans
     if args.matcher is not None:
         cfg.MATCHER_TYPE = args.matcher
+    if getattr(args, "scans_per_submap", None) is not None:
+        cfg.SCANS_PER_SUBMAP = int(args.scans_per_submap)
 
 
 def _format_delta(delta) -> str:
@@ -135,6 +151,11 @@ def main():
     max_scans = cfg.MAX_SCANS
     verbose_every = cfg.VERBOSE_EVERY
 
+    enable_pgo = bool(getattr(args, "enable_pgo", False)) and matcher_type == "scan_to_submap"
+    if bool(getattr(args, "enable_pgo", False)) and matcher_type != "scan_to_submap":
+        print("[warn] --enable-pgo ignored: only valid with --matcher scan_to_submap")
+    print(f"Online PGO   : {'ON (g2o pose graph + loop closure)' if enable_pgo else 'OFF'}")
+
     if max_scans is not None:
         scans = scans[:int(max_scans)]
         print(f"Using first {len(scans)} scans (capped by MAX_SCANS={max_scans})")
@@ -182,22 +203,18 @@ def main():
     )
 
     if matcher_type == "scan_to_submap":
-        corr_params_submap = dict(
+        # Unified scan-to-submap front-end (shared with Cartographer pipeline).
+        # Native GaussNewtonLM local refinement (no pyceres dependency); g2o is
+        # reserved for the pose graph. Parameters come from the Hector profile.
+        submap_backend_config = ScanToSubmapBackendConfig(
+            backend_type="two_stage_bruteforce",
+            local_refine_backend="native",
+            reject_below_min_score=True,  # legacy Hector: FALLBACK on low score
             min_score=cfg.SUBMAP_MIN_SCORE,
             max_match_points=cfg.SUBMAP_MAX_MATCH_POINTS,
             max_refine_points=cfg.SUBMAP_MAX_REFINE_POINTS,
             min_valid=cfg.SUBMAP_MIN_VALID,
             precomp_levels=3,
-            coarse_level=2,
-            coarse_xy_window=cfg.SUBMAP_COARSE_XY_WINDOW,
-            coarse_th_window=cfg.SUBMAP_COARSE_TH_WINDOW,
-            coarse_xy_step=cfg.SUBMAP_COARSE_XY_STEP,
-            coarse_th_step=cfg.SUBMAP_COARSE_TH_STEP,
-            fine_level=0,
-            fine_xy_window=cfg.SUBMAP_FINE_XY_WINDOW,
-            fine_th_window=cfg.SUBMAP_FINE_TH_WINDOW,
-            fine_xy_step=cfg.SUBMAP_FINE_XY_STEP,
-            fine_th_step=cfg.SUBMAP_FINE_TH_STEP,
             do_refine=True,
             refine_min_points=cfg.SUBMAP_REFINE_MIN_POINTS,
             refine_w_trans=cfg.SUBMAP_REFINE_W_TRANS,
@@ -206,10 +223,24 @@ def main():
             refine_damping=1e-3,
             refine_step_clip_xy=0.10,
             refine_step_clip_th=float(np.deg2rad(5.0)),
+            coarse=SubmapSearchWindow(
+                xy_window=cfg.SUBMAP_COARSE_XY_WINDOW,
+                theta_window=cfg.SUBMAP_COARSE_TH_WINDOW,
+                xy_step=cfg.SUBMAP_COARSE_XY_STEP,
+                theta_step=cfg.SUBMAP_COARSE_TH_STEP,
+                level=2,
+            ),
+            fine=SubmapSearchWindow(
+                xy_window=cfg.SUBMAP_FINE_XY_WINDOW,
+                theta_window=cfg.SUBMAP_FINE_TH_WINDOW,
+                xy_step=cfg.SUBMAP_FINE_XY_STEP,
+                theta_step=cfg.SUBMAP_FINE_TH_STEP,
+                level=0,
+            ),
         )
-        matcher = OldScanToSubmapMatcher(
+        matcher = ScanToSubmapMatcher(
             submap_builder=submaps,
-            corr_params=corr_params_submap,
+            backend_config=submap_backend_config,
         )
 
     elif matcher_type == "scan_to_map":
@@ -264,6 +295,96 @@ def main():
     )
 
     # -------------------------------------------------------
+    # Online pose-graph back-end (Cartographer-style global SLAM via g2o)
+    # -------------------------------------------------------
+    pose_graph = None
+    global_slam = None
+    if enable_pgo:
+        from carto.pose_graph.pose_graph_2d import PoseGraph2D
+        from carto.pose_graph.backends.g2o_backend_2d import G2oBackend2D
+        from carto.pose_graph.global_slam_2d import CartoGlobalSlam2D
+        from carto.loop_closure_adapter import CartoLoopClosureAdapter
+        from slam_core.loop_closure import LoopClosureConfig
+
+        # Loop-closure detection matcher: branch-and-bound over finished submaps,
+        # native refine (no pyceres). Shares the SAME submap builder/front-end.
+        loop_backend_config = ScanToSubmapBackendConfig(
+            backend_type="branch_and_bound",
+            local_refine_backend="native",
+            min_score=float(getattr(cfg, "PGO_LOOP_MIN_SCORE", 0.50)),
+            global_localization_min_score=float(getattr(cfg, "PGO_LOOP_MIN_SCORE", 0.50)),
+            min_valid=cfg.SUBMAP_MIN_VALID,
+            precomp_levels=7,
+            do_refine=True,
+            max_match_points=cfg.SUBMAP_MAX_MATCH_POINTS,
+            max_refine_points=cfg.SUBMAP_MAX_REFINE_POINTS,
+            refine_min_points=cfg.SUBMAP_REFINE_MIN_POINTS,
+            refine_w_trans=cfg.SUBMAP_REFINE_W_TRANS,
+            refine_w_rot=cfg.SUBMAP_REFINE_W_ROT,
+            coarse=SubmapSearchWindow(
+                xy_window=float(getattr(cfg, "PGO_LOOP_SEARCH_XY", 7.0)),
+                theta_window=float(np.deg2rad(30.0)),
+                xy_step=0.05,
+                theta_step=0.02,
+                level=0,
+            ),
+            fine=None,
+            bnb_depth_limit=7,
+            bnb_min_rotational_step=0.02,
+            bnb_branching=4,
+        )
+        loop_matcher = ScanToSubmapMatcher(
+            submap_builder=submaps,
+            backend_config=loop_backend_config,
+        )
+
+        g2o_backend = G2oBackend2D(
+            huber_scale=1e1,
+            max_num_iterations=50,
+            local_slam_pose_translation_weight=1e5,
+            local_slam_pose_rotation_weight=1e5,
+        )
+        g2o_backend.set_fixed("submap", 0)
+        print("Using PGO backend:", type(g2o_backend).__name__)
+
+        pose_graph = PoseGraph2D(
+            backend=g2o_backend,
+            submap_builder=submaps,
+            intra_translation_weight=5e2,
+            intra_rotation_weight=1.6e3,
+        )
+
+        loop_config = LoopClosureConfig(
+            min_score=float(getattr(cfg, "PGO_LOOP_MIN_SCORE", 0.50)),
+            translation_weight=1.1e4,
+            rotation_weight=1e5,
+            min_node_index_separation=int(getattr(cfg, "PGO_MIN_NODE_SEPARATION", 30)),
+            spatial_search_radius=float(getattr(cfg, "PGO_SPATIAL_SEARCH_RADIUS", 8.0)),
+            max_candidate_targets_per_new_node=3,
+            historical_node_stride=3,
+            # Bound loop-search cost: branch-and-bound over every finished submap for
+            # EVERY node explodes when there are many submaps. Checking every Nth node
+            # is plenty (the robot moves slowly) and keeps runtime sane.
+            check_every_n_nodes=int(getattr(cfg, "PGO_CHECK_EVERY_N_NODES", 5)),
+            # Lab has few submaps (SCANS_PER_SUBMAP=500 -> ~2 finished). With the
+            # default exclusion of 2, ALL finished submaps are excluded as "recent"
+            # and zero loop candidates are ever generated. 0 lets the robot close
+            # the loop against the start submap when it returns near the origin.
+            recent_finished_submap_exclusion=int(getattr(cfg, "PGO_RECENT_SUBMAP_EXCLUSION", 0)),
+        )
+        global_slam = CartoGlobalSlam2D(
+            loop_closure_adapter=CartoLoopClosureAdapter(
+                matcher=loop_matcher,
+                pose_graph=pose_graph,
+                config=loop_config,
+            ),
+            pose_graph=pose_graph,
+            optimize_every_n_nodes=int(getattr(cfg, "PGO_OPTIMIZE_EVERY_N_NODES", 90)),
+            adapter=None,            # submap write-back is enough; no extrapolator nudge
+            correction_alpha=0.5,
+        )
+
+    # -------------------------------------------------------
     # Adapter
     # -------------------------------------------------------
     adapter = HectorLocalSlamAdapter(
@@ -271,6 +392,9 @@ def main():
         extrapolator=extrap,
         motion_params=(None if matcher_type == "scan_to_map" else motion_params),
         use_extrapolator=use_extrapolator,
+        pose_graph=pose_graph,
+        global_slam=global_slam,
+        solve_every_n_nodes=int(getattr(cfg, "PGO_OPTIMIZE_EVERY_N_NODES", 90)),
     )
 
     # -------------------------------------------------------
@@ -297,6 +421,10 @@ def main():
     # -------------------------------------------------------
     _prev_submap_count   = 0
     _prev_finished_count = 0
+
+    # Per-scan records for dense optimized-trajectory reconstruction (PGO only):
+    # (t, online_pose, node_id_of_most_recent_keyframe).
+    pgo_scan_records: list = []
 
     with open(traj_path, "w") as f_traj, open(meta_path, "w") as f_meta:
         f_meta.write(f"# dataset_name={cfg.DATASET_NAME}\n")
@@ -329,6 +457,9 @@ def main():
                 odom_pose_world=odom,
                 odom_alpha=(cfg.ODOM_ALPHA if odom is not None else 0.0),
             )
+
+            if enable_pgo:
+                pgo_scan_records.append((t, pose, int(adapter.last_node_id)))
 
             # Preserve the actual matcher score even on failure so diagnostics
             # show what the score really was (not a misleading -1.0).
@@ -421,6 +552,58 @@ def main():
 
     print(f"\nWrote trajectory : {traj_path}")
     print(f"Wrote debug log  : {meta_path}")
+
+    # -------------------------------------------------------
+    # Online PGO: final optimization pass + optimized trajectory export
+    # -------------------------------------------------------
+    if enable_pgo and pose_graph is not None:
+        print("\nRunning final pose-graph optimization...")
+        adapter.finalize()
+
+        counts = pose_graph.get_constraint_counts()
+        print(
+            f"  Pose graph: {len(pose_graph.nodes)} nodes, "
+            f"{len(pose_graph.submaps)} submaps, "
+            f"constraints total={counts['total']} intra={counts['intra']} loop={counts['loop']}"
+        )
+        if global_slam is not None:
+            lc = global_slam.get_stats()
+            print(
+                f"  Loop closure: candidates={lc['candidate_pairs']} "
+                f"accepted={lc['accepted_pairs']} rejected={lc['rejected_pairs']}"
+            )
+
+        # Export a DENSE optimized trajectory (one pose per processed scan) so it
+        # aligns 1:1 with the online trajectory for downstream map rebuild. Each
+        # scan inherits the rigid SE(2) correction of its most recent keyframe
+        # node: delta = T_opt_node * inv(T_online_node); corrected = delta * T_scan.
+        from slam_core.common.se2 import pose_compose, inverse_pose
+
+        node_delta = {}  # node_id -> correction Pose2 (left-multiplied)
+        for nd in pose_graph.nodes:
+            nid = int(nd.id)
+            online = pose_graph.drifted_nodes.get(nid)  # pose at insertion (pre-solve)
+            if online is None:
+                continue
+            optimized = nd.pose                          # post-solve pose
+            node_delta[nid] = pose_compose(optimized, inverse_pose(online))
+
+        identity = Pose2(0.0, 0.0, 0.0)
+        pgo_path = f"hector_outputs/trajectory_{dataset_tag}_{matcher_type}_{len(scans)}_pgo.txt"
+        max_corr = 0.0
+        with open(pgo_path, "w") as f_pgo:
+            for (t_s, pose_s, nid) in pgo_scan_records:
+                delta = node_delta.get(int(nid), identity)
+                corrected = pose_compose(delta, pose_s)
+                max_corr = max(max_corr, float(np.hypot(corrected.x - pose_s.x, corrected.y - pose_s.y)))
+                f_pgo.write(
+                    f"{t_s:.6f} {corrected.x:.6f} {corrected.y:.6f} {corrected.theta:.6f} 1.000000\n"
+                )
+        print(
+            f"Wrote optimized PGO trajectory : {pgo_path}  "
+            f"({len(pgo_scan_records)} scans, {len(pose_graph.nodes)} keyframes, "
+            f"max correction={max_corr:.3f}m)"
+        )
 
     # Final submap summary
     if matcher_type == "scan_to_submap":
