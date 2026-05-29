@@ -123,6 +123,74 @@ def _bruteforce_search(
     return best_pose, best_score
 
 
+def _bruteforce_search_vectorized(
+    stack: PrecomputationGridStack,
+    level: int,
+    grid_origin_xy: np.ndarray,
+    res: float,
+    points_local: np.ndarray,
+    center_pose: Pose2,
+    xy_window: float,
+    th_window: float,
+    xy_step: float,
+    th_step: float,
+    min_valid: int,
+) -> Tuple[Pose2, float]:
+    """Vectorized equivalent of `_bruteforce_search`.
+
+    Same scoring (nearest-cell mean occupancy, same in-bounds / min_valid rule) but the
+    point rotation is hoisted out of the translation loops and all (dx, dy) translations
+    are scored with batched NumPy instead of ~thousands of Python calls. Scores match the
+    scalar version; ties may resolve to a different (equal-score) candidate, so this is
+    used only on the opt-in fast path, not the bit-identical default path.
+    """
+    img = stack.levels[int(level)]
+    h, w = img.shape
+    scale = float(2 ** int(level))
+
+    xs = np.arange(-xy_window, xy_window + 1e-9, xy_step)
+    ys = np.arange(-xy_window, xy_window + 1e-9, xy_step)
+    ths = np.arange(-th_window, th_window + 1e-9, th_step)
+
+    px = points_local[:, 0]
+    py = points_local[:, 1]
+    ox = xs / (res * scale)            # (Nx,) grid-cell offsets for dx
+    oy = ys / (res * scale)            # (Ny,)
+
+    best_score = -1e9
+    best_pose = center_pose
+    for dth in ths:
+        th = wrap_angle(center_pose.theta + float(dth))
+        c, s = np.cos(th), np.sin(th)
+        bpx = c * px - s * py + center_pose.x
+        bpy = s * px + c * py + center_pose.y
+        base_x = (bpx - grid_origin_xy[0]) / (res * scale)   # (P,)
+        base_y = (bpy - grid_origin_xy[1]) / (res * scale)
+
+        gx = np.rint(base_x[:, None] + ox[None, :]).astype(np.int32)   # (P, Nx)
+        gy = np.rint(base_y[:, None] + oy[None, :]).astype(np.int32)   # (P, Ny)
+        vx = (gx >= 0) & (gx < w)
+        vy = (gy >= 0) & (gy < h)
+        gxc = np.clip(gx, 0, w - 1)
+        gyc = np.clip(gy, 0, h - 1)
+
+        # vals[p, i, j] = img[gyc[p, j], gxc[p, i]]
+        vals = img[gyc[:, None, :], gxc[:, :, None]]          # (P, Nx, Ny)
+        V = vx[:, :, None] & vy[:, None, :]                    # (P, Nx, Ny)
+        cnt = V.sum(axis=0)                                    # (Nx, Ny)
+        ssum = np.where(V, vals, 0.0).sum(axis=0)              # (Nx, Ny)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            score = np.where(cnt >= min_valid, ssum / np.maximum(cnt, 1), -1e9)
+
+        idx = int(np.argmax(score))
+        i, j = np.unravel_index(idx, score.shape)
+        if float(score[i, j]) > best_score:
+            best_score = float(score[i, j])
+            best_pose = Pose2(center_pose.x + float(xs[i]), center_pose.y + float(ys[j]), th)
+
+    return best_pose, best_score
+
+
 def correlative_match_two_stage(
     prob_img: np.ndarray,
     grid_origin_xy: np.ndarray,
@@ -141,10 +209,12 @@ def correlative_match_two_stage(
     fine_th_window: float = 0.12,
     fine_xy_step: float = 0.05,
     fine_th_step: float = 0.02,
+    vectorized: bool = False,
 ) -> Tuple[Pose2, float]:
     stack = PrecomputationGridStack(prob_img, num_levels=int(precomp_levels))
+    search = _bruteforce_search_vectorized if vectorized else _bruteforce_search
 
-    coarse_pose, _ = _bruteforce_search(
+    coarse_pose, _ = search(
         stack=stack,
         level=int(coarse_level),
         grid_origin_xy=grid_origin_xy,
@@ -158,7 +228,7 @@ def correlative_match_two_stage(
         min_valid=min_valid,
     )
 
-    fine_pose, fine_score = _bruteforce_search(
+    fine_pose, fine_score = search(
         stack=stack,
         level=int(fine_level),
         grid_origin_xy=grid_origin_xy,

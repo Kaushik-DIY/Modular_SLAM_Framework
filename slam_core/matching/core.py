@@ -162,21 +162,45 @@ class MatcherManager:
 
         self._switch_requested = False
         self._target_matcher_name: Optional[str] = None
+        # Scans the ORIGINAL matcher keeps running after a switch request before the
+        # switch takes effect (the grace/buffer window). Decremented once per scan in
+        # maybe_activate_pending (called exactly once per scan by the adapter).
+        self._grace_remaining: int = 0
 
     @property
     def switch_requested(self) -> bool:
         return self._switch_requested
 
-    def request_switch(self, new_matcher: ScanMatcherBase) -> None:
+    @property
+    def grace_remaining(self) -> int:
+        return self._grace_remaining
+
+    def request_switch(self, new_matcher: ScanMatcherBase, grace_scans: int = 0) -> None:
         """
-        Request a switch. Actual switch occurs only when the pending matcher
-        is successfully initialized from the rolling matched-scan buffer.
+        Request a switch to ``new_matcher``, effective after ``grace_scans`` more scans
+        (during which the current matcher keeps running). The actual switch additionally
+        waits until the rolling matched-scan buffer is ready, then warm-starts the new
+        matcher from it.
+
+        Edge handling:
+          - switching to the already-active matcher cancels any pending switch (no-op);
+          - re-requesting the SAME pending target is ignored (the countdown is not reset);
+          - requesting a DIFFERENT target while one is pending replaces it and resets the
+            countdown (last request wins).
         """
         if new_matcher is self.active_matcher:
+            # Cancel any in-flight switch back toward where we already are.
+            self.pending_matcher = None
+            self._target_matcher_name = None
+            self._switch_requested = False
+            self._grace_remaining = 0
+            return
+        if self._switch_requested and new_matcher is self.pending_matcher:
             return
         self.pending_matcher = new_matcher
         self._target_matcher_name = new_matcher.name
         self._switch_requested = True
+        self._grace_remaining = max(0, int(grace_scans))
 
     def maybe_activate_pending(self) -> bool:
         """
@@ -184,6 +208,10 @@ class MatcherManager:
         Returns True if switch was completed.
         """
         if not self._switch_requested or self.pending_matcher is None:
+            return False
+
+        if self._grace_remaining > 0:
+            self._grace_remaining -= 1
             return False
 
         if not self.buffer.is_ready(self.min_buffer_for_switch):

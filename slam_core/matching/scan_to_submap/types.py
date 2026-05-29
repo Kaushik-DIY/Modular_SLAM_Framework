@@ -75,6 +75,12 @@ class ScanToSubmapBackendConfig:
     # Default False keeps the Cartographer always-refine behaviour.
     reject_below_min_score: bool = False
 
+    # When True, the discrete correlative search uses the VECTORIZED (batched NumPy)
+    # brute-force scorer instead of the per-candidate Python loop. Same full search window
+    # and scoring (so match quality is the same), ~10x faster. Off by default so the
+    # original scalar path stays bit-identical; the fast runner turns it on.
+    use_vectorized_search: bool = False
+
     # Search windows.
     coarse: Optional[SubmapSearchWindow] = None
     fine: Optional[SubmapSearchWindow] = None

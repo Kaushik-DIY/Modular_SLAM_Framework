@@ -22,6 +22,7 @@ from slam_core.matching.scan_to_map import ScanToMapMatcher
 
 from hector.adapter import (
     HectorLocalSlamAdapter,
+    MotionFilterParams,
     make_motion_filter_from_expected_velocity,
 )
 
@@ -70,6 +71,39 @@ def _parse_args() -> argparse.Namespace:
         dest="scans_per_submap",
         help="Override SCANS_PER_SUBMAP. Smaller -> more submaps -> more loop-closure "
              "opportunities for PGO (Cartographer uses ~90).",
+    )
+    p.add_argument(
+        "--use-extrapolator",
+        action="store_true",
+        dest="use_extrapolator",
+        help="Force the constant-velocity pose extrapolator ON (overrides the "
+             "per-dataset USE_EXTRAPOLATOR). Implied by --use-imu / "
+             "--use-motion-filter.",
+    )
+    p.add_argument(
+        "--use-imu",
+        action="store_true",
+        dest="use_imu",
+        help="Feed the dataset IMU (gyro yaw-rate + quaternion heading) into the "
+             "extrapolator so the GN prior tracks rotation accurately. Forces the "
+             "extrapolator ON. Only datasets with an imu_path (lab_run_2).",
+    )
+    p.add_argument(
+        "--use-motion-filter",
+        action="store_true",
+        dest="use_motion_filter",
+        help="Cartographer-style motion-filter keyframing for scan_to_map: skip GN "
+             "matching on sub-threshold scans (dead-reckon them via the "
+             "extrapolator). Fewer GN solves; forces the extrapolator ON.",
+    )
+    p.add_argument(
+        "--vectorized-search",
+        action="store_true",
+        dest="vectorized_search",
+        help="scan_to_submap only: run the correlative search vectorized (batched "
+             "NumPy) instead of the scalar Python loop. ~10x faster, same scores "
+             "(exact ties may resolve to a different equal-score pose). Default OFF "
+             "= scalar (deterministic, byte-identical baseline).",
     )
     return p.parse_args()
 
@@ -126,7 +160,22 @@ def main():
     if not scans:
         raise RuntimeError(f"No scans loaded from {profile.scan_path}")
 
-    use_extrapolator = getattr(cfg, "USE_EXTRAPOLATOR", True)
+    # Opt-in IMU-aided extrapolator + motion-filter keyframing. Either of
+    # --use-imu / --use-motion-filter forces the extrapolator on (both depend
+    # on it). Defaults preserve the per-dataset baseline path.
+    use_motion_filter = bool(getattr(args, "use_motion_filter", False)) \
+        or bool(getattr(cfg, "USE_MOTION_FILTER", False))
+    use_imu = bool(getattr(args, "use_imu", False)) \
+        or bool(getattr(cfg, "USE_IMU", False))
+    use_extrapolator = (
+        bool(getattr(args, "use_extrapolator", False))
+        or bool(getattr(cfg, "USE_EXTRAPOLATOR", True))
+        or use_imu
+        or use_motion_filter
+    )
+    # scan_to_submap correlative-search executor (opt-in; default scalar/stable).
+    use_vectorized_search = bool(getattr(args, "vectorized_search", False)) \
+        or bool(getattr(cfg, "SUBMAP_VECTORIZED_SEARCH", False))
 
     print("=" * 60)
     print(f"Dataset      : {cfg.DATASET_NAME}")
@@ -143,6 +192,13 @@ def main():
     print(f"Total scans  : {len(scans)}")
     print(f"Matcher      : {cfg.MATCHER_TYPE}")
     print(f"Extrapolator : {'ON' if use_extrapolator else 'OFF (raw odom / last pose)'}")
+    print(f"IMU aiding   : {'ON' if use_imu else 'OFF'}")
+    print(f"Motion filter: {'ON (keyframe skip)' if use_motion_filter else 'OFF (match every scan)'}")
+    if use_motion_filter and not use_imu and profile.imu_path is not None:
+        print("[warn] Motion filter is ON but IMU is OFF. Skipped scans are dead-reckoned "
+              "by constant-velocity only, which drifts badly through turns. Add --use-imu.")
+    if cfg.MATCHER_TYPE == "scan_to_submap":
+        print(f"Corr. search : {'VECTORIZED (batched NumPy)' if use_vectorized_search else 'scalar (Python loop)'}")
     print(f"Odom alpha   : {cfg.ODOM_ALPHA}")
     print(f"Voxel filter : {cfg.VOXEL_FILTER_ENABLED}")
     print("=" * 60)
@@ -199,7 +255,7 @@ def main():
         min_inliers_accept=cfg.CORR_MAP_MIN_INLIERS,
         min_score=cfg.CORR_MAP_MIN_SCORE,
         step_clip_xy=cfg.CORR_MAP_STEP_CLIP_XY,
-        step_clip_th=np.deg2rad(1.0),
+        step_clip_th=np.deg2rad(cfg.GN_STEP_CLIP_TH_DEG),
     )
 
     if matcher_type == "scan_to_submap":
@@ -209,33 +265,34 @@ def main():
         submap_backend_config = ScanToSubmapBackendConfig(
             backend_type="two_stage_bruteforce",
             local_refine_backend="native",
+            use_vectorized_search=use_vectorized_search,
             reject_below_min_score=True,  # legacy Hector: FALLBACK on low score
             min_score=cfg.SUBMAP_MIN_SCORE,
             max_match_points=cfg.SUBMAP_MAX_MATCH_POINTS,
             max_refine_points=cfg.SUBMAP_MAX_REFINE_POINTS,
             min_valid=cfg.SUBMAP_MIN_VALID,
-            precomp_levels=3,
+            precomp_levels=cfg.SUBMAP_PRECOMP_LEVELS,
             do_refine=True,
             refine_min_points=cfg.SUBMAP_REFINE_MIN_POINTS,
             refine_w_trans=cfg.SUBMAP_REFINE_W_TRANS,
             refine_w_rot=cfg.SUBMAP_REFINE_W_ROT,
-            refine_iters=12,
-            refine_damping=1e-3,
-            refine_step_clip_xy=0.10,
-            refine_step_clip_th=float(np.deg2rad(5.0)),
+            refine_iters=cfg.SUBMAP_REFINE_ITERS,
+            refine_damping=cfg.SUBMAP_REFINE_DAMPING,
+            refine_step_clip_xy=cfg.SUBMAP_REFINE_STEP_CLIP_XY,
+            refine_step_clip_th=float(np.deg2rad(cfg.SUBMAP_REFINE_STEP_CLIP_TH_DEG)),
             coarse=SubmapSearchWindow(
                 xy_window=cfg.SUBMAP_COARSE_XY_WINDOW,
                 theta_window=cfg.SUBMAP_COARSE_TH_WINDOW,
                 xy_step=cfg.SUBMAP_COARSE_XY_STEP,
                 theta_step=cfg.SUBMAP_COARSE_TH_STEP,
-                level=2,
+                level=cfg.SUBMAP_COARSE_LEVEL,
             ),
             fine=SubmapSearchWindow(
                 xy_window=cfg.SUBMAP_FINE_XY_WINDOW,
                 theta_window=cfg.SUBMAP_FINE_TH_WINDOW,
                 xy_step=cfg.SUBMAP_FINE_XY_STEP,
                 theta_step=cfg.SUBMAP_FINE_TH_STEP,
-                level=0,
+                level=cfg.SUBMAP_FINE_LEVEL,
             ),
         )
         matcher = ScanToSubmapMatcher(
@@ -266,8 +323,8 @@ def main():
 
     matcher_manager = MatcherManager(
         active_matcher=matcher,
-        rolling_buffer_size=30,
-        min_buffer_for_switch=20,
+        rolling_buffer_size=cfg.ROLLING_BUFFER_SIZE,
+        min_buffer_for_switch=cfg.MIN_BUFFER_FOR_SWITCH,
     )
 
     # -------------------------------------------------------
@@ -277,11 +334,28 @@ def main():
         max_dt=cfg.EXTRAP_MAX_DT,
         init_vxy=cfg.EXTRAP_INIT_VXY,
         init_wz=cfg.EXTRAP_INIT_WZ,
+        use_imu=use_imu,
+        imu_yaw_correction_alpha=float(getattr(cfg, "IMU_YAW_CORRECTION_ALPHA", 0.02)),
     )
+
+    # -------------------------------------------------------
+    # IMU samples (gyro yaw-rate + quaternion heading) for the extrapolator
+    # -------------------------------------------------------
+    imu_samples: list = []   # sorted (timestamp, wz, yaw)
+    if use_imu:
+        if profile.imu_path is None or not os.path.exists(str(profile.imu_path)):
+            print(f"[warn] --use-imu requested but no IMU file for {cfg.DATASET_NAME}; "
+                  "extrapolator falls back to pose-derived velocity only.")
+        else:
+            from slam_core.dataio.imu_csv import read_imu_csv
+            from carto.local_slam.imu_extrapolation import imu_rows_to_samples
+            imu_samples = imu_rows_to_samples(read_imu_csv(str(profile.imu_path)))
+            print(f"IMU samples  : {len(imu_samples)} loaded from {profile.imu_path}")
 
     # -------------------------------------------------------
     # Motion filter
     # -------------------------------------------------------
+    # Velocity-derived thresholds (legacy, used by scan_to_submap orchestration).
     motion_params = make_motion_filter_from_expected_velocity(
         target_insert_period_s=cfg.TARGET_INSERT_PERIOD_S,
         v_expected_mps=cfg.V_EXPECTED_MPS,
@@ -293,6 +367,25 @@ def main():
         f"  dist={motion_params.max_distance_meters:.3f}m"
         f"  angle={np.rad2deg(motion_params.max_angle_radians):.2f}deg"
     )
+
+    # Explicit keyframe thresholds for scan_to_map motion-filter skip mode.
+    # Built directly from MF_* config so "crosses threshold" is unambiguous.
+    mf_keyframe_params = MotionFilterParams(
+        max_time_seconds=float(getattr(cfg, "MF_MAX_TIME_S", 0.5)),
+        max_distance_meters=float(getattr(cfg, "MF_MAX_DIST_M", 0.10)),
+        max_angle_radians=float(np.deg2rad(float(getattr(cfg, "MF_MAX_ANGLE_DEG", 2.0)))),
+        min_distance_meters=0.0,
+        min_angle_radians=0.0,
+        max_distance_cap_meters=10.0,
+        max_angle_cap_radians=np.deg2rad(180.0),
+    )
+    if use_motion_filter:
+        print(
+            "MotionFilter keyframe thresholds (scan_to_map skip):"
+            f"  time={mf_keyframe_params.max_time_seconds:.3f}s"
+            f"  dist={mf_keyframe_params.max_distance_meters:.3f}m"
+            f"  angle={np.rad2deg(mf_keyframe_params.max_angle_radians):.2f}deg"
+        )
 
     # -------------------------------------------------------
     # Online pose-graph back-end (Cartographer-style global SLAM via g2o)
@@ -311,10 +404,10 @@ def main():
         loop_backend_config = ScanToSubmapBackendConfig(
             backend_type="branch_and_bound",
             local_refine_backend="native",
-            min_score=float(getattr(cfg, "PGO_LOOP_MIN_SCORE", 0.50)),
-            global_localization_min_score=float(getattr(cfg, "PGO_LOOP_MIN_SCORE", 0.50)),
+            min_score=float(cfg.PGO_LOOP_MIN_SCORE),
+            global_localization_min_score=float(cfg.PGO_LOOP_MIN_SCORE),
             min_valid=cfg.SUBMAP_MIN_VALID,
-            precomp_levels=7,
+            precomp_levels=int(cfg.PGO_LOOP_PRECOMP_LEVELS),
             do_refine=True,
             max_match_points=cfg.SUBMAP_MAX_MATCH_POINTS,
             max_refine_points=cfg.SUBMAP_MAX_REFINE_POINTS,
@@ -322,16 +415,16 @@ def main():
             refine_w_trans=cfg.SUBMAP_REFINE_W_TRANS,
             refine_w_rot=cfg.SUBMAP_REFINE_W_ROT,
             coarse=SubmapSearchWindow(
-                xy_window=float(getattr(cfg, "PGO_LOOP_SEARCH_XY", 7.0)),
-                theta_window=float(np.deg2rad(30.0)),
+                xy_window=float(cfg.PGO_LOOP_SEARCH_XY),
+                theta_window=float(np.deg2rad(cfg.PGO_LOOP_SEARCH_TH_DEG)),
                 xy_step=0.05,
                 theta_step=0.02,
                 level=0,
             ),
             fine=None,
-            bnb_depth_limit=7,
-            bnb_min_rotational_step=0.02,
-            bnb_branching=4,
+            bnb_depth_limit=int(cfg.PGO_LOOP_BNB_DEPTH),
+            bnb_min_rotational_step=float(cfg.PGO_LOOP_BNB_MIN_ROT_STEP),
+            bnb_branching=int(cfg.PGO_LOOP_BNB_BRANCHING),
         )
         loop_matcher = ScanToSubmapMatcher(
             submap_builder=submaps,
@@ -339,10 +432,10 @@ def main():
         )
 
         g2o_backend = G2oBackend2D(
-            huber_scale=1e1,
-            max_num_iterations=50,
-            local_slam_pose_translation_weight=1e5,
-            local_slam_pose_rotation_weight=1e5,
+            huber_scale=float(cfg.PGO_HUBER_SCALE),
+            max_num_iterations=int(cfg.PGO_MAX_ITERATIONS),
+            local_slam_pose_translation_weight=float(cfg.PGO_LOCAL_TRANS_WEIGHT),
+            local_slam_pose_rotation_weight=float(cfg.PGO_LOCAL_ROT_WEIGHT),
         )
         g2o_backend.set_fixed("submap", 0)
         print("Using PGO backend:", type(g2o_backend).__name__)
@@ -350,27 +443,27 @@ def main():
         pose_graph = PoseGraph2D(
             backend=g2o_backend,
             submap_builder=submaps,
-            intra_translation_weight=5e2,
-            intra_rotation_weight=1.6e3,
+            intra_translation_weight=float(cfg.PGO_INTRA_TRANS_WEIGHT),
+            intra_rotation_weight=float(cfg.PGO_INTRA_ROT_WEIGHT),
         )
 
         loop_config = LoopClosureConfig(
-            min_score=float(getattr(cfg, "PGO_LOOP_MIN_SCORE", 0.50)),
-            translation_weight=1.1e4,
-            rotation_weight=1e5,
-            min_node_index_separation=int(getattr(cfg, "PGO_MIN_NODE_SEPARATION", 30)),
-            spatial_search_radius=float(getattr(cfg, "PGO_SPATIAL_SEARCH_RADIUS", 8.0)),
-            max_candidate_targets_per_new_node=3,
-            historical_node_stride=3,
+            min_score=float(cfg.PGO_LOOP_MIN_SCORE),
+            translation_weight=float(cfg.PGO_LOOP_TRANS_WEIGHT),
+            rotation_weight=float(cfg.PGO_LOOP_ROT_WEIGHT),
+            min_node_index_separation=int(cfg.PGO_MIN_NODE_SEPARATION),
+            spatial_search_radius=float(cfg.PGO_SPATIAL_SEARCH_RADIUS),
+            max_candidate_targets_per_new_node=int(cfg.PGO_MAX_CANDIDATE_TARGETS),
+            historical_node_stride=int(cfg.PGO_HISTORICAL_NODE_STRIDE),
             # Bound loop-search cost: branch-and-bound over every finished submap for
             # EVERY node explodes when there are many submaps. Checking every Nth node
             # is plenty (the robot moves slowly) and keeps runtime sane.
-            check_every_n_nodes=int(getattr(cfg, "PGO_CHECK_EVERY_N_NODES", 5)),
+            check_every_n_nodes=int(cfg.PGO_CHECK_EVERY_N_NODES),
             # Lab has few submaps (SCANS_PER_SUBMAP=500 -> ~2 finished). With the
             # default exclusion of 2, ALL finished submaps are excluded as "recent"
             # and zero loop candidates are ever generated. 0 lets the robot close
             # the loop against the start submap when it returns near the origin.
-            recent_finished_submap_exclusion=int(getattr(cfg, "PGO_RECENT_SUBMAP_EXCLUSION", 0)),
+            recent_finished_submap_exclusion=int(cfg.PGO_RECENT_SUBMAP_EXCLUSION),
         )
         global_slam = CartoGlobalSlam2D(
             loop_closure_adapter=CartoLoopClosureAdapter(
@@ -379,22 +472,31 @@ def main():
                 config=loop_config,
             ),
             pose_graph=pose_graph,
-            optimize_every_n_nodes=int(getattr(cfg, "PGO_OPTIMIZE_EVERY_N_NODES", 90)),
+            optimize_every_n_nodes=int(cfg.PGO_OPTIMIZE_EVERY_N_NODES),
             adapter=None,            # submap write-back is enough; no extrapolator nudge
-            correction_alpha=0.5,
+            correction_alpha=float(cfg.PGO_CORRECTION_ALPHA),
         )
 
     # -------------------------------------------------------
     # Adapter
     # -------------------------------------------------------
+    # Baseline (no motion filter) cadence params per matcher:
+    #   scan_to_map  -> None (insert cadence handled by MAP_UPDATE_EVERY)
+    #   scan_to_submap -> velocity-derived motion_params (insertion cadence)
+    # When --use-motion-filter is set, the adapter switches the keyframe decision
+    # to mf_keyframe_params (the MF_* thresholds) for whichever front-end is active.
+    base_motion_params = None if matcher_type == "scan_to_map" else motion_params
+
     adapter = HectorLocalSlamAdapter(
         matcher_manager=matcher_manager,
         extrapolator=extrap,
-        motion_params=(None if matcher_type == "scan_to_map" else motion_params),
+        motion_params=base_motion_params,
         use_extrapolator=use_extrapolator,
         pose_graph=pose_graph,
         global_slam=global_slam,
-        solve_every_n_nodes=int(getattr(cfg, "PGO_OPTIMIZE_EVERY_N_NODES", 90)),
+        solve_every_n_nodes=int(cfg.PGO_OPTIMIZE_EVERY_N_NODES),
+        motion_filter_skip=use_motion_filter,
+        mf_keyframe_params=mf_keyframe_params,
     )
 
     # -------------------------------------------------------
@@ -413,8 +515,16 @@ def main():
     if cfg.DATASET_NAME == "lab_run_2":
         dataset_tag = f"lab_run_2_{cfg.DATASET_SCAN_VARIANT}"
 
-    traj_path = f"hector_outputs/trajectory_{dataset_tag}_{matcher_type}_{len(scans)}.txt"
-    meta_path = f"hector_outputs/trajectory_{dataset_tag}_{matcher_type}_{len(scans)}_debug.txt"
+    # Feature suffix keeps motion-filter / IMU runs from overwriting the
+    # baseline trajectory (and makes side-by-side map rebuilds easy).
+    feat_suffix = ""
+    if use_imu:
+        feat_suffix += "_imu"
+    if use_motion_filter:
+        feat_suffix += "_mf"
+
+    traj_path = f"hector_outputs/trajectory_{dataset_tag}_{matcher_type}{feat_suffix}_{len(scans)}.txt"
+    meta_path = f"hector_outputs/trajectory_{dataset_tag}_{matcher_type}{feat_suffix}_{len(scans)}_debug.txt"
 
     # -------------------------------------------------------
     # Main scan loop
@@ -425,6 +535,10 @@ def main():
     # Per-scan records for dense optimized-trajectory reconstruction (PGO only):
     # (t, online_pose, node_id_of_most_recent_keyframe).
     pgo_scan_records: list = []
+
+    # IMU playback cursor: samples are fed into the extrapolator in time order,
+    # up to each scan's timestamp, before that scan is processed.
+    imu_idx = 0
 
     with open(traj_path, "w") as f_traj, open(meta_path, "w") as f_meta:
         f_meta.write(f"# dataset_name={cfg.DATASET_NAME}\n")
@@ -437,6 +551,14 @@ def main():
 
         for k, s in enumerate(scans):
             t = float(s["t"])
+
+            # Feed all IMU samples up to this scan's time so the extrapolator's
+            # gyro yaw-rate / heading reflect motion since the previous scan.
+            while imu_idx < len(imu_samples) and imu_samples[imu_idx][0] <= t:
+                ts_i, wz_i, yaw_i = imu_samples[imu_idx]
+                extrap.add_imu(ts_i, wz_i, yaw_i)
+                imu_idx += 1
+
             odom_raw = s.get("odom")
             odom = Pose2(*odom_raw) if odom_raw is not None else None
 
@@ -464,7 +586,12 @@ def main():
             # Preserve the actual matcher score even on failure so diagnostics
             # show what the score really was (not a misleading -1.0).
             score = float(result.score)
-            mode  = "MATCH" if result.success else "FALLBACK"
+            if getattr(result, "method", "") == "motion_filter_skip":
+                mode = "SKIP"
+            elif result.success:
+                mode = "MATCH"
+            else:
+                mode = "FALLBACK"
 
             # Print a one-line diagnosis for every non-bootstrap FALLBACK.
             # Only score and inlier gates remain (jump gates removed per original).
@@ -552,6 +679,14 @@ def main():
 
     print(f"\nWrote trajectory : {traj_path}")
     print(f"Wrote debug log  : {meta_path}")
+
+    if use_motion_filter:
+        total = adapter.matched_count + adapter.skipped_count
+        print(
+            f"Motion filter   : {adapter.matched_count} keyframes GN-matched, "
+            f"{adapter.skipped_count} scans dead-reckoned (skipped) of {total} "
+            f"→ {100.0 * adapter.skipped_count / max(1, total):.1f}% of GN solves avoided"
+        )
 
     # -------------------------------------------------------
     # Online PGO: final optimization pass + optimized trajectory export

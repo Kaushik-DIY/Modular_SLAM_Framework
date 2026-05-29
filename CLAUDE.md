@@ -1,58 +1,50 @@
-# CLAUDE.md — Hector scan-to-submap + g2o PGO task
+*General Excution Rules*
 
-## Objective
-Make Hector `scan_to_submap` match or beat `scan_to_map` on the lab dataset by (1) unifying a single
-shared scan-to-submap front-end, (2) adding an online Cartographer-style pose-graph back-end, and
-(3) using a g2o SE2 solver instead of scipy/pyceres.
+1. Think Before Coding
+Don't assume. Don't hide confusion. Surface tradeoffs.
 
-## Why (root cause)
-`scan_to_map` keeps ONE global occupancy grid forever, so in a small looping room every scan
-re-matches against all prior geometry — an implicit "perfect loop closure" every frame → low drift.
-`scan_to_submap` is a front-end ONLY: it matches one active submap, drops finished submaps, and has
-no online pose graph, so drift accumulates at submap handoffs and revisits are invisible.
-Cartographer's submaps only win when paired with the global pose-graph back-end (intra-submap
-constraints + inter-submap loop closures + optimization fed back into submap poses).
+Before implementing:
 
-## Architecture (after this work)
-- Front-end (ONE shared module): `slam_core/matching/scan_to_submap/` — local correlative + GN
-  scan-to-submap, used by BOTH Hector and Cartographer with separate config profiles. Do NOT create a
-  second copy; `scan_to_submap_old.py` is removed.
-- Back-end (reused from carto): `carto/pose_graph/` — `PoseGraph2D` holds nodes/submaps/constraints;
-  `CartoGlobalSlam2D` runs loop-closure search + periodic optimize + write-back online.
-- Solver: `carto/pose_graph/backends/g2o_backend_2d.py` (g2o `VertexSE2`/`EdgeSE2`/`BlockSolverSE2` +
-  Levenberg) is the default; pyceres/scipy are fallbacks.
+State your assumptions explicitly. If uncertain, ask.
+If multiple interpretations exist, present them - don't pick silently.
+If a simpler approach exists, say so. Push back when warranted.
+If something is unclear, stop. Name what's confusing. Ask.
+2. Simplicity First
+Minimum code that solves the problem. Nothing speculative.
 
-## Hard rules
-- Exactly ONE scan-to-submap implementation; differences between Hector and Cartographer are
-  parameters only, never forked logic.
-- g2o is for the POSE GRAPH. Local per-scan refinement stays native `GaussNewtonLM`.
-- Always export the OPTIMIZED trajectory (post-solve), never the raw online poses.
-- Run with `.venv/bin/python`. g2o needs NumPy 1.26.4 (already in `.venv`).
+No features beyond what was asked.
+No abstractions for single-use code.
+No "flexibility" or "configurability" that wasn't requested.
+No error handling for impossible scenarios.
+If you write 200 lines and it could be 50, rewrite it.
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
-## Validate
-Run `lab_run_2` for: scan_to_map; scan_to_submap (no PGO); scan_to_submap + PGO. Rebuild maps,
-compare drift/distortion and loop closure. scan_to_submap+PGO must be <= scan_to_map drift.
-Unit test: square-loop pose graph, g2o vs pyceres agree < 1e-3 m / 0.1 deg.
+3. Surgical Changes
+Touch only what you must. Clean up only your own mess.
 
-Commands:
-- `.venv/bin/python -m hector.run_local_slam_new --dataset lab_run_2 --matcher scan_to_map`
-- `.venv/bin/python -m hector.run_local_slam_new --dataset lab_run_2 --matcher scan_to_submap`
-- `.venv/bin/python -m hector.run_local_slam_new --dataset lab_run_2 --matcher scan_to_submap --enable-pgo`
+When editing existing code:
 
-## Recommended PGO usage (lab)
-`.venv/bin/python -m hector.run_local_slam_new --dataset lab_run_2 --matcher scan_to_submap --enable-pgo --scans-per-submap 250`
-Smaller submaps -> more finished submaps -> more loop closures. Loop search is bounded
-by PGO_CHECK_EVERY_N_NODES (default 5). sps=500 (the dataset default) yields only ~2
-finished submaps and PGO barely helps; sps=250 gives 8 submaps / 208 loop closures.
+Don't "improve" adjacent code, comments, or formatting.
+Don't refactor things that aren't broken.
+Match existing style, even if you'd do it differently.
+If you notice unrelated dead code, mention it - don't delete it.
+When your changes create orphans:
 
-## Result (lab_run_2, start<->end drift gap, lower=better)
-- scan_to_map: 0.186 m   |   scan_to_submap no-PGO: 0.525 m   |   scan_to_submap+PGO(sps250): 0.306 m
-PGO removes the no-PGO ghosting (see hector_outputs/three_way_comparison_sps250.png) and
-cuts drift ~42%. Residual gap to scan_to_map is front-end per-scan jitter (not fixable by
-a keyframe pose graph).
+Remove imports/variables/functions that YOUR changes made unused.
+Don't remove pre-existing dead code unless asked.
+The test: Every changed line should trace directly to the user's request.
 
-## Status log
-- [x] Phase 1 unify front-end + de-pyceres local refine + migrate Hector runner (scan_to_submap_old.py deleted)
-- [x] Phase 2 g2o backend (carto/pose_graph/backends/g2o_backend_2d.py) + unit test (carto/test_g2o_vs_pyceres.py PASS)
-- [x] Phase 3 online PGO wired into Hector runner (--enable-pgo, --scans-per-submap)
-- [x] Phase 4 lab validation (3-way comparison) + tuning
+4. Goal-Driven Execution
+Define success criteria. Loop until verified.
+
+Transform tasks into verifiable goals:
+
+"Add validation" → "Write tests for invalid inputs, then make them pass"
+"Fix the bug" → "Write a test that reproduces it, then make it pass"
+"Refactor X" → "Ensure tests pass before and after"
+For multi-step tasks, state a brief plan:
+
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.

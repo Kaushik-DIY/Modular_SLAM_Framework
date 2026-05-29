@@ -60,6 +60,14 @@ class GridMap:
         self.origin = np.array([self.size / 2.0, self.size / 2.0], dtype=float)
         self.logodds = np.full((self.size, self.size), self.l0, dtype=np.float32)
 
+        # Gradient cache: recomputed only when the logodds array changes (dirty flag).
+        # The map updates every MAP_UPDATE_EVERY scans; all other scans reuse the cache,
+        # avoiding repeated sigmoid + central-difference on the full grid every scan.
+        self._dirty: bool = True
+        self._prob_cache: Optional[np.ndarray] = None
+        self._gradx_cache: Optional[np.ndarray] = None
+        self._grady_cache: Optional[np.ndarray] = None
+
     # ---------------- coordinate transforms ----------------
 
     def world_to_grid(self, xy: np.ndarray) -> np.ndarray:
@@ -83,8 +91,11 @@ class GridMap:
     # ---------------- occupancy representation ----------------
 
     def prob(self) -> np.ndarray:
+        if not self._dirty and self._prob_cache is not None:
+            return self._prob_cache
         l = self.logodds.astype(np.float32)
-        return 1.0 / (1.0 + np.exp(-l))
+        self._prob_cache = 1.0 / (1.0 + np.exp(-l))
+        return self._prob_cache
 
     @staticmethod
     def _bilinear_sample(grid: np.ndarray, gxy: np.ndarray) -> np.ndarray:
@@ -112,7 +123,9 @@ class GridMap:
         return self._bilinear_sample(prob_grid, gxy)
 
     def gradients_prob(self) -> Tuple[np.ndarray, np.ndarray]:
-        p = self.prob().astype(np.float32)
+        if not self._dirty and self._gradx_cache is not None:
+            return self._gradx_cache, self._grady_cache
+        p = self.prob().astype(np.float32)  # hits prob() cache if already computed
 
         gx = 0.5 * (p[:, 2:] - p[:, :-2])
         gx = np.pad(gx, ((0, 0), (1, 1)), mode="edge")
@@ -120,6 +133,9 @@ class GridMap:
         gy = 0.5 * (p[2:, :] - p[:-2, :])
         gy = np.pad(gy, ((1, 1), (0, 0)), mode="edge")
 
+        self._gradx_cache = gx
+        self._grady_cache = gy
+        self._dirty = False
         return gx, gy
 
     # ---------------- mapping update ----------------
@@ -136,6 +152,7 @@ class GridMap:
             self.l_min,
             self.l_max,
         )
+        self._dirty = True
 
     def integrate_scan_simple(
         self,

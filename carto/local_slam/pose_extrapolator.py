@@ -36,6 +36,8 @@ class PoseExtrapolatorCV:
         odom_trust: float = 0.35,
         max_linear_speed_mps: float = 2.0,
         max_angular_speed_rps: float = 2.0,
+        use_imu: bool = False,
+        imu_yaw_correction_alpha: float = 0.02,
     ) -> None:
         self.max_dt = float(max_dt)
 
@@ -45,6 +47,16 @@ class PoseExtrapolatorCV:
 
         self.max_linear_speed_mps = float(max_linear_speed_mps)
         self.max_angular_speed_rps = float(max_angular_speed_rps)
+
+        # Optional IMU aiding (Cartographer ImuTracker style, 2D): the IMU angular
+        # velocity drives the rotation term and the absolute quaternion-yaw provides a
+        # drift-bounding heading reference. Off by default -> behaviour is pure CV.
+        self.use_imu = bool(use_imu)
+        self.imu_yaw_correction_alpha = float(np.clip(imu_yaw_correction_alpha, 0.0, 1.0))
+        self._imu_wz: Optional[float] = None     # latest IMU yaw-rate [rad/s]
+        self._imu_yaw: Optional[float] = None     # latest IMU absolute yaw [rad]
+        self._imu_yaw_offset: Optional[float] = None  # slam_yaw - imu_yaw, set once
+        self._imu_t: Optional[float] = None
 
         # Exposed for debugging / plotting convenience.
         self.vx = float(init_vxy)
@@ -91,6 +103,15 @@ class PoseExtrapolatorCV:
         """
         self._append_state(self._odom_queue, float(t), odom_pose, self.odom_queue_duration_s)
 
+    def add_imu(self, t: float, wz: float, yaw: Optional[float] = None) -> None:
+        """Feed one IMU sample: angular velocity wz [rad/s] and optional absolute
+        yaw [rad] (from the orientation quaternion). No-op for prediction unless
+        `use_imu` was enabled at construction."""
+        self._imu_t = float(t)
+        self._imu_wz = float(wz)
+        if yaw is not None:
+            self._imu_yaw = float(wrap_angle(float(yaw)))
+
     def correct_pose(self, t: float, pose: Pose2) -> None:
         """
         Replace or append the latest matched pose after a pose-graph correction.
@@ -115,14 +136,33 @@ class PoseExtrapolatorCV:
 
         vx, vy, wz = self._estimate_blended_velocity()
 
+        # IMU aiding: the gyro yaw-rate is a far better short-horizon rotation estimate
+        # than differencing matched poses (especially during fast turns, where the
+        # pose-derived wz lags). Translation stays CV (no reliable 2D accel integration).
+        if self.use_imu and self._imu_wz is not None:
+            wz = float(np.clip(self._imu_wz, -self.max_angular_speed_rps, self.max_angular_speed_rps))
+
         self.vx = float(vx)
         self.vy = float(vy)
         self.wz = float(wz)
 
+        pred_theta = wrap_angle(float(last_pose.theta) + float(wz) * dt)
+
+        # Absolute-heading reference from the IMU orientation quaternion: bound long-term
+        # yaw drift by gently nudging the prediction toward the IMU-implied heading.
+        # The offset (slam_yaw - imu_yaw) is captured once so the IMU yaw frame aligns
+        # with the SLAM world frame; thereafter imu_yaw + offset is the absolute heading.
+        if self.use_imu and self._imu_yaw is not None and self.imu_yaw_correction_alpha > 0.0:
+            if self._imu_yaw_offset is None:
+                self._imu_yaw_offset = float(wrap_angle(float(last_pose.theta) - float(self._imu_yaw)))
+            imu_heading = wrap_angle(float(self._imu_yaw) + float(self._imu_yaw_offset))
+            a = float(self.imu_yaw_correction_alpha)
+            pred_theta = wrap_angle(pred_theta + a * wrap_angle(imu_heading - pred_theta))
+
         pred = Pose2(
             x=float(last_pose.x) + float(vx) * dt,
             y=float(last_pose.y) + float(vy) * dt,
-            theta=wrap_angle(float(last_pose.theta) + float(wz) * dt),
+            theta=pred_theta,
         )
         self._last_extrapolated_time = float(t)
         return pred

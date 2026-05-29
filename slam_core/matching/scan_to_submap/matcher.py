@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 import numpy as np
 
 from slam_core.common.types import Pose2
-from slam_core.matching.core import MatchResult
+from slam_core.matching.core import MatchResult, ScanMatcherBase, BufferedScan
 from slam_core.optimisers.gn_lm import GaussNewtonLM, GNLMConfig
 from slam_core.matching.scan_to_submap.types import (
     ScanToSubmapBackendConfig,
@@ -17,15 +17,14 @@ from slam_core.matching.scan_to_submap.two_stage_backend import TwoStageBruteFor
 from slam_core.matching.scan_to_submap.branch_and_bound_backend import BranchAndBoundSubmapBackend
 
 
-class ScanToSubmapMatcher:
-    name = "scan_to_submap"
-
+class ScanToSubmapMatcher(ScanMatcherBase):
     def __init__(
         self,
         submap_builder: SubmapBuilder2D,
         backend_config: ScanToSubmapBackendConfig,
         refine_solver=None,
     ) -> None:
+        super().__init__(name="scan_to_submap")
         self.submap_builder = submap_builder
         self.backend_config = backend_config
 
@@ -66,6 +65,28 @@ class ScanToSubmapMatcher:
             )
 
         raise ValueError(f"Unsupported backend type: {self.backend_config.backend_type}")
+
+    def initialize_from_buffer(self, scans: Sequence[BufferedScan]) -> None:
+        """Warm-start on a matcher switch (requirement #2: fresh origin + last pose prior).
+
+        Drops ALL existing submaps (we do not remember the pre-switch map) and rebuilds a
+        fresh active submap by replaying only the recent rolling-buffer scans at their world
+        poses. The first replayed pose anchors the new submap; the last replayed pose is the
+        current pose, so the trajectory is continuous across the switch. Mirrors
+        ScanToMapMatcher.initialize_from_buffer.
+        """
+        self.submap_builder.clear()
+        if len(scans) == 0:
+            self._is_initialized = False
+            return
+        for item in scans:
+            self.submap_builder.insert_scan(item.pose_world, item.scan_points_local)
+        self._is_initialized = True
+
+    def shutdown(self) -> None:
+        """Free submap memory when this matcher is deactivated by a switch."""
+        self.submap_builder.clear()
+        self._is_initialized = False
 
     def match_against_submap(self, request: SubmapMatchRequest) -> SubmapMatchResponse:
         return self.backend.match(request)

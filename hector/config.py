@@ -8,8 +8,22 @@ this file, or override from the command line:
 
     python -m hector.run_local_slam_new --dataset fr079 --max-scans 1000
 
-All SLAM tuning parameters are loaded automatically from the per-dataset
-profile below.  Only the three constants at the top need user attention.
+This file is the single source of truth for tuning — both
+run_local_slam_new.py and run_realtime_viz.py read every parameter from here
+via `cfg.XXX`, so you should never need to edit the runner files.
+
+Where to change things
+----------------------
+  • USER SELECTION block  — dataset, scan variant, matcher type, scan cap.
+  • _COMMON dict          — knobs shared across datasets: the GN-LM refine
+                            solver, motion filter / IMU extrapolator, live
+                            switching, the PGO back-end, and realtime-viz
+                            runtime defaults.
+  • _PROFILES[<dataset>]  — only what differs per dataset (sensor geometry,
+                            environment size, per-dataset solver tuning); these
+                            override _COMMON.
+
+_apply_profile() applies _COMMON first, then the dataset profile.
 
 Supported datasets
 ------------------
@@ -40,11 +54,95 @@ MAX_SCANS            = None             # None → all scans; int → cap for te
 VERBOSE_EVERY        = 10
 
 # ==============================================================
+# Shared tuning defaults (apply to every dataset)
+# ==============================================================
+# These are the knobs that are normally the same across datasets (matcher
+# internals, the GN-LM refine solver, live-switching, the PGO back-end, and the
+# realtime-viz runtime defaults).  They are applied FIRST, then a dataset profile
+# below can override any of them.  Both run_local_slam_new.py and
+# run_realtime_viz.py read every value here via `cfg.XXX`, so this file is the
+# single place to tune behaviour — no need to edit the runner files.
+_COMMON: dict = dict(
+
+    # --- Matcher selection default (overridable by --matcher) ---
+    MAP_UPDATE_EVERY = 1,          # scan_to_map: insert every Nth scan when motion filter is OFF
+
+    # --- IMU-aided extrapolator + motion-filter keyframing (opt-in) ---
+    # OFF by default so the baseline path (match every scan, last-pose prior) is
+    # preserved exactly.  Enable per run with --use-imu / --use-motion-filter
+    # (either flag also forces the extrapolator ON).
+    USE_IMU                  = False,   # feed gyro yaw-rate + quaternion yaw into the extrapolator
+    IMU_YAW_CORRECTION_ALPHA = 0.02,    # blend toward IMU absolute heading per predict (0=gyro-rate only)
+    USE_MOTION_FILTER        = False,   # skip GN on sub-threshold scans (dead-reckon them)
+    MF_MAX_DIST_M            = 0.10,    # keyframe if translation since last keyframe exceeds this [m]
+    MF_MAX_ANGLE_DEG         = 2.0,     # keyframe if rotation since last keyframe exceeds this [deg]
+    MF_MAX_TIME_S            = 0.5,     # keyframe if time since last keyframe exceeds this [s]
+
+    # --- scan_to_map GN-LM solver (extra knobs; per-level iters/damping are per-profile) ---
+    GN_STEP_CLIP_TH_DEG = 1.0,     # max GN rotation step per iteration [deg]
+
+    # --- scan_to_submap two-stage front-end (correlative search + native GN-LM refine) ---
+    # Correlative search executor: False = scalar Python loop (deterministic, the
+    # stable default); True = vectorized NumPy batch (~10x faster, same scores, may
+    # break exact ties differently). Opt-in via --vectorized-search.
+    SUBMAP_VECTORIZED_SEARCH    = False,
+    SUBMAP_PRECOMP_LEVELS       = 3,    # multi-resolution precompute levels for correlative search
+    SUBMAP_COARSE_LEVEL         = 2,    # pyramid level used by the coarse correlative pass
+    SUBMAP_FINE_LEVEL           = 0,    # pyramid level used by the fine correlative pass
+    SUBMAP_REFINE_ITERS         = 12,   # GN-LM iterations in the local refine stage
+    SUBMAP_REFINE_DAMPING       = 1e-3, # LM damping for the local refine stage
+    SUBMAP_REFINE_STEP_CLIP_XY  = 0.10, # max refine translation step per iteration [m]
+    SUBMAP_REFINE_STEP_CLIP_TH_DEG = 5.0,  # max refine rotation step per iteration [deg]
+
+    # --- Matcher manager / live front-end switching (realtime viz) ---
+    ROLLING_BUFFER_SIZE  = 30,     # recent matched scans kept for warm-starting a switched matcher
+    MIN_BUFFER_FOR_SWITCH = 20,    # min buffered scans before a live matcher switch may take effect
+    SWITCH_GRACE_SCANS   = 15,     # scans the old matcher keeps running after a switch is requested
+
+    # --- Online PGO: g2o SE2 solver ---
+    PGO_LOCAL_TRANS_WEIGHT = 1e5,  # information weight on the local-SLAM (front-end) pose prior, xy
+    PGO_LOCAL_ROT_WEIGHT   = 1e5,  # information weight on the local-SLAM pose prior, rotation
+    PGO_HUBER_SCALE        = 10.0, # Huber robust-kernel scale for loop edges
+    PGO_MAX_ITERATIONS     = 50,   # Levenberg iterations per global solve
+
+    # --- Online PGO: pose-graph constraints ---
+    PGO_INTRA_TRANS_WEIGHT = 5e2,  # intra-submap (node↔submap) constraint weight, xy
+    PGO_INTRA_ROT_WEIGHT   = 1.6e3,# intra-submap constraint weight, rotation
+    PGO_OPTIMIZE_EVERY_N_NODES = 90,  # run a global solve every N inserted keyframe nodes
+
+    # --- Online PGO: loop-closure detection ---
+    PGO_LOOP_MIN_SCORE        = 0.50,  # min branch-and-bound score to accept a loop candidate
+    PGO_LOOP_TRANS_WEIGHT     = 1.1e4, # accepted loop-closure constraint weight, xy
+    PGO_LOOP_ROT_WEIGHT       = 1e5,   # accepted loop-closure constraint weight, rotation
+    PGO_LOOP_SEARCH_XY        = 7.0,   # loop-search translational window half-extent [m]
+    PGO_LOOP_SEARCH_TH_DEG    = 30.0,  # loop-search rotational window half-extent [deg]
+    PGO_LOOP_PRECOMP_LEVELS   = 7,     # branch-and-bound precompute depth for loop search
+    PGO_LOOP_BNB_DEPTH        = 7,     # branch-and-bound recursion depth limit
+    PGO_LOOP_BNB_MIN_ROT_STEP = 0.02,  # branch-and-bound minimum rotational step [rad]
+    PGO_LOOP_BNB_BRANCHING    = 4,     # branch-and-bound branching factor
+    PGO_MIN_NODE_SEPARATION   = 30,    # min node-index gap between the two ends of a loop
+    PGO_SPATIAL_SEARCH_RADIUS = 8.0,   # only search submaps within this radius of the new node [m]
+    PGO_MAX_CANDIDATE_TARGETS = 3,     # max loop candidates evaluated per new node
+    PGO_HISTORICAL_NODE_STRIDE = 3,    # stride when scanning historical nodes for candidates
+    PGO_CHECK_EVERY_N_NODES   = 5,     # only run loop search on every Nth node (bounds cost)
+    PGO_RECENT_SUBMAP_EXCLUSION = 0,   # exclude this many most-recent finished submaps from loop search
+    PGO_CORRECTION_ALPHA      = 0.5,   # blend factor when writing optimized poses back online
+
+    # --- Realtime-viz runtime defaults (overridable by CLI flags) ---
+    PLAYBACK_SPEED         = 1.0,   # 1.0=real-time, 2.0=2x, 0=as-fast-as-possible
+    DRAW_EVERY             = 5,     # redraw the live plot every N scans
+    REALTIME_VERBOSE_EVERY = 20,    # print a live timing line every N scans
+    POINTS_MAX             = 80000, # cap displayed --live-points cloud (stride-subsampled above this)
+)
+
+
+# ==============================================================
 # Per-dataset parameter profiles
 # ==============================================================
-# Each profile must define every parameter key listed below.
-# Keys are injected as module-level attributes so the runner can
-# continue to use `cfg.XXX` style access unchanged.
+# A profile only needs to list keys that DIFFER from _COMMON (sensor geometry,
+# environment size, per-dataset solver tuning).  _apply_profile() applies _COMMON
+# first, then the profile, so any key here overrides the shared default.
+# Keys are injected as module-level attributes so the runner can use `cfg.XXX`.
 
 _PROFILES: dict = {
 
@@ -91,7 +189,7 @@ _PROFILES: dict = {
         SUBMAP_SIZE_METERS = 20.0,
         # Slow robot at ~10 Hz → ~0.03 m/scan → 500 scans ≈ 15 m traversal
         # giving 2–3 finished submaps for the full ~34 m lab path.
-        SCANS_PER_SUBMAP   = 500,
+        SCANS_PER_SUBMAP   = 250,
 
         # Correlative coarse search — wide window because there is no
         # odometry prior; the extrapolator alone can lag at sharp turns.
@@ -138,15 +236,17 @@ _PROFILES: dict = {
         N_BOOTSTRAP_SCANS  = 1,
 
         # --- Pose extrapolator ---
+        # IMU/motion-filter knobs (USE_IMU, USE_MOTION_FILTER, MF_*, etc.) are
+        # shared defaults in _COMMON; override here only if lab needs different.
         USE_EXTRAPOLATOR = False,
         EXTRAP_MAX_DT   = 0.5,
         EXTRAP_INIT_VXY = 0.0,
         EXTRAP_INIT_WZ  = 0.0,
 
-        # --- Motion filter — slow robot at 10 Hz ---
-        TARGET_INSERT_PERIOD_S = 0.10,
-        V_EXPECTED_MPS         = 1.0,
-        W_EXPECTED_RPS         = np.deg2rad(45.0),
+        # --- Motion filter (velocity-derived, scan_to_submap cadence) — slow robot at 10 Hz ---
+        TARGET_INSERT_PERIOD_S = 0.10,    # target seconds between submap inserts
+        V_EXPECTED_MPS         = 1.0,     # expected linear speed → derives insert distance
+        W_EXPECTED_RPS         = np.deg2rad(45.0),  # expected angular speed → derives insert angle
 
         # --- Pose graph / PGO ---
         KEYFRAME_STRIDE = 10,
@@ -364,7 +464,11 @@ _PROFILES: dict = {
 
 
 def _apply_profile(dataset_name: str) -> None:
-    """Inject all profile keys for *dataset_name* as module-level attributes."""
+    """Inject shared defaults then the dataset profile as module-level attributes.
+
+    _COMMON is applied first; the per-dataset profile is applied second so any
+    key it defines overrides the shared default.
+    """
     import sys
     mod = sys.modules[__name__]
     if dataset_name not in _PROFILES:
@@ -372,6 +476,8 @@ def _apply_profile(dataset_name: str) -> None:
             f"Unknown DATASET_NAME={dataset_name!r}. "
             f"Supported: {', '.join(_PROFILES)}"
         )
+    for key, value in _COMMON.items():
+        setattr(mod, key, value)
     for key, value in _PROFILES[dataset_name].items():
         setattr(mod, key, value)
 
@@ -385,3 +491,16 @@ _apply_profile(DATASET_NAME)
 # ==============================================================
 P0 = 0.5
 L0 = float(np.log(P0 / (1.0 - P0)))   # always 0.0; kept for downstream compat
+
+
+# ==============================================================
+# Cartographer-style fast local matching + IMU (run_realtime_viz --fast-match / --use-imu)
+# ==============================================================
+# --fast-match runs the SAME full correlative search + refine as the default path, but
+# vectorized (batched NumPy) plus vectorized submap insertion (fast_insert). Same map
+# quality, ~10x faster. Does NOT affect the default scalar path or the stable runner.
+# --use-imu feeds gyro yaw-rate + quaternion yaw into the extrapolator. Finding on this
+# slow indoor robot: scan-derived velocity already predicts well, so the gyro adds
+# bias/noise and IMU is OFF by default (kept for fast-motion / feature-poor runs).
+# The IMU/motion-filter knobs themselves (USE_IMU, IMU_YAW_CORRECTION_ALPHA,
+# USE_MOTION_FILTER, MF_*) live in _COMMON above.

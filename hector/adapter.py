@@ -104,11 +104,31 @@ class HectorLocalSlamAdapter:
         pose_graph=None,
         global_slam=None,
         solve_every_n_nodes: int = 20,
+        motion_filter_skip: bool = False,
+        mf_keyframe_params: Optional[MotionFilterParams] = None,
     ):
         self.matcher_manager = matcher_manager
         self.extrap = extrapolator
         self.motion_params = motion_params
         self.use_extrapolator = use_extrapolator
+
+        # Dedicated keyframe thresholds for the scan_to_map motion-filter-skip
+        # decision. Kept separate from motion_params so a runner that also drives
+        # scan_to_submap (e.g. live-switchable realtime viz) can give submap
+        # insertion its own cadence. Falls back to motion_params when None.
+        self.mf_keyframe_params = mf_keyframe_params
+
+        # Motion-filter keyframing (scan_to_map, opt-in). When True, a scan whose
+        # extrapolated motion since the last keyframe is below motion_params'
+        # thresholds is SKIPPED: no GN match, no map insert. Its pose is the
+        # dead-reckoned extrapolator prediction. This is the Cartographer
+        # "MotionFilter selects keyframes" idea; the win is far fewer GN solves.
+        # Requires use_extrapolator=True (otherwise the skipped-scan prediction
+        # would just repeat the last matched pose and the map would stagnate).
+        self.motion_filter_skip = bool(motion_filter_skip)
+        # Diagnostics: how many scans were GN-matched vs dead-reckoned (skipped).
+        self.matched_count: int = 0
+        self.skipped_count: int = 0
 
         # Optional online pose-graph back-end (Cartographer-style global SLAM).
         # When set, every accepted scan-to-submap node is added to the graph and
@@ -175,7 +195,20 @@ class HectorLocalSlamAdapter:
 
         pred_world = self._predict_world_pose(t, odom_pose_world, odom_alpha)
 
-        if self.motion_params is None:
+        # Motion-filter keyframe-skip applies to BOTH front-ends (scan_to_map and
+        # scan_to_submap). When active it uses its own keyframe thresholds
+        # (mf_keyframe_params); every other case uses motion_params (which for
+        # scan_to_submap is the baseline insertion-cadence filter).
+        mf_skip_applies = (
+            self.motion_filter_skip
+            and matcher_name in ("scan_to_map", "scan_to_submap")
+        )
+        if mf_skip_applies and self.mf_keyframe_params is not None:
+            decision_params = self.mf_keyframe_params
+        else:
+            decision_params = self.motion_params
+
+        if decision_params is None:
             motion_insert, dtrans, drot, dtime = True, 0.0, 0.0, 0.0
         else:
             motion_insert, dtrans, drot, dtime = motion_filter_decision(
@@ -183,17 +216,113 @@ class HectorLocalSlamAdapter:
                 t=t,
                 last_pose=self.last_insert_pose,
                 last_time=self.last_insert_time,
-                p=self.motion_params,
+                p=decision_params,
             )
 
+        # ------------------------------------------------------------------
+        # Motion-filter skip path (scan_to_map AND scan_to_submap, opt-in).
+        #
+        # Once the front-end is seeded and we already have a keyframe anchor, a
+        # sub-threshold scan is dead-reckoned by the extrapolator: NO scan match
+        # (no GN / no correlative search), NO insert. This is the efficiency win
+        # — the expensive match runs only at keyframes. The dead-reckoned pose is
+        # NOT fed back into the extrapolator's matched-pose queue (only matched
+        # poses and IMU samples drive velocity), matching Cartographer's design.
+        #
+        # "Seeded" check: scan_to_map needs its occupancy grid bootstrapped;
+        # scan_to_submap just needs one inserted scan, which last_insert_pose
+        # already implies — so the keyframe anchor is the sufficient gate there.
+        # ------------------------------------------------------------------
+        if matcher_name == "scan_to_submap":
+            matcher_seeded = self.last_insert_pose is not None
+        else:
+            matcher_seeded = bool(
+                getattr(active_matcher, "initialized", False)
+                or getattr(active_matcher, "_is_initialized", False)
+            )
+        if (
+            mf_skip_applies
+            and matcher_seeded
+            and self.last_insert_pose is not None
+            and not motion_insert
+        ):
+            final_pose = pred_world
+            if not np.all(np.isfinite([final_pose.x, final_pose.y, final_pose.theta])):
+                raise ValueError(f"Non-finite dead-reckoned pose: {final_pose}")
+
+            skip_result = MatchResult(
+                pose_world=final_pose,
+                # Score 1.0 = "trusted dead-reckoning" so map-rebuild (min_score
+                # >= 0) includes the pose; method tags it for diagnostics.
+                score=1.0,
+                success=True,
+                method="motion_filter_skip",
+                debug={
+                    "reason": "motion_filter_skip",
+                    "dtrans": float(dtrans),
+                    "drot_deg": float(np.rad2deg(drot)),
+                    "dtime": float(dtime),
+                },
+            )
+            self._last_match_result = skip_result
+            self._last_match_pose = final_pose
+            self._last_do_insert = False
+            self.skipped_count += 1
+
+            # scan_to_submap: STILL insert the dead-reckoned scan into the active
+            # submap so it stays dense (the submap is the only local map a keyframe
+            # has to match against — skipping inserts makes matches drift). We only
+            # skip the expensive correlative+GN MATCH, which is the real cost. The
+            # keyframe anchor (last_insert_pose/time) is NOT updated, so the motion
+            # threshold keeps accumulating from the last MATCHED keyframe, and no
+            # pose-graph node is added (dead-reckoned scans are not keyframes).
+            # scan_to_map keeps its global grid crisp, so it inserts nothing here.
+            did_insert_skip = False
+            if matcher_name == "scan_to_submap":
+                did_insert_skip = bool(
+                    self.matcher_manager.update_active_target(
+                        pose_world=final_pose,
+                        scan_points_local=scan_points_local,
+                        t=t,
+                    )
+                )
+            self._last_did_insert = did_insert_skip
+
+            # Keep the rolling switch buffer fed so a later matcher switch can
+            # still warm-start from a continuous pose stream.
+            self.matcher_manager.push_buffered_scan(
+                t=t,
+                scan_points_local=scan_points_local,
+                pose_world=final_pose,
+                score=1.0,
+            )
+
+            self._last_motion_debug = {
+                "matcher_name": matcher_name,
+                "dtrans": float(dtrans),
+                "drot_deg": float(np.rad2deg(drot)),
+                "dtime": float(dtime),
+                "motion_filter_insert": False,
+                "do_insert": False,
+                "did_insert": did_insert_skip,
+                "skipped": True,
+            }
+            return final_pose, skip_result, False, did_insert_skip
+
         # Hector-style policy:
-        # - scan_to_map can throttle occupancy-map insertions
+        # - scan_to_map throttles inserts by map-update cadence, OR (when the
+        #   motion filter is enabled) inserts exactly at keyframes
         # - scan_to_submap still uses sparse insertion/update
         if matcher_name == "scan_to_map":
-            map_update_every = max(1, int(getattr(cfg, "MAP_UPDATE_EVERY", 1)))
-            do_insert = ((k % map_update_every) == 0)
+            if self.motion_filter_skip:
+                do_insert = bool(motion_insert)
+            else:
+                map_update_every = max(1, int(getattr(cfg, "MAP_UPDATE_EVERY", 1)))
+                do_insert = ((k % map_update_every) == 0)
         else:
             do_insert = bool(motion_insert)
+
+        self.matched_count += 1
 
         result = self.matcher_manager.match(
             t=t,

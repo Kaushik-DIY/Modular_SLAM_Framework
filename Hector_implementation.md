@@ -1,668 +1,910 @@
-# Hector SLAM — Complete Implementation Review
+# Hector SLAM — Complete Implementation & Mathematical Reference
 
-**Target audience:** Anyone curious about this SLAM system, including readers with little or no robotics background.
+**Target audience.** Researchers and engineers who want the exact mathematics of
+*this* implementation, not a textbook survey. Every equation below corresponds to
+code that actually runs in the repository; nothing is added "for completeness."
+A short plain-language paragraph precedes each mathematical block so that readers
+without a SLAM background can still follow the intent.
 
----
-
-## What Is SLAM and Why Does It Matter?
-
-Imagine you are dropped blindfolded into an unknown building and told to draw a map of it while figuring out where you are. That is exactly the problem robots face, and it is called **SLAM — Simultaneous Localization and Mapping**.
-
-- **Localization** = "Where am I?"
-- **Mapping** = "What does the environment look like?"
-
-The challenge is circular: you need a map to know where you are, but you need to know where you are to build a map. SLAM solves both problems at the same time.
-
-This implementation solves 2D SLAM — the robot moves on a flat floor, and the map is a 2D bird's-eye-view of the environment.
+> **Scope discipline.** This document describes only what the runner
+> `hector/run_local_slam_new.py` and the modules it imports actually execute. Dead
+> or optional code paths (e.g. the constant-velocity extrapolator and odometry
+> blending, the legacy `pyceres` refine backend, the standalone scipy PGO tool) are
+> flagged explicitly as *present but inactive in the shipped profiles* rather than
+> presented as part of the live pipeline.
 
 ---
 
-## High-Level Pipeline at a Glance
+## 0. What SLAM is (one paragraph)
+
+SLAM — *Simultaneous Localization and Mapping* — is the problem of estimating, at
+the same time, **where a sensor is** (localization) and **what the environment
+looks like** (a map), using only the sensor's own measurements. It is circular:
+you need a map to localize, and a localized pose to extend the map. This codebase
+solves the **2-D** version: the platform moves on a plane and the map is a
+bird's-eye occupancy grid. The estimated quantity at each step is a planar pose
+$\xi=(x,y,\theta)$, and the map is a grid of occupancy probabilities.
+
+---
+
+## 1. Notation and SE(2) algebra
+
+All poses live in the special Euclidean group of the plane, $SE(2)$. A pose is the
+triple
+
+$$
+\xi = (x,\,y,\,\theta)\in\mathbb{R}^2\times\mathbb{S}^1 ,
+$$
+
+interpreted as the rigid transform that maps a point $\mathbf{p}=(p_x,p_y)$ in the
+body frame to the world frame:
+
+$$
+T(\xi)\,\mathbf{p} \;=\; R(\theta)\,\mathbf{p} + \mathbf{t},
+\qquad
+R(\theta)=\begin{bmatrix}\cos\theta & -\sin\theta\\[2pt]\sin\theta & \cos\theta\end{bmatrix},
+\qquad
+\mathbf{t}=\begin{bmatrix}x\\y\end{bmatrix}.
+$$
+
+In code this is `transform_points_pose` / `_transform_points` (a right-multiply by
+$R^\top$ on row-vector point arrays, which is algebraically identical).
+
+**Composition** ($\oplus$), `pose_compose(a,b)` — apply $b$ then $a$:
+
+$$
+\xi_a \oplus \xi_b =
+\begin{bmatrix}
+x_a + \cos\theta_a\, x_b - \sin\theta_a\, y_b\\[2pt]
+y_a + \sin\theta_a\, x_b + \cos\theta_a\, y_b\\[2pt]
+\operatorname{wrap}(\theta_a+\theta_b)
+\end{bmatrix}.
+$$
+
+**Inverse** ($\ominus$ as a unary op), `inverse_pose(p)`:
+
+$$
+\xi^{-1}=
+\begin{bmatrix}
+-(\cos\theta\, x + \sin\theta\, y)\\[2pt]
+-(-\sin\theta\, x + \cos\theta\, y)\\[2pt]
+\operatorname{wrap}(-\theta)
+\end{bmatrix}.
+$$
+
+**Relative pose** (used everywhere for constraints), `pose_relative(a,b)`:
+
+$$
+{}^{a}\xi_{b} \;=\; \xi_a^{-1}\oplus\xi_b
+\qquad(\text{"pose of $b$ expressed in the frame of $a$"}).
+$$
+
+**Angle wrap**, `wrap_angle`, keeps angles in $(-\pi,\pi]$:
+
+$$
+\operatorname{wrap}(\alpha)=\big((\alpha+\pi)\bmod 2\pi\big)-\pi .
+$$
+
+These five operations are the algebraic spine of the whole system. Defined in
+[slam_core/common/se2.py](slam_core/common/se2.py).
+
+---
+
+## 2. Pipeline at a glance
+
+**The core pipeline is: sensor → preprocessing → prediction → scan matching → map
+update → trajectory.** Scan matching is the heart of the system, and it comes in
+two **independent, interchangeable** flavours — `scan_to_map` (§8) and
+`scan_to_submap` (§9) — selected at startup. Each is a complete standalone matching
+pipeline; you run *one* of them. The pose graph (§10) is an **optional add-on stage
+layered on top of `scan_to_submap`** to reduce accumulated drift; it is off unless
+`--enable-pgo` is passed and changes nothing about how scans are matched or how the
+map is built. Read §8 and §9 as the two main paths; read §10 only as a refinement
+that can be bolted onto §9.
 
 ```
-[Sensor]
-   │  Raw distance measurements (range data)
-   ▼
-[Data Loader]
-   │  Reads the log file and sensor geometry
-   ▼
-[Range → Point Cloud]
-   │  Converts distances into 2D (x, y) points
-   ▼
-[Voxel Filter]  (optional, dataset-dependent)
-   │  Removes redundant points, keeps ~200 clean points
-   ▼
-[Pose Predictor]
-   │  "Where do I think I am right now?"
-   ▼
-[Scan Matcher]  ← CORE OF THE SYSTEM
-   │  Aligns the new scan to the map to get the precise pose
-   ▼
-[Map Updater]
-   │  Paints the new scan into the occupancy grid map
-   ▼
-[Trajectory Writer]
-   │  Appends (timestamp, x, y, θ, score) to output file
-   ▼
-[Post-Run PGO]  (optional, run separately)
-   │  Finds loop closures, globally corrects drift
-   ▼
-[Map & Trajectory Plots]
-   │  Visualizes the trajectory overlaid on the final map
+ raw laser ranges  r_i                                  (Part 3 — sensor)
+        │  ranges_to_points()                           (Stage A — §5)
+        ▼
+ body-frame point cloud  P = { p_i }                    (carto/local_slam/range_to_points.py)
+        │  PointCloudProcessor.process()                (Stage B — §6)
+        ▼
+ thinned point cloud  P'  (lab only; ~200 pts)          (slam_core/matching/preprocessing.py)
+        │  HectorLocalSlamAdapter._predict_world_pose() (Stage C — §7)
+        ▼
+ predicted pose  ξ̂_k                                    (hector/adapter.py)
+        │
+        ▼
+ ┌─ SCAN MATCHING — choose ONE path ─────────────────────────────────────┐
+ │  PATH 1: scan_to_map  (§8)    OR   PATH 2: scan_to_submap  (§9)        │
+ │  Hector multi-res GN          two-stage correlative + GN-LM refine    │
+ │  slam_core/matching/scan_to_map.py    slam_core/matching/scan_to_submap/│
+ └───────────────────────────────────────────────────────────────────────┘
+        │  matched pose  ξ_k,  score  s_k
+        ▼
+ map / submap update (ray casting, log-odds)            (map update — §8.4, §9.1)
+        │
+        ├──────────────► trajectory_*.txt  (t, x, y, θ, s)   (output — §11)
+        │
+        ▼  ╌╌ OPTIONAL improvement, only with --enable-pgo (path 2 only) ╌╌
+ ONLINE POSE GRAPH (g2o SE2)                             (§10, optional)
+   nodes + intra-submap + loop-closure + spine constraints
+   carto/pose_graph/*  +  carto/pose_graph/backends/g2o_backend_2d.py
+        │  final Levenberg solve + write-back
+        ▼
+ trajectory_*_pgo.txt  (dense, drift-corrected)
 ```
 
----
-
-## Part 1 — Sensors Used
-
-### Three Supported Datasets
-
-The system supports three different real-world sensor setups. All produce **laser range scans** — the sensor spins a laser beam and measures how far away the nearest obstacle is at each angle.
+The two matchers are interchangeable; the back-end pose graph is optional and only
+meaningful for `scan_to_submap`.
 
 ---
 
-### 1.1 Lab Run 2 — Custom JetRacer Robot
+## 3. Sensors and datasets
 
-| Property | Value |
-|---|---|
-| Robot | JetRacer AI Kit (small wheeled robot) |
-| Sensor | YD LiDAR G4 (spinning laser rangefinder) |
-| Field of View | 360° — full circle around the robot |
-| Number of beams | 909 raw beams per scan |
-| Range | 0.10 m to 16.0 m |
-| Odometry | None (no wheel encoders used) |
-| Environment | Small indoor lab room, roughly 8 × 6 metres |
-| Data format | Custom CARMEN log file (`scans.carmen`) |
+All three datasets deliver **planar laser range scans**: a spinning beam reports
+the distance $r_i$ to the nearest surface at a known angle $\theta_i$.
 
-The LiDAR G4 fires 909 laser beams in a circle at roughly 10 Hz. Each beam returns one distance measurement. Because 909 points is more than the solver benefits from, the voxel filter is switched on for this dataset.
+| Property | lab_run_2 | fr079 | intel |
+|---|---|---|---|
+| Sensor | YD LiDAR G4 | SICK LMS | SICK LMS |
+| FOV | 360° | 180° | 180° |
+| Beams / scan | 909 (`raw`) or 360 | 360 | 180 (1°) |
+| Range | 0.10–16 m | 0.10–30 m | 0.10–30 m |
+| Wheel odometry | none | yes | yes (drifts) |
+| Path length | ~34 m loop | ~60 m | ~800 m |
+| Log format | `scans.carmen` | `fr079.clf` | `intel.clf` |
 
-An IMU (Inertial Measurement Unit) is present in the dataset but is **not used** in this Hector SLAM pipeline — it exists for future use.
-
----
-
-### 1.2 Freiburg FR079 — Corridor Benchmark
-
-| Property | Value |
-|---|---|
-| Robot | University of Freiburg research robot |
-| Sensor | SICK LMS laser scanner |
-| Field of View | 180° (a half-circle in front of the robot) |
-| Number of beams | 360 beams per scan |
-| Range | 0.10 m to 30.0 m |
-| Odometry | Wheel odometry embedded in the log |
-| Environment | Long university corridor, ~60 m total path |
-| Data format | CARMEN log file (`fr079.clf`) |
+The sensor geometry (beam count, `angle_min`, `angle_inc`, range limits, odometry
+flag) is stored as a frozen `DatasetProfile` and loaded by
+[slam_core/dataio/dataset_catalog.py](slam_core/dataio/dataset_catalog.py). An IMU
+CSV exists for lab_run_2 but **is not fused** in the live Hector path (the IMU
+hooks in the extrapolator are disabled by default — see §7).
 
 ---
 
-### 1.3 Intel Research Lab — Large Building Benchmark
+## 4. Configuration system
 
-| Property | Value |
-|---|---|
-| Robot | Intel Research Lab robot |
-| Sensor | SICK LMS laser scanner |
-| Field of View | 180° |
-| Number of beams | 180 beams per scan (coarser, 1° per beam) |
-| Range | 0.10 m to 30.0 m |
-| Odometry | Wheel odometry (but known to drift over long runs) |
-| Environment | Large office building, ~800 m total path |
-| Data format | CARMEN log file (`intel.clf`) |
+[hector/config.py](hector/config.py) holds one parameter **profile** per dataset.
+Selecting a dataset injects every key as a module attribute (`cfg.XXX`), so the
+runner code is dataset-agnostic. The three user knobs at the top are
+`DATASET_NAME`, `DATASET_SCAN_VARIANT` (lab only), and `MATCHER_TYPE`; CLI flags
+(`--dataset`, `--matcher`, `--enable-pgo`, `--scans-per-submap`, `--max-scans`)
+override them.
 
----
+Key constants referenced by the math below, per dataset:
 
-## Part 2 — Configuration System
-
-**File:** [hector/config.py](hector/config.py)
-
-Before running, every parameter the system needs is loaded from a per-dataset profile defined in `config.py`. You can think of this as the "settings panel" — one set of knobs per dataset, covering everything from sensor geometry to how aggressively the scan matcher should iterate.
-
-### What You Control at the Top
-
-```python
-DATASET_NAME         = "lab_run_2"    # which dataset to run
-DATASET_SCAN_VARIANT = "raw"          # lab_run_2 only: "raw" (909 beams) or "360" (360 beams)
-MATCHER_TYPE         = "scan_to_map"  # "scan_to_map" or "scan_to_submap"
-MAX_SCANS            = None           # None = all scans; set an integer to limit for testing
-```
-
-Or override from the command line:
-```bash
-python -m hector.run_local_slam_new --dataset fr079 --matcher scan_to_map --max-scans 500
-```
-
-### Key Parameters per Dataset (summary)
-
-| Parameter | Lab Run 2 | FR079 | Intel | What it controls |
+| Symbol (this doc) | config key | lab_run_2 | fr079 | intel |
 |---|---|---|---|---|
-| `ODOM_ALPHA` | 0.0 | 0.5 | 0.35 | How much to trust wheel odometry (0 = ignore, 1 = full trust) |
-| `VOXEL_FILTER_ENABLED` | True | False | False | Whether to thin out the point cloud |
-| `MAP_RESOLUTION` | 0.05 m | 0.05 m | 0.05 m | Grid cell size (5 cm) |
-| `PYRAMID_LEVELS` | 3 | 3 | 3 | Number of map resolution levels |
-| `GN_ITERS_PER_LEVEL` | [20, 15, 10] | [2, 2, 1] | [15, 10, 8] | GN iterations at each pyramid level |
-| `L_OCC` | 1.0 | 0.85 | 0.85 | How strongly a hit updates the map |
-| `L_FREE` | -0.1 | -0.1 | -0.1 | How strongly a miss updates the map |
-| `RAY_STEPS` | 20 | 40 | 40 | Steps used when casting a ray through the map |
+| occupancy hit log-odds $\ell_{\text{occ}}$ | `L_OCC` | 1.0 | 0.85 | 0.85 |
+| miss log-odds $\ell_{\text{free}}$ | `L_FREE` | −0.1 | −0.1 | −0.1 |
+| clamp $[\ell_{\min},\ell_{\max}]$ | `L_MIN/L_MAX` | ±5 | ±5 | ±5 |
+| base resolution $\rho$ (m/cell) | `MAP_RESOLUTION` | 0.05 | 0.05 | 0.05 |
+| pyramid levels $L$ | `PYRAMID_LEVELS` | 3 | 3 | 3 |
+| GN iters / level | `GN_ITERS_PER_LEVEL` | [20,15,10] | [2,2,1] | [15,10,8] |
+| GN damping $\lambda$ | `GN_DAMPING` | 1e−4 | 2e−2 | 1e−4 |
+| accept score $s_{\min}$ (map) | `CORR_MAP_MIN_SCORE` | 0.10 | 0.35 | 0.10 |
+| ray steps $N_{\text{ray}}$ | `RAY_STEPS` | 20 | 40 | 40 |
+| scans per submap $N_s$ | `SCANS_PER_SUBMAP` | 500 | 90 | 90 |
+| submap accept score | `SUBMAP_MIN_SCORE` | 0.50 | 0.52 | 0.60 |
+| odom trust $\alpha$ | `ODOM_ALPHA` | 0.0 | 0.5 | 0.35 |
+| use CV extrapolator | `USE_EXTRAPOLATOR` | **False** | **False** | **False** |
+
+The last two rows matter for §7: **all three profiles disable the extrapolator**,
+so $\alpha$ (which only acts inside the extrapolator branch) is inert in the
+shipped runs.
 
 ---
 
-## Part 3 — Step-by-Step Pipeline
+## 5. Stage A — laser ranges to a Cartesian point cloud
 
-### Step 1: Startup and Dataset Loading
+**Plain idea.** A scan is a list of distances. Convert each distance + its known
+beam angle into an $(x,y)$ point in the sensor's own frame.
 
-**File:** [hector/run_local_slam_new.py](hector/run_local_slam_new.py)  
-**Supporting file:** [slam_core/dataio/dataset_catalog.py](slam_core/dataio/dataset_catalog.py)
+**Math.** For beam index $i$ the firing angle and Cartesian endpoint are
 
-The main script `run_local_slam_new.py` is the entry point. When it starts:
+$$
+\theta_i=\theta_{\min}+i\,\Delta\theta,
+\qquad
+\mathbf{p}_i=\begin{bmatrix}r_i\cos\theta_i\\ r_i\sin\theta_i\end{bmatrix},
+$$
 
-1. It reads the command-line arguments and applies any overrides to the config.
-2. It calls `load_dataset_scans(cfg.DATASET_NAME)`, which:
-   - Looks up a **DatasetProfile** — a frozen record containing the sensor geometry (number of beams, angle range, range limits, whether odometry is available, the file path of the log).
-   - Calls the appropriate reader (`read_carmen_log`, `read_intel_carmen_log`, or `read_lab_carmen_log`) which parses the log file line by line and returns a Python list of scan dictionaries.
+where $\theta_{\min}$ is `angle_min` and $\Delta\theta$ is `angle_inc` from the
+dataset profile. A beam is kept only if it is finite and within range,
 
-Each scan dictionary looks like:
-```python
-{
-    "t":      1234567890.123,       # Unix timestamp in seconds
-    "ranges": [0.82, 0.95, ...],   # list of N distance values (one per beam)
-    "odom":   (x, y, theta)        # optional wheel odometry pose (world frame)
-}
-```
+$$
+r_{\min}\le r_i\le r_{\max},\qquad r_{\min}=\max(\texttt{LIDAR\_MIN\_RANGE},\,\texttt{range\_min}).
+$$
 
-The system prints a startup summary:
-```
-Dataset      : lab_run_2
-Scan variant : raw
-Geometry     : beams=909  angle=[-180.0°, 180.0°]  range=[0.10, 16.00] m  has_odom=False
-Total scans  : 3420
-Matcher      : scan_to_map
-```
+Optional decimation keeps every `BEAM_STRIDE`-th beam (lab: 1, fr079: 2, intel: 1);
+indices and ranges are strided together so $\theta_i$ stays correct. Output: an
+$(N,2)$ array in the **body frame**. Code: `ranges_to_points` in
+[carto/local_slam/range_to_points.py](carto/local_slam/range_to_points.py).
 
 ---
 
-### Step 2: Converting Range Data to a 2D Point Cloud
+## 6. Stage B — voxel preprocessing (thinning)
 
-**File:** `carto/local_slam/range_to_points.py` — function `ranges_to_points()`
+**Plain idea.** With 909 beams, a nearby wall produces dozens of almost-identical
+points; they add cost without adding information. Collapse clusters to one
+representative point. Enabled only for lab_run_2 (`VOXEL_FILTER_ENABLED=True`);
+fr079/intel pass through unchanged.
 
-The raw sensor data is just a list of distances — one number per laser beam. To do any geometry, we first need to convert these distances into 2D (x, y) coordinates **in the robot's local frame** (the robot is at the origin, facing the +x direction).
+**Stage B.1 — fixed voxel centroid filter.** Partition the plane into square cells
+of side $v$ (`VOXEL_FIXED_SIZE` = 0.03 m). Each point is assigned the integer cell
+index $\lfloor \mathbf{p}/v\rfloor$; all points sharing a cell are replaced by their
+centroid
 
-**How it works (for a single beam):**
+$$
+\bar{\mathbf{p}}_c=\frac{1}{|C|}\sum_{\mathbf{p}\in C}\mathbf{p}.
+$$
 
-The sensor fires beam number `i` at a known angle:
-```
-angle_i = angle_min + i * angle_increment
-```
+**Stage B.2 — adaptive voxel filter.** Binary-search the largest voxel size in
+$[0,\,v_{\max}]$ (`VOXEL_ADAPTIVE_MAX_SIZE` = 0.10 m) whose fixed-filter output
+still retains at least $n_{\min}$ points (`VOXEL_ADAPTIVE_MIN_POINTS` = 200):
 
-The measured distance `r_i` converts to Cartesian:
-```
-x_i = r_i * cos(angle_i)
-y_i = r_i * sin(angle_i)
-```
+$$
+v^\star=\max\{\,v: |\,\text{fixed}_v(P)\,|\ge n_{\min}\,\},
+$$
 
-**Filters applied:**
-- Beams shorter than `LIDAR_MIN_RANGE` (0.10 m) are discarded — these are sensor noise or self-reflections.
-- Beams at or beyond `range_max` are discarded — these hit nothing (open space).
-- `BEAM_STRIDE` can skip every Nth beam to reduce computation (lab_run_2: stride 1 = use all; fr079: stride 2 = use every other beam).
-
-After this step, each scan is a NumPy array of shape `(N, 2)` — N points with (x, y) coordinates in the robot frame, measured in metres.
-
----
-
-### Step 3: Voxel Filtering (Point Cloud Thinning)
-
-**File:** [slam_core/matching/preprocessing.py](slam_core/matching/preprocessing.py)  
-**Class:** `PointCloudProcessor`
-
-**Why is this needed?**  
-The lab_run_2 dataset produces 909 laser beams per scan. Near a wall 0.5 m away, dozens of nearby beams all hit essentially the same spot. Having 50 nearly-identical points from the same wall patch does not help the solver — it just wastes compute. Voxel filtering reduces these to one representative point per region.
-
-**How it works — two stages:**
-
-**Stage 1 — Fixed Voxel Filter** (voxel size = 0.03 m for lab):
-- Divide 2D space into a grid of 3 cm × 3 cm cells (voxels).
-- All points that fall into the same cell are collapsed into their centroid (average position).
-- This removes tightly-clustered duplicates while preserving spatial coverage.
-
-**Stage 2 — Adaptive Voxel Filter:**
-- Binary search for the largest voxel size that still keeps at least `VOXEL_ADAPTIVE_MIN_POINTS` (200 for lab_run_2) points.
-- This ensures the output always has enough points for the scan matcher regardless of how sparse or dense the scene is.
-
-**Result for lab_run_2:** 909 raw beams → typically ~200 clean, well-distributed points.  
-**FR079 and Intel:** Voxel filtering disabled — 360/180 beams is already manageable.
+found by `VOXEL_ADAPTIVE_ITERS` = 6 bisection steps. This guarantees a roughly
+constant point budget regardless of scene density. Result for lab: 909 → ~200
+well-spread points. Code: `PointCloudProcessor` in
+[slam_core/matching/preprocessing.py](slam_core/matching/preprocessing.py).
 
 ---
 
-### Step 4: Pose Prediction ("Where Am I Before Matching?")
+## 7. Stage C — pose prediction (the matcher's initial guess)
 
-**Files:** `carto/local_slam/pose_extrapolator.py` and [hector/adapter.py](hector/adapter.py)
+**Plain idea.** Before matching, supply a starting pose. A good guess makes the
+matcher converge fast and avoids local minima.
 
-Before trying to match the new scan against the map, the system needs a starting guess for the robot's current pose. This guess is called the **predicted pose**.
+**What actually runs (shipped profiles).** Because `USE_EXTRAPOLATOR=False` for all
+three datasets, `_predict_world_pose` in [hector/adapter.py](hector/adapter.py)
+takes the simple branch:
 
-**What is a pose?**  
-A 2D pose is three numbers: `(x, y, θ)` — position in metres and heading angle in radians. The robot starts at `(0, 0, 0)`.
+$$
+\hat{\xi}_k=
+\begin{cases}
+\xi_k^{\text{odom}}, & \text{wheel odometry present (fr079, intel)},\\[4pt]
+\xi_{k-1}^{\text{match}}, & \text{otherwise (lab\_run\_2): last accepted pose},\\[4pt]
+(0,0,0), & \text{before the first match.}
+\end{cases}
+$$
 
-**Two prediction strategies:**
+So for lab_run_2 the prior is a **constant-position** model (the previous matched
+pose); for fr079/intel it is the **raw odometry** pose. Note that with the
+extrapolator off, the odometry-blend weight $\alpha=$ `ODOM_ALPHA` is never applied,
+and the matched pose does not feed back into the extrapolator.
 
-**Strategy A — Constant Velocity Extrapolator** (`PoseExtrapolatorCV`):  
-Tracks the robot's recent velocity. Predicts: `pose(t) = pose(t_last) + velocity × Δt`. This is like saying "if the robot was moving at 0.3 m/s to the right, it's probably 0.03 m further right 0.1 seconds later."
+**Present but inactive — the constant-velocity extrapolator.** When
+`USE_EXTRAPOLATOR=True`, `PoseExtrapolatorCV`
+([carto/local_slam/pose_extrapolator.py](carto/local_slam/pose_extrapolator.py))
+estimates a body velocity from the two ends of a short pose queue,
 
-**Strategy B — Raw Odometry** (when `USE_EXTRAPOLATOR = False`):  
-Uses the wheel encoder reading directly as the prediction. Simpler but relies entirely on the quality of the odometry.
+$$
+v_x=\frac{x_1-x_0}{t_1-t_0},\quad
+v_y=\frac{y_1-y_0}{t_1-t_0},\quad
+\omega=\frac{\operatorname{wrap}(\theta_1-\theta_0)}{t_1-t_0},
+$$
 
-**Odometry blending** (fr079 and intel only):  
-When odometry is available, the two predictions are blended:
-```
-predicted_pose = (1 - ODOM_ALPHA) × extrapolator_pose + ODOM_ALPHA × odometry_pose
-```
-For fr079: `ODOM_ALPHA = 0.5` (50/50 blend because the odometry is reliable).  
-For intel: `ODOM_ALPHA = 0.35` (less trust because intel odometry drifts).  
-For lab_run_2: `ODOM_ALPHA = 0.0` (no odometry, ignore).
+and predicts $\hat\xi_k = (x+v_x\,\Delta t,\; y+v_y\,\Delta t,\;
+\operatorname{wrap}(\theta+\omega\,\Delta t))$ with $\Delta t$ clamped to
+`EXTRAP_MAX_DT`. Odometry blending would then mix the two predictions
+componentwise with weight $\alpha$, including a wrapped angular blend
+$\theta\leftarrow\operatorname{wrap}\!\big(\hat\theta+\alpha\,
+\operatorname{wrap}(\theta^{\text{odom}}-\hat\theta)\big)$. IMU aiding (gyro
+yaw-rate substitution + a small absolute-yaw correction $\alpha_{\text{imu}}=0.02$)
+is also implemented here but disabled. **None of this executes in the documented
+runs** — it is retained for fast-motion / feature-poor scenarios.
 
 ---
 
-### Step 5: Scan Matching — The Heart of the System
+## 8. Scan matching, Path 1 — `scan_to_map` (classic Hector matcher)
 
-This is the most important step. The scan matcher takes the predicted pose and the filtered point cloud, and finds the **best pose** that makes the scan align with the current map.
+*One of the two interchangeable scan-matching pipelines (the other is §9). Pick one
+at startup; this section is self-contained.*
 
-There are two interchangeable matcher implementations:
+**Core idea.** Maintain one global occupancy grid and align each new scan to it by
+iterative nonlinear least squares (Gauss–Newton), coarse-to-fine over a
+resolution pyramid. File:
+[slam_core/matching/scan_to_map.py](slam_core/matching/scan_to_map.py).
+
+### 8.1 Occupancy grid and the log-odds field
+
+Each cell stores a **log-odds** value $\ell$. The occupancy probability is the
+logistic (sigmoid) map
+
+$$
+M = \sigma(\ell)=\frac{1}{1+e^{-\ell}}\in(0,1),
+$$
+
+so $\ell=0\Rightarrow M=0.5$ (unknown), $\ell>0$ occupied, $\ell<0$ free. Log-odds
+is used because Bayesian evidence accumulation becomes simple addition (§8.4).
+World→grid mapping (cell units, grid centred on the world origin):
+
+$$
+g_x=\frac{x}{\rho}+o_x,\qquad g_y=\frac{y}{\rho}+o_y,\qquad o=\tfrac{1}{2}\,\text{size}.
+$$
+
+**Bilinear interpolation.** $M$ is read at continuous grid coordinates so that the
+field is differentiable. With $x_0=\lfloor g_x\rfloor$, $y_0=\lfloor g_y\rfloor$,
+$d_x=g_x-x_0$, $d_y=g_y-y_0$:
+
+$$
+M(g)=(1-d_y)\big[(1-d_x)M_{00}+d_x M_{10}\big]+d_y\big[(1-d_x)M_{01}+d_x M_{11}\big].
+$$
+
+**Spatial gradient.** The gradient field used by the optimizer is computed once per
+iteration by central differences on the probability grid, then converted to
+per-metre units by dividing by $\rho$:
+
+$$
+\frac{\partial M}{\partial x}\Big|_{\text{cell}}=\tfrac12\big(M_{i+1,j}-M_{i-1,j}\big),
+\qquad
+\nabla_{\!w} M=\frac{1}{\rho}\,\big(\partial_x M,\;\partial_y M\big).
+$$
+
+Probability and gradient arrays are cached and recomputed only when the grid is
+marked dirty (a `_dirty` flag set on every map update), so unchanged scans reuse
+them.
+
+### 8.2 Resolution pyramid
+
+$L=3$ grids share the same physical extent but differ in cell size:
+
+$$
+\rho_\ell=\rho\cdot 2^{\,L-1-\ell},\qquad
+\rho_0=0.20\,\text{m (coarse)},\;\;\rho_1=0.10,\;\;\rho_2=0.05\,\text{m (fine)}.
+$$
+
+Coarse levels have wide basins of convergence (tolerate large initial error);
+fine levels give precision. The matcher optimizes coarse→fine, feeding each
+level's result as the next level's initial pose.
+
+### 8.3 Gauss–Newton scan-to-map alignment
+
+**Plain idea.** Slide and rotate the scan so its endpoints land on cells the map
+says are occupied. "Occupied" means $M\to1$, so we drive each endpoint's
+**residual** $r_i = 1-M(\cdot)$ toward zero.
+
+For a pose $\xi$ the $i$-th body point maps to the world point
+$\mathbf{q}_i(\xi)=R(\theta)\mathbf{p}_i+\mathbf{t}$, and the per-point residual is
+
+$$
+r_i(\xi)=1-M\big(\mathbf{q}_i(\xi)\big).
+$$
+
+The objective minimized over the in-bounds points is
+
+$$
+E(\xi)=\sum_i r_i(\xi)^2 = \sum_i\big[\,1-M(\mathbf{q}_i(\xi))\,\big]^2 .
+$$
+
+**Jacobian.** Each residual depends on $\xi=(x,y,\theta)$ through the map value at a
+moving point. By the chain rule, with $\partial r/\partial M=-1$:
+
+$$
+\frac{\partial r_i}{\partial \xi}
+= -\,\nabla_{\!w} M(\mathbf{q}_i)^\top\,\frac{\partial \mathbf{q}_i}{\partial \xi},
+\qquad
+\frac{\partial \mathbf{q}_i}{\partial(x,y)}=I_2,
+\qquad
+\frac{\partial \mathbf{q}_i}{\partial\theta}=\frac{dR}{d\theta}\mathbf{p}_i,
+$$
+
+with
+
+$$
+\frac{dR}{d\theta}=\begin{bmatrix}-\sin\theta & -\cos\theta\\ \cos\theta & -\sin\theta\end{bmatrix}.
+$$
+
+So the $1\times3$ Jacobian row is
+
+$$
+J_i=\Big[\,-\partial_x M,\;\; -\partial_y M,\;\;
+-\big(\nabla_{\!w}M\big)^\top \tfrac{dR}{d\theta}\mathbf{p}_i\,\Big].
+$$
+
+This is exactly the Hector SLAM Jacobian (Kohlbrecher et al., 2011) and matches
+`align_pose_gauss_newton` lines 277–286.
+
+**Normal equations (Gauss–Newton with Levenberg–Marquardt damping).** Stacking
+$J$ (size $m\times3$) and the residual vector $r$ (size $m$):
+
+$$
+H=J^\top J+\lambda I_3,\qquad g=J^\top r,\qquad
+\boxed{\;\delta=-H^{-1}g\;}
+$$
+
+$\lambda=$ `GN_DAMPING` keeps $H$ invertible when the geometry is degenerate
+(e.g. a single straight wall constrains only one translation direction). The step
+is clamped per component to avoid overshoot,
+
+$$
+\delta_x,\delta_y\in[-\,c_{xy},\,c_{xy}]\ (c_{xy}=\texttt{CORR\_MAP\_STEP\_CLIP\_XY}=0.03\,\text{m}),
+\qquad
+\delta_\theta\in[-1^\circ,1^\circ],
+$$
+
+then applied, $\xi\leftarrow(x+\delta_x,\,y+\delta_y,\,\operatorname{wrap}(\theta+\delta_\theta))$.
+Iteration stops at `GN_ITERS_PER_LEVEL[ℓ]`, when fewer than `min_points` endpoints
+are in bounds, or when $\lVert\delta\rVert<10^{-6}$.
+
+**Coarse-to-fine loop.** Levels are processed from largest $\rho$ to smallest; the
+pose carries over between levels.
+
+### 8.3.1 Bootstrap and acceptance
+
+- **Bootstrap.** With an empty map the gradient field is flat and GN cannot move.
+  The first `N_BOOTSTRAP_SCANS` (=1) scans are integrated *at the predicted pose
+  without optimization* (`match()` returns `success=False`, score $=-1$, so the
+  prediction loop is not polluted). After that the map has enough evidence.
+- **Score.** After the finest level, the match quality is the mean occupancy at the
+  matched endpoints,
+  $$
+  s=\frac{1}{|\mathcal{I}|}\sum_{i\in\mathcal{I}} M(\mathbf{q}_i),\qquad
+  \mathcal{I}=\{\text{in-bounds finest-grid endpoints}\}.
+  $$
+- **Acceptance.** Hector itself never rejects on inliers or jump size; only a score
+  guard remains: the match is accepted iff $s\ge s_{\min}$ (`CORR_MAP_MIN_SCORE`,
+  0.10 lab / 0.35 fr079). On failure the **predicted** pose is returned as a
+  fallback and a `!! FALLBACK` line is printed.
+
+### 8.4 Map update — painting the scan into the map (ray casting)
+
+**Plain idea.** Everything between the sensor and a hit is free space; the hit cell
+is occupied. Add evidence accordingly.
+
+For each accepted endpoint, the ray from the sensor origin $g_0$ to the endpoint
+$g_1$ (both in grid coords) is sampled at $N_{\text{ray}}$ uniform points
+(`np.linspace`). All cells **except** the endpoint receive the free update; the
+endpoint receives the occupied update, with clamping:
+
+$$
+\ell \leftarrow \operatorname{clip}\big(\ell+\ell_{\text{free}},\,\ell_{\min},\ell_{\max}\big)\ \text{(along ray)},
+\qquad
+\ell \leftarrow \operatorname{clip}\big(\ell+\ell_{\text{occ}},\,\ell_{\min},\ell_{\max}\big)\ \text{(endpoint)}.
+$$
+
+This is the additive log-odds form of Bayesian occupancy updating; clamping to
+$\pm5$ bounds any single reading's influence so the map stays adaptable. The update
+is applied to **all three pyramid levels**. Code: `integrate_scan_simple`. The
+adapter throttles insertions via `MAP_UPDATE_EVERY` (1 = every scan); on a matcher
+*failure* it still inserts at the predicted pose (dead-reckoning) so the map keeps
+growing along the path instead of stalling at the bootstrap region.
 
 ---
 
-#### Matcher A — Scan-to-Map (Hector-Style)
+## 9. Scan matching, Path 2 — `scan_to_submap` (Cartographer-style front-end)
 
-**File:** [slam_core/matching/scan_to_map.py](slam_core/matching/scan_to_map.py)
+*The second of the two interchangeable scan-matching pipelines (the other is §8).
+Self-contained as a local matcher; the optional pose-graph improvement in §10 can be
+layered on top of it.*
 
-**Core idea:** Match the new laser scan directly against a single large global occupancy grid map using iterative mathematical optimization. This is the classic Hector SLAM approach.
+**Core idea.** Instead of one global grid, keep a small rolling set of **submaps**.
+Match each scan to the active submap by a discrete **correlative search** (robust
+to larger initial error) followed by a continuous **GN-LM refine**. This is the
+single unified front-end shared with the Cartographer pipeline; there is no second
+copy (`scan_to_submap_old.py` was removed). Package:
+[slam_core/matching/scan_to_submap/](slam_core/matching/scan_to_submap/).
+
+### 9.1 Submap representation and lifecycle
+
+A `ProbabilityGrid` is a $20\,\text{m}\times20\,\text{m}$, 0.05 m log-odds grid
+anchored at a world pose $\xi_s$ (its origin), with the same $\sigma(\ell)$
+probability and the same clamp as §8.1. Insertion uses **Bresenham** rays (integer
+line rasterization) rather than `linspace`, but the log-odds update is identical:
+free along the ray, occupied at the endpoint, clamped.
+
+Scans are first transformed into the submap frame before insertion:
+
+$$
+\mathbf{q}^{\,s}=\xi_s^{-1}\oplus\big(\xi_k\oplus\mathbf{p}\big),
+$$
+
+i.e. world endpoints rebased into the submap's local frame.
+
+**Lifecycle (`SubmapBuilder2D`, Cartographer-faithful).** Exactly two active
+submaps are kept: `active[0]` is the mature matching target, `active[1]` is filling.
+
+- When `active[0]` reaches $N_s$ scans (`SCANS_PER_SUBMAP`) it is **marked
+  finished** but *not* removed — it remains the match target.
+- The pair **rotates** only once `active[1]` has $\ge N_s/2$ scans: `active[0]` is
+  dropped, the finished submap moves to the finished list, and a fresh empty submap
+  is appended. This guarantees the target always has $\ge N_s/2$ scans of evidence,
+  avoiding score $=-1$ fallbacks at handoffs.
+
+Matching targets the **oldest** active submap (richest evidence).
+
+### 9.2 Discrete correlative search (two-stage brute force)
+
+**Plain idea.** Try a grid of candidate poses around the prediction; keep the one
+whose scan endpoints land on the most-occupied cells. Two stages: a fast coarse
+sweep on a downsampled grid, then a fine sweep around the winner.
+
+A **precomputation stack** is built by repeated $2\times2$ **max-pooling** of the
+submap probability image; level $\ell$ has been downsampled by $2^\ell$. The score
+of a candidate submap-frame pose $\xi$ is the mean occupancy at its
+nearest-cell-rounded endpoints, evaluated at level $\ell$:
+
+$$
+\text{score}(\xi,\ell)=
+\frac{1}{|\mathcal{V}|}\sum_{i\in\mathcal{V}}
+\text{Grid}_\ell\Big[\,\operatorname{round}\!\big(g(\mathbf q_i(\xi))/2^\ell\big)\Big],
+$$
+
+requiring at least `min_valid` in-bounds points (else $-\infty$). Using a max-pooled
+level gives an **optimistic upper bound**, so a coarse winner cannot hide a better
+fine solution nearby.
+
+**Stage 1 (coarse, level 2 = 4× down).** Exhaustively sweep offsets
+
+$$
+(\delta x,\delta y)\in[-W_{xy},W_{xy}]^2\ \text{step}\ \Delta_{xy},
+\qquad
+\delta\theta\in[-W_\theta,W_\theta]\ \text{step}\ \Delta_\theta,
+$$
+
+centred on the predicted submap-frame pose. (lab: $W_{xy}=1.0$ m, $W_\theta\approx
+23^\circ$, $\Delta_{xy}=0.10$ m, $\Delta_\theta\approx2.9^\circ$.)
+
+**Stage 2 (fine, level 0 = full res).** Repeat in a tight window around the coarse
+winner (lab: $\pm0.25$ m / $\pm6.9^\circ$, step 0.05 m / $1.1^\circ$).
+
+Code: `correlative_match_two_stage` in
+[slam_core/matching/scan_to_submap/correlative.py](slam_core/matching/scan_to_submap/correlative.py).
+The point set is downsampled to `SUBMAP_MAX_MATCH_POINTS` for this stage only.
+
+### 9.3 Continuous GN-LM refinement with a motion prior
+
+**Plain idea.** Polish the discrete winner to sub-cell accuracy, while gently
+anchoring it to the prediction so a weak/ambiguous scan can't teleport the pose.
+
+This solves an augmented least-squares problem (`CartoRefinementProblem` in
+[slam_core/matching/scan_to_submap/refine.py](slam_core/matching/scan_to_submap/refine.py))
+whose residual stacks two blocks:
+
+**(a) Occupancy residuals**, one per in-bounds point, identical in spirit to §8.3
+but using the bilinearly-interpolated submap probability $p$ and its analytic
+bilinear gradient $(\partial_x p,\partial_y p)$:
+
+$$
+r_i^{\text{occ}}=1-p(\mathbf q_i),\qquad
+J_i^{\text{occ}}=\Big[-\partial_x p,\;-\partial_y p,\;
+-\big(\partial_x p\,\dot q_{x,i}+\partial_y p\,\dot q_{y,i}\big)\Big],
+$$
+
+where $\dot q_{x}=-\sin\theta\,p_x-\cos\theta\,p_y$ and
+$\dot q_{y}=\cos\theta\,p_x-\sin\theta\,p_y$ are $\partial\mathbf q/\partial\theta$.
+
+**(b) Prior residuals** anchoring to the predicted submap-frame pose
+$\hat\xi=(\hat x,\hat y,\hat\theta)$, with separate translation/rotation weights:
+
+$$
+r^{\text{prior}}=
+\begin{bmatrix}
+w_t\,(x-\hat x)\\
+w_t\,(y-\hat y)\\
+w_r\,\operatorname{wrap}(\theta-\hat\theta)
+\end{bmatrix},
+\qquad
+J^{\text{prior}}=\operatorname{diag}(w_t,w_t,w_r).
+$$
+
+Weights (lab): $w_t=$ `SUBMAP_REFINE_W_TRANS` $=0.1$ (gentle translation anchor),
+$w_r=$ `SUBMAP_REFINE_W_ROT` $=1.0$ (firmer rotation anchor). The combined system
+
+$$
+r=\begin{bmatrix}r^{\text{occ}}\\ r^{\text{prior}}\end{bmatrix},\quad
+J=\begin{bmatrix}J^{\text{occ}}\\ J^{\text{prior}}\end{bmatrix}
+$$
+
+is minimized by the generic `GaussNewtonLM` solver
+([slam_core/optimisers/gn_lm.py](slam_core/optimisers/gn_lm.py)), i.e. the same
+$H=J^\top J+\lambda I$, $\delta=-H^{-1}J^\top r$ update with per-iteration step
+clipping (0.10 m / 5°), up to 12 iterations. The 3-DOF local refine is **native
+NumPy** — g2o is reserved for the pose graph (§10).
+
+### 9.4 Acceptance, score, and the motion filter
+
+- **Reported score** is the *coarse correlative* score $s$ (not the refined score);
+  the refined pose is the actual estimate returned.
+- **Acceptance.** With `reject_below_min_score=True` (the Hector profile), a coarse
+  score below `SUBMAP_MIN_SCORE` yields a **FALLBACK** to the predicted pose
+  instead of refining from a weak initializer — this avoids accepting ambiguous
+  matches during fast turns.
+- **Motion filter** (submap mode only) decides *whether to insert* a scan into the
+  submap. Insertion fires if any threshold is exceeded since the last insertion:
+
+$$
+\Delta\text{trans} > d_{\max}\ \ \lor\ \ \Delta\text{rot} > a_{\max}\ \ \lor\ \ \Delta t > t_{\max}.
+$$
+
+The thresholds derive from expected motion,
+$d_{\max}=\operatorname{clip}(v_{\exp}\,t_{\text{period}},\,0.05,\,0.50)\,\text{m}$
+and $a_{\max}=\operatorname{clip}(\omega_{\exp}\,t_{\text{period}},\,0.5^\circ,\,10^\circ)$,
+with $t_{\max}=$ `TARGET_INSERT_PERIOD_S` $=0.10$ s (`adapter.py`,
+`make_motion_filter_from_expected_velocity`). `scan_to_map` does not use this; it
+uses the simpler `MAP_UPDATE_EVERY` cadence (§8.4).
 
 ---
 
-##### 5A.1 — The Occupancy Grid Map
+## 10. Optional improvement stage — online pose-graph optimization (g2o SE(2))
 
-Think of the map as a giant sheet of graph paper where each 5 cm × 5 cm square (cell) stores a single number representing what the robot believes about that cell:
+> **This is not part of the core scan-matching pipeline.** Sections 8 and 9 are each
+> complete on their own and produce a full trajectory and map without any of the
+> machinery below. The pose graph is an **optional refinement layered on top of
+> `scan_to_submap`**: it leaves the front-end (prediction, matching, map insertion)
+> untouched and only post-corrects the *poses* to reduce accumulated drift. It is
+> inactive unless `--enable-pgo` is passed, and it has no effect on `scan_to_map`.
 
-- **Positive number** → probably occupied (wall, obstacle)
-- **Zero** → completely unknown
-- **Negative number** → probably free space (open area)
+**Enabled by** `--enable-pgo` with `--matcher scan_to_submap`. This is the
+Cartographer-style **back-end** that turns the drift-prone front-end estimate into a
+globally consistent one. Everything runs *online* during the scan loop, with a final
+solve at the end. Modules: [carto/pose_graph/](carto/pose_graph/) +
+[carto/pose_graph/backends/g2o_backend_2d.py](carto/pose_graph/backends/g2o_backend_2d.py).
 
-The stored number is actually in **log-odds** form (a mathematical transformation of probability) to make updates numerically stable. The actual occupancy probability is recovered as:
-```
-P(occupied) = 1 / (1 + exp(-logodds))
-```
+### 10.1 Graph structure
 
-**Multi-resolution pyramid:**  
-Three versions of this map are maintained simultaneously at different resolutions:
+A pose graph is a set of **vertices** (poses to estimate) and **edges**
+(relative-pose measurements with confidences).
 
-| Level | Cell Size | Purpose |
+- **Submap vertices** $\xi_{s}$ — one per submap origin.
+- **Node vertices** $\xi_{n}$ — one per *accepted, inserted* scan keyframe (added
+  by `add_node_with_intra_constraints`). FALLBACK poses never become nodes.
+- **Edges** carry a measurement $z$ (a relative pose) and an **information matrix**
+  $\Omega$ (inverse covariance — bigger = more trusted), $\Omega=\operatorname{diag}(w_t,w_t,w_r)$.
+
+`G2oBackend2D` maps the two id spaces into one disjoint g2o vertex space (submaps →
+even ids, nodes → odd ids) and uses `VertexSE2` / `EdgeSE2`.
+
+### 10.2 The three constraint families
+
+**(1) Intra-submap constraints** (trusted local matches). For each submap a node
+was inserted into, the measurement is the node pose expressed in the submap frame:
+
+$$
+z^{\text{intra}}_{s,n}=\xi_s^{-1}\oplus\xi_n,
+\qquad (w_t,w_r)=(5\times10^2,\,1.6\times10^3).
+$$
+
+**(2) Inter-submap (loop-closure) constraints** (§10.3). Same algebraic form, but
+between a *historical* submap $t$ and a current node, with much higher weight and a
+robust kernel:
+
+$$
+z^{\text{loop}}_{t,n}=\xi_t^{-1}\oplus\xi_n^{\text{matched}},
+\qquad (w_t,w_r)=(1.1\times10^4,\,1\times10^5).
+$$
+
+**(3) Local-trajectory "spine" constraints** (consecutive nodes). These preserve
+the front-end's trajectory shape under loop-closure deformation. Between
+consecutive node ids $i,i{+}1$ the measurement uses the online (pre-solve) poses,
+
+$$
+z^{\text{spine}}_{i,i+1}=\xi_i^{-1}\oplus\xi_{i+1},
+\qquad (w_t,w_r)=(1\times10^5,\,1\times10^5),
+$$
+
+added in `_add_local_trajectory_regularization`. (Using the global online pose
+rather than the submap-relative pose avoids a spurious large jump at submap
+boundaries.)
+
+### 10.3 Online loop-closure detection
+
+A loop closure is the recognition that the robot has returned to an earlier place,
+giving a constraint that ties distant parts of the trajectory together. Detection
+has three filters (`CartoLoopClosureAdapter`, `LoopClosureManager`):
+
+**(i) Spatial candidate gating.** For a new node, consider only *finished* submaps
+whose current estimated origin lies within `spatial_search_radius` $=8.0$ m of the
+node's guess, excluding submaps the node already belongs to, and only every
+`check_every_n_nodes` $=5$-th node (cost control). A node-index separation of
+`min_node_index_separation` $=30$ prevents matching near-neighbours. (For the small
+lab loop, `recent_finished_submap_exclusion` $=0$ so the robot can close against the
+very first submap when it returns to the origin.)
+
+**(ii) Geometric verification (branch-and-bound).** Each candidate is verified by
+re-matching the node's scan against the candidate submap with the **branch-and-bound
+correlative matcher**
+([branch_and_bound_backend.py](slam_core/matching/scan_to_submap/branch_and_bound_backend.py)).
+This uses a stack of **forward-looking max-filter precomputation grids** (level $i$
+stores the max probability over a $2^i\times2^i$ forward box) to compute, cheaply,
+an **upper bound** on the achievable score for a whole block of candidate offsets.
+The recursion (`_branch_and_bound`) explores high-score branches first and prunes
+any branch whose upper bound cannot beat the current best — guaranteeing the global
+optimum within the search window without scoring every cell. The angular step is
+derived from the maximum scan radius $d_{\max}$ and resolution so that one angular
+bin corresponds to roughly one cell of arc:
+
+$$
+\Delta\theta=\max\!\Big(\theta_{\min},\;\arccos\!\big(1-\tfrac{\rho^2}{2d_{\max}^2}\big)\Big).
+$$
+
+The best candidate is then continuously refined (the §9.3 GN-LM problem).
+
+**(iii) Consistency gate.** Even a high-scoring match is rejected unless it agrees
+with the current graph estimate. With predicted and matched node-in-target relative
+poses $z^{\text{pred}}=\xi_t^{-1}\oplus\xi_n^{\text{guess}}$ and
+$z^{\text{match}}=\xi_t^{-1}\oplus\xi_n^{\text{matched}}$, the residual
+
+$$
+\Delta=\big(z^{\text{pred}}\big)^{-1}\oplus z^{\text{match}},\qquad
+\lVert\Delta_{xy}\rVert\le 1.0\,\text{m},\quad |\Delta_\theta|\le 0.209\,\text{rad}\,(12^\circ)
+$$
+
+must hold (defaults `max_loop_translation_residual_m`,
+`max_loop_rotation_residual_rad`). The score must also clear `min_score` $=0.50$.
+Accepted constraints are deduplicated per (node, target) pair.
+
+### 10.4 The g2o optimization
+
+**Objective.** With $\mathcal{V}=\{\xi_s\}\cup\{\xi_n\}$ the optimizer minimizes the
+total Mahalanobis edge error,
+
+$$
+\min_{\mathcal V}\;
+\sum_{e\in\mathcal E}\rho_e\!\Big(\;e_e^\top\,\Omega_e\,e_e\Big),
+\qquad
+e_e \;=\; \log_{SE(2)}\!\Big(z_e^{-1}\cdot\big(\xi_a^{-1}\oplus\xi_b\big)\Big),
+$$
+
+where edge $e$ connects vertices $a,b$ with measurement $z_e$, $e_e\in\mathbb{R}^3$
+is the $SE(2)$ residual in the tangent space (g2o's `EdgeSE2` error), and $\rho_e$
+is identity for intra/spine edges and the **Huber** kernel for loop edges. Huber
+caps the influence of a residual once $\lVert e\rVert$ exceeds $\delta_H=$
+`huber_scale` $=10$,
+
+$$
+\rho_H(s)=
+\begin{cases}
+s, & s\le \delta_H^2,\\
+2\delta_H\sqrt{s}-\delta_H^2, & s> \delta_H^2,
+\end{cases}
+$$
+
+so a single bad loop closure cannot dominate the solution.
+
+**Gauge fix.** Submap 0 is held fixed (`set_fixed("submap",0)`), removing the global
+translation/rotation gauge freedom that would otherwise leave the problem rank-3
+deficient.
+
+**Solver.** g2o's `SparseOptimizer` with a `BlockSolverSE2` over an Eigen sparse
+linear solver and the **Levenberg–Marquardt** algorithm
+(`OptimizationAlgorithmLevenberg`), up to 50 iterations. At each LM step it solves
+the damped normal equations $(\mathbf H+\mu\,\mathrm{diag}(\mathbf H))\,\Delta=
+-\mathbf b$, where $\mathbf H=\sum_e \mathbf J_e^\top\Omega_e\mathbf J_e$ and
+$\mathbf b=\sum_e \mathbf J_e^\top\Omega_e e_e$ are assembled from per-edge
+Jacobians, accepting the step only if the error decreases (otherwise increasing
+$\mu$). This is the same GN/LM machinery as §8.3, now over the full sparse graph in
+C++ instead of one dense 3×3 system.
+
+**Scheduling & write-back.** `CartoGlobalSlam2D.on_node_inserted` triggers a solve
+every `optimize_every_n_nodes` $=90$ nodes (guarded by having $\ge1$ intra
+constraint), and `finalize()` runs a last full solve. After each solve, optimized
+**submap poses are written back into the live `SubmapBuilder2D`**
+(`_sync_submaps_to_builder`) so subsequent insertions and loop-distance checks use
+corrected positions — closing the loop between back-end and front-end.
+
+### 10.5 Exporting the corrected trajectory
+
+The online trajectory file holds one row per scan; nodes are sparse keyframes. To
+produce a **dense** corrected trajectory, each node's rigid correction is computed
+as the left-multiplied delta between its optimized and online (drifted) poses,
+
+$$
+\Delta_n=\xi_n^{\text{opt}}\oplus\big(\xi_n^{\text{online}}\big)^{-1},
+$$
+
+and every scan inherits the correction of its **most recent keyframe node** $n(k)$:
+
+$$
+\xi_k^{\text{pgo}}=\Delta_{n(k)}\oplus\xi_k^{\text{online}}.
+$$
+
+The result is written to `trajectory_*_pgo.txt`. Because this is the post-solve
+trajectory, it is the one used for map rebuild and evaluation (the hard rule:
+*always export the optimized trajectory*).
+
+> **Standalone offline PGO.** A separate scipy-based tool
+> [hector/eval/pgo_any.py](hector/eval/pgo_any.py) implements an *offline*
+> post-processing pose graph (spatial + scan-context loop detection, sparse
+> `spsolve`, Huber weighting) that reads a finished `trajectory_*.txt`. It is **not**
+> part of the live runner and is not the g2o path documented above; it remains as an
+> alternative analysis tool.
+
+---
+
+## 11. Stage G — outputs
+
+**Trajectory** `hector_outputs/trajectory_<tag>_<matcher>_<N>.txt`, one row per
+scan: `t  x  y  θ  score` (bootstrap rows carry score $=-1$). A 13-column
+`_debug.txt` adds per-scan diagnostics (`inliers`, per-scan delta
+$(\delta x,\delta y,\delta\theta)$, `do_insert`, `did_insert`). With PGO, the dense
+corrected `_pgo.txt` is also written (§10.5).
+
+**Map.** The occupancy grid is converted cell-by-cell to probability
+$M=\sigma(\ell)$ and rendered as greyscale (white = free, black = occupied, grey =
+unknown), with the $(x,y)$ trajectory overlaid. Rebuild/plot helpers:
+`hector/eval/rebuild_map_any.py`, `hector/plot_single_trajectory.py`,
+`hector/viz/`.
+
+---
+
+## 12. Algorithm summary
+
+| Component | Method | Code |
 |---|---|---|
-| Level 0 (coarsest) | 0.20 m (20 cm) | Big-picture alignment, tolerates large errors |
-| Level 1 (medium) | 0.10 m (10 cm) | Medium refinement |
-| Level 2 (finest) | 0.05 m (5 cm) | Sub-centimetre precision |
-
-All three levels cover the same physical area and are kept updated in sync. This is called a **map pyramid** and is the key to efficient coarse-to-fine alignment.
-
----
-
-##### 5A.2 — Bootstrap Phase
-
-Before the first real scan-to-map alignment can work, the map must contain some information — otherwise the gradient field is flat and the solver has nothing to pull on.
-
-The **bootstrap** integrates the first scan directly at the predicted pose (no optimization), painting it into all three map levels. Only 1 bootstrap scan is needed (configurable). After that, the map has enough evidence for the Gauss-Newton optimizer to work.
-
----
-
-##### 5A.3 — Coarse-to-Fine Gauss-Newton Optimization
-
-This is the core of the scan matcher. It runs on the map pyramid, from the coarsest level to the finest level, iteratively adjusting the pose to minimize the mismatch between the new scan and the map.
-
-**What "alignment" means in plain language:**
-
-Imagine you are holding a transparent overlay sheet (the new scan) over the graph-paper map. The overlay has dots where the laser hit walls. You slide and rotate the overlay until the dots line up with the dark (occupied) areas on the map as well as possible. Gauss-Newton is the mathematical procedure for finding that best position and angle automatically.
-
-**Gauss-Newton iteration (one step):**
-
-1. Take the current pose estimate `(x, y, θ)`.
-2. Transform all scan points from robot frame to world frame using `(x, y, θ)`.
-3. For each transformed point, look up the **occupancy probability** in the current map level (using bilinear interpolation for sub-pixel accuracy — this means reading a smoothly interpolated value between the four nearest grid cells rather than snapping to the nearest cell).
-4. Compute the **residual** for each point: `r = 1.0 - P(occupied)`. A residual of 0 means the point sits exactly on a known wall; a residual of 1 means the point is in unknown or free space.
-5. Compute the **Jacobian** — how much would the residuals change if we moved the pose slightly in x, y, or θ? This uses the map's spatial gradient (computed once per iteration using finite differences across adjacent cells) and the derivative of the rotation matrix with respect to θ.
-6. Solve the **normal equations**: `H·δ = -g` where `H = Jᵀ J + λI` and `g = Jᵀ r`. The small damping term `λI` (Levenberg–Marquardt regularization) prevents numerical explosions when H is nearly singular.
-7. **Clip the step size** to at most ±0.03 m in x/y and ±1° in θ. This prevents the optimizer from jumping too far in one step and overshooting.
-8. Apply the update: `pose += δ`.
-9. Repeat until the step magnitude is below 1e-6 (converged) or the maximum iteration count is reached.
-
-**Coarse-to-fine sequence:**
-
-| Map Level | Iterations | Why |
-|---|---|---|
-| Coarsest (0.20 m) | 20 (lab), 2 (fr079) | Large steps, gets close fast |
-| Medium (0.10 m) | 15 (lab), 2 (fr079) | Medium refinement |
-| Finest (0.05 m) | 10 (lab), 1 (fr079) | Fine-grained precision |
-
-The output of each level is fed as the starting pose for the next (finer) level.
-
-**Acceptance test:**
-
-After the finest-level GN finishes, the system checks whether the match is trustworthy:
-- Compute `score = mean P(occupied)` for all scan points at the matched pose on the finest grid.
-- If `score ≥ min_score` (0.10 for lab, 0.35 for fr079), the match **succeeds** and the returned pose is used.
-- If the score is too low (points landed in free space — bad alignment), the match **fails** and the predicted pose is returned as a fallback.
-
-The score threshold is intentionally low (0.10) for lab_run_2 because the sparse indoor environment naturally scores lower than a dense corridor.
+| Range → points | polar→Cartesian + range/finite gating | `range_to_points.py` |
+| Preprocess | fixed-voxel centroid + adaptive (bisection) voxel | `preprocessing.py` |
+| Prediction (active) | raw odom / last matched pose (`USE_EXTRAPOLATOR=False`) | `adapter.py` |
+| Prediction (dormant) | constant-velocity + odom/IMU blend | `pose_extrapolator.py` |
+| scan_to_map | multi-res log-odds grid, coarse-to-fine GN+LM | `scan_to_map.py` |
+| scan_to_submap search | two-stage correlative (max-pool stack) | `correlative.py` |
+| scan_to_submap refine | GN-LM, occupancy + translation/rotation prior | `refine.py`, `gn_lm.py` |
+| Submap mgmt | 2-active rotation, finish at $N_s$, rotate at $N_s/2$ | `submaps.py` |
+| Map update | log-odds add (linspace ray / Bresenham), clamp ±5 | `scan_to_map.py`, `submaps.py` |
+| Loop detection | spatial gate + branch-and-bound verify + consistency gate | `loop_closure*.py`, `branch_and_bound_backend.py` |
+| Pose graph | $SE(2)$ vertices/edges, intra + loop + spine, Huber on loops | `pose_graph_2d.py` |
+| PGO solver | g2o `BlockSolverSE2` + Levenberg, submap 0 fixed | `g2o_backend_2d.py` |
+| Trajectory export | per-node rigid correction propagated to all scans | `run_local_slam_new.py` |
 
 ---
 
-#### Matcher B — Scan-to-Submap (Cartographer-Style)
+## 13. What this implementation deliberately does *not* do
 
-**File:** [slam_core/matching/scan_to_submap_old.py](slam_core/matching/scan_to_submap_old.py)
-
-**Core idea:** Instead of one giant global map, maintain a rolling set of **submaps** — small local maps that cover only a recent portion of the robot's path. Match each new scan against the currently active submap using a two-stage search.
-
----
-
-##### 5B.1 — Submap Management
-
-A submap is an independent occupancy grid (20 m × 20 m, 5 cm resolution) anchored at a fixed world position. The system always maintains **two active submaps**:
-
-- **Submap N** — the current (newest) submap, still being filled.
-- **Submap N-1** — the previous submap, recently finished but kept for matching.
-
-When a submap accumulates enough scans (`SCANS_PER_SUBMAP`: 500 for lab, 90 for fr079/intel), it is **finished** (frozen) and a new submap is created. A finished submap is available for matching until it is eventually rotated out.
-
-This design means the system never needs a single monolithic global map in memory. For a long 800-metre run like the Intel dataset, many submaps are created and finished in sequence.
+- **No IMU fusion** in the live path (hooks exist, disabled).
+- **No constant-velocity prediction or odom blending** in the shipped profiles
+  (`USE_EXTRAPOLATOR=False`); the prediction is raw odom or the last matched pose.
+- **No loop closure inside `scan_to_map`** — that matcher is purely local; global
+  consistency is only available via the `scan_to_submap` + g2o back-end.
+- **g2o is used only for the pose graph.** All per-scan 3-DOF matching is native
+  NumPy Gauss–Newton; there is no `pyceres` in the default path.
+- **No ROS / GTSAM / Ceres** in the documented pipeline.
 
 ---
 
-##### 5B.2 — Correlative Two-Stage Search
+## 14. File-by-file data flow (current)
 
-Unlike scan-to-map which starts from the predicted pose and only refines, scan-to-submap first performs a **brute-force search** over a grid of candidate poses. This makes it more robust to larger prediction errors.
-
-**Stage 1 — Coarse Search (on the 4× downsampled map level):**
-- Systematically try every combination of x, y, θ within a search window around the predicted pose.
-  - Lab: ±1.0 m in x/y, ±23° in θ; step = 0.10 m / 2.9°
-  - FR079: ±0.30 m in x/y, ±11°; step = 0.05 m / 2.9°
-- For each candidate pose, transform the scan points and compute the mean occupancy score on the coarse (4× downsampled) grid.
-- Record the candidate with the highest score.
-
-This is slow but thorough — it cannot miss a good match as long as it is within the search window.
-
-**Stage 2 — Fine Search (on the finest map level):**
-- Center a tighter search window on the coarse winner.
-  - Lab: ±0.25 m / ±6.9°; step = 0.05 m / 1.1°
-  - FR079: ±0.15 m / ±4.6°; step = 0.03 m / 1.1°
-- Repeat the brute-force grid evaluation but at full resolution.
-- Record the best fine candidate.
-
-**Stage 3 — Gauss-Newton-LM Refinement:**
-
-The best fine-search candidate is refined further with a GN-LM solver (Gauss-Newton with Levenberg–Marquardt damping). Unlike the scan-to-map GN above, this version includes a **regularization term** that anchors the refined pose close to the predicted pose:
-
-- Residuals = scan-to-grid alignment residuals (same as before) + weighted penalty for drifting from the prior pose.
-- Weights: `w_trans = 0.1–0.2` (gentle translation anchor), `w_rot = 1.0` (stronger rotation anchor).
-- Up to 12 iterations; step clipped to 0.10 m / 5° per iteration.
-
-**Acceptance:** Score ≥ `SUBMAP_MIN_SCORE` (0.50–0.60 depending on dataset) for success.
-
----
-
-##### 5B.3 — Motion Filter (Scan-to-Submap Only)
-
-Not every matched scan needs to be inserted into the submap. Inserting when the robot has barely moved wastes compute and adds noise. The **motion filter** only triggers a submap update when:
-- The robot has moved more than `max_distance_meters` (typically 0.05 m), OR
-- The robot has rotated more than `max_angle_radians` (typically 0.5°–10°), OR
-- More than `max_time_seconds` (0.10 s) has elapsed since the last insertion.
-
-For scan-to-map mode, the motion filter is replaced by a simpler `MAP_UPDATE_EVERY` — insert every Nth scan (default 1, meaning every scan).
-
----
-
-### Step 6: Map Update (Painting the Scan into the Map)
-
-**File:** [slam_core/matching/scan_to_map.py](slam_core/matching/scan_to_map.py) — `integrate_scan_simple()`
-
-After finding the matched pose, the system updates the map with what the new scan observed. This uses **ray casting**:
-
-For each laser beam endpoint:
-1. Draw a line (ray) from the robot's position to the endpoint.
-2. All grid cells along the ray (except the endpoint) are marked **more free**: `logodds += L_FREE` (−0.1).
-3. The endpoint cell is marked **more occupied**: `logodds += L_OCC` (+0.85 to +1.0).
-4. Both updates are clipped to the range `[L_MIN, L_MAX]` = `[−5, +5]` to prevent any single reading from dominating.
-
-The ray is traced using **linspace** (uniform steps along the line from robot to endpoint). The number of steps is `RAY_STEPS` (20 for lab, 40 for fr079/intel — more steps for the longer-range SICK sensor).
-
-This is done for all three pyramid levels simultaneously, keeping the coarse levels consistent with the fine level.
-
----
-
-### Step 7: Trajectory Recording
-
-**File:** [hector/run_local_slam_new.py](hector/run_local_slam_new.py) — lines 398–407
-
-After every scan, the final pose is written to two output files in the `hector_outputs/` directory:
-
-**Trajectory file** (5 columns, one row per scan):
 ```
-timestamp   x(m)    y(m)    theta(rad)  score
-1234567.891  0.123  -0.045   0.012       0.634
-```
-
-**Debug log file** (13 columns):
-```
-k  t   x   y   theta  score  inliers  dx  dy  dtheta  do_insert  did_insert
-```
-This contains internal diagnostics — how many inlier points were found, how much the pose moved per scan, whether the scan was inserted into the map.
-
-The filename encodes all relevant settings, e.g.:
-```
-hector_outputs/trajectory_lab_run_2_raw_scan_to_map_3420.txt
+datasets/<name>/<log>                                  raw log
+  └► slam_core/dataio/dataset_catalog.py               DatasetProfile + reader → scan dicts
+       └► hector/run_local_slam_new.py                 MAIN LOOP (CLI, scheduling, IO)
+            ├► carto/local_slam/range_to_points.py      ranges → body-frame points  (§5)
+            ├► slam_core/matching/preprocessing.py      voxel thinning              (§6)
+            ├► hector/adapter.py                         predict + motion filter + node insert (§7,§9.4)
+            │    └► carto/local_slam/pose_extrapolator.py  (dormant CV extrapolator)
+            ├► slam_core/matching/core.py                MatcherManager (swappable)
+            ├─[scan_to_map] slam_core/matching/scan_to_map.py          (§8)
+            │     MapPyramid · align_pose_gauss_newton · integrate_scan_simple
+            └─[scan_to_submap] slam_core/matching/scan_to_submap/      (§9)
+                  matcher.py · correlative.py · two_stage_backend.py
+                  refine.py (CartoRefinementProblem) · submaps.py (SubmapBuilder2D)
+                  └─[--enable-pgo] carto/pose_graph/  +  loop_closure*  (§10)
+                        pose_graph_2d.py · global_slam_2d.py
+                        branch_and_bound_backend.py (loop verify)
+                        backends/g2o_backend_2d.py  (VertexSE2/EdgeSE2 + Levenberg)
+       outputs ► hector_outputs/trajectory_*.txt              (online, per scan)
+                 hector_outputs/trajectory_*_debug.txt         (diagnostics)
+                 hector_outputs/trajectory_*_pgo.txt           (dense, optimized — PGO only)
 ```
 
 ---
 
-### Step 8: Post-Run Pose Graph Optimization (PGO)
+## 15. Reproducing the validated result (lab_run_2)
 
-**File:** [hector/eval/pgo_any.py](hector/eval/pgo_any.py)
-
-This step is **run separately** after the main SLAM has finished. It corrects the accumulated drift in the trajectory by finding **loop closures** — places where the robot revisited a previously seen location — and globally adjusting all poses to make the map consistent.
-
----
-
-#### 8.1 — What Is Drift and Why Does It Matter?
-
-Each individual scan match is very accurate — typically within a few millimetres. But small errors accumulate over hundreds of metres. After travelling 100 metres and returning to the start, the trajectory might show the endpoint displaced by 0.5–2 metres from the actual starting point. This accumulated drift makes the map inconsistent (walls appear doubled or blurred).
-
----
-
-#### 8.2 — Loop Closure Detection
-
-The system uses three complementary strategies to find revisited places:
-
-**Strategy 1 — Spatial Search:**
-- Every 10th pose is a **keyframe**.
-- For each keyframe `j`, find all earlier keyframes `i` within `search_radius` (1.2–2.0 m).
-- Skip `i` if `|j - i| < min_index_gap` (80–120) to avoid matching adjacent poses.
-- The remaining candidates are geometrically verified.
-
-**Strategy 2 — Geometric Verification (Map-Based):**
-- Build a small local mini-map around candidate keyframe `i` from ±10 surrounding scans.
-- Run the GN scan matcher to align keyframe `j`'s scan against that mini-map.
-- If the match score is high enough, a **loop closure constraint** is created: `(i, j, relative_pose_z_ij)`.
-
-**Strategy 3 — Scan-Context Descriptor:**
-- For each keyframe, compute a **Scan-Context** descriptor: a polar histogram binned by radial rings and angular sectors, capturing the distribution of points around the robot.
-- Find candidates with high descriptor similarity (cosine similarity), then verify geometrically.
-- This works for rotational revisits where the robot approaches from a different direction.
-
-**Consistency gate:** A candidate loop closure `(i, j, z_ij)` is accepted only if the measured relative pose `z_ij` agrees with the predicted relative pose from the current trajectory within 0.75 m and 20°. This prevents false positives.
-
----
-
-#### 8.3 — Pose Graph Structure
-
-The **pose graph** is a network where:
-- **Nodes** are robot poses at keyframe locations.
-- **Edges** are constraints between poses:
-  - **Odometry / sequential edges** — every consecutive pair of keyframes.
-  - **Loop closure edges** — the newly found loop closures.
-
-Each edge carries a measurement `z_ij` (the measured relative pose between nodes i and j) and an **information matrix** (the inverse of covariance — how confident the measurement is):
-
-| Edge type | Translation weight | Rotation weight |
-|---|---|---|
-| Sequential (intra-submap) | 500 | 1600 |
-| Loop closure (inter-submap) | 11 000 | 100 000 |
-
-Loop closure edges have much higher weight because they are verified matches, while sequential edges accumulate odometric uncertainty.
-
----
-
-#### 8.4 — Optimization Solver
-
-**Algorithm: Gauss-Newton on the condensed Hessian (sparse)**
-
-The pose graph optimization minimizes the total weighted squared error across all edge measurements:
-
-1. **Fix the first node** (the robot starts at origin — this removes the gauge freedom that would otherwise make the system underdetermined).
-2. Linearize all edge residuals around the current pose estimates: `r_ij = z_ij ⊖ (x_i⁻¹ ⊕ x_j)` (using SE(2) composition operators).
-3. Assemble the **sparse Hessian** `H` (a 3N × 3N matrix, mostly zeros) using SciPy's CSR sparse matrix format.
-4. Solve the reduced linear system `H·Δx = −g` using SciPy's sparse direct solver (`spsolve`).
-5. **Huber robust weighting:** Each residual is down-weighted if it is large (likely an outlier): `w = min(1, δ_Huber / |residual|)`. This prevents bad loop closures from corrupting the solution.
-6. Apply the update `x += Δx`, rewrap all angles.
-7. Repeat up to 15 iterations or until `‖Δx‖ < 1e-7` (converged).
-
-**Key technical choice — no external library:**  
-The entire PGO is implemented in pure Python using only NumPy and SciPy. There is no dependency on g2o, Ceres, or any C++ SLAM library.
-
----
-
-#### 8.5 — What Changes After PGO?
-
-The optimizer adjusts all keyframe poses globally. The corrected trajectory is then written to a new file. The map is rebuilt from scratch by replaying all scans at their corrected poses (see `hector/eval/rebuild_map_any.py`).
-
----
-
-## Part 4 — Outputs: Trajectory and Map
-
-### Trajectory
-
-The trajectory file `hector_outputs/trajectory_*.txt` contains the robot's estimated position at every scan:
-
-```
-1618560000.100  0.000  0.000  0.000  -1.000   ← bootstrap scan (score=-1)
-1618560000.200  0.024  0.001  0.003   0.721   ← first real match
-1618560000.300  0.051  0.002  0.005   0.758
-...
+```bash
+# scan_to_map (Hector global grid)
+.venv/bin/python -m hector.run_local_slam_new --dataset lab_run_2 --matcher scan_to_map
+# scan_to_submap, no back-end
+.venv/bin/python -m hector.run_local_slam_new --dataset lab_run_2 --matcher scan_to_submap
+# scan_to_submap + online g2o PGO (recommended: smaller submaps → more loop closures)
+.venv/bin/python -m hector.run_local_slam_new --dataset lab_run_2 --matcher scan_to_submap \
+    --enable-pgo --scans-per-submap 250
 ```
 
-Each row is one moment in time: timestamp, x position, y position, heading angle, match quality score.
-
-### Map
-
-The occupancy grid is held in memory as a NumPy array throughout the run. After the run:
-
-- **Probability image:** Each cell's log-odds value is converted to probability (0–1), then to a greyscale pixel. White = free space, black = occupied wall, grey = unknown.
-- **Trajectory overlay:** The (x, y) positions are plotted on top of the map image.
-
-**Plotting scripts:**
-
-| Script | What it produces |
-|---|---|
-| [hector/plot_single_trajectory.py](hector/plot_single_trajectory.py) | XY trajectory, score vs. scan index, heading vs. scan index |
-| [hector/plot_matcher_trajectories.py](hector/plot_matcher_trajectories.py) | Side-by-side comparison of scan_to_map vs. scan_to_submap |
-| [hector/viz/live_view.py](hector/viz/live_view.py) | Rendered map frames saved during the run |
-| [hector/viz/plot_final.py](hector/viz/plot_final.py) | Final map rendered after run |
-| [hector/eval/pgo_any.py](hector/eval/pgo_any.py) — PGO section | Before/after map comparison with trajectory correction arrows |
-
----
-
-## Part 5 — All Algorithms and Solvers, Summarized
-
-| Component | Algorithm | Implementation |
-|---|---|---|
-| Scan matching (local) | Hector-style coarse-to-fine Gauss-Newton on occupancy grid pyramid | Pure NumPy in `scan_to_map.py` |
-| Search-then-match | Two-stage correlative search + GN-LM refinement | Pure NumPy in `scan_to_submap_old.py` |
-| Map representation | Log-odds occupancy grid | NumPy float32 array |
-| Map update | Ray casting via linspace | `integrate_scan_simple()` in `scan_to_map.py` |
-| Ray casting (PGO maps) | Bresenham's line algorithm | `_bresenham_cells()` in `pgo_any.py` |
-| Motion model | Constant-velocity extrapolator | `PoseExtrapolatorCV` in carto module |
-| Pose graph optimization | Gauss-Newton with sparse Hessian, Huber loss | SciPy spsolve in `pgo_any.py` |
-| Loop closure detection | Spatial search + geometric GN verification + Scan-Context descriptor | `pgo_any.py` |
-| Point cloud preprocessing | Fixed voxel centroid filter + adaptive binary-search voxel filter | `preprocessing.py` |
-| Linear algebra | Direct dense solve (GN per scan), sparse direct solve (PGO) | `np.linalg.solve` and `scipy.sparse.linalg.spsolve` |
-
-**No PGO during the main run:** Loop closure and global optimization are post-processing steps. The main SLAM loop is purely local (each new scan is matched against the current map without any global graph update).
-
-**No external SLAM libraries:** No g2o, no Ceres, no ROS, no GTSAM. Everything is NumPy + SciPy.
-
----
-
-## Part 6 — End-to-End Data Flow with File References
-
-```
-datasets/lab_run_2/scans.carmen
-         │
-         │ read_lab_carmen_log()
-         ▼
-slam_core/dataio/dataset_catalog.py     ← DatasetProfile (geometry, file paths)
-         │
-         │ load_dataset_scans()
-         ▼
-hector/run_local_slam_new.py            ← MAIN ENTRY POINT (main loop)
-         │
-         │ ranges_to_points()
-         ▼
-carto/local_slam/range_to_points.py     ← laser angles → (x,y) point cloud
-         │
-         │ PointCloudProcessor.process()
-         ▼
-slam_core/matching/preprocessing.py    ← voxel filtering
-         │
-         │ HectorLocalSlamAdapter._predict_world_pose()
-         ▼
-hector/adapter.py                       ← pose prediction (extrap + odom blend)
-carto/local_slam/pose_extrapolator.py  ← PoseExtrapolatorCV
-         │
-         │ ScanToMapMatcher.match()        OR    OldScanToSubmapMatcher.match()
-         ▼                                       ▼
-slam_core/matching/scan_to_map.py       slam_core/matching/scan_to_submap_old.py
-  ├── MapPyramid (3 GridMaps)             ├── SubmapBuilder2D
-  ├── align_pose_gauss_newton()           ├── correlative_match_two_stage()
-  └── integrate_scan_simple()            ├── GaussNewtonLM.solve()
-                                         └── CartoRefinementProblem
-         │
-         │ write trajectory row
-         ▼
-hector_outputs/trajectory_*.txt         ← (timestamp, x, y, θ, score)
-hector_outputs/trajectory_*_debug.txt   ← (full diagnostics per scan)
-
-         [OPTIONAL POST-PROCESSING]
-         │
-         │ python -m hector.eval.pgo_any
-         ▼
-hector/eval/pgo_any.py
-  ├── load_trajectory_full()
-  ├── load_aligned_scan_points()
-  ├── loop closure detection (spatial + GN + scan-context)
-  ├── PGO with scipy.sparse spsolve + Huber weighting
-  └── save corrected trajectory + before/after map plots
-```
-
----
-
-## Part 7 — Frequently Asked Questions
-
-**Q: Does this implementation use loop closure during the main SLAM run?**  
-A: No. The main run is purely local — each scan is matched against the current map, the map is updated, and the system moves on. Loop closure is a separate post-processing step run via `pgo_any.py` after the trajectory file is saved.
-
-**Q: Is there IMU fusion?**  
-A: The lab_run_2 dataset includes an IMU CSV file, but the Hector pipeline does not fuse IMU measurements. The IMU data is present for potential future use.
-
-**Q: What happens if the scan matcher fails?**  
-A: The system falls back to the predicted pose (from the extrapolator/odometry). On the next scan, it tries again from that predicted position. A message like `!! FALLBACK k=1234  score=0.021<0.100` is printed for every non-bootstrap failure.
-
-**Q: Can the two matchers be switched at runtime?**  
-A: The `MatcherManager` in `slam_core/matching/core.py` supports swapping matchers mid-run using a rolling buffer of recent scans. The new matcher is seeded from those buffered scans. However, in normal operation, one matcher type is selected at startup and used for the entire run.
-
-**Q: What coordinate frame is used?**  
-A: The robot starts at world position `(0, 0, 0)` — x pointing forward, y pointing left, angles measured counter-clockwise. All trajectory outputs and map origins are in this world frame.
-
-**Q: How accurate is it?**  
-A: For well-structured indoor environments (fr079, intel), the scan-to-map matcher typically achieves sub-5 cm position accuracy between consecutive scans. Accumulated drift over a full run (before PGO) is typically 0.3–2.0 m depending on path length and environment complexity.
+Start↔end drift gap (lower is better): `scan_to_map` 0.186 m · `scan_to_submap`
+no-PGO 0.525 m · `scan_to_submap` + PGO (sps 250) 0.306 m. PGO removes the no-PGO
+ghosting and cuts drift ~42%; the residual gap to `scan_to_map` is front-end
+per-scan jitter that a keyframe pose graph does not correct.

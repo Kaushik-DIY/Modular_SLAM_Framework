@@ -68,6 +68,10 @@ class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
         self.local_refine_backend = str(
             getattr(self.config, "local_refine_backend", "native")
         )
+        # Vectorized correlative search (same window/scoring, batched NumPy) — opt-in.
+        self.use_vectorized_search = bool(
+            getattr(self.config, "use_vectorized_search", False)
+        )
 
         self._native_solver = refine_solver or GaussNewtonLM(
             GNLMConfig(
@@ -230,6 +234,7 @@ class TwoStageBruteForceSubmapBackend(IScanToSubmapBackend):
             fine_th_window=float(fine_window.theta_window),
             fine_xy_step=float(fine_window.xy_step),
             fine_th_step=float(fine_window.theta_step),
+            vectorized=self.use_vectorized_search,
         )
 
         raw_coarse_score = float(coarse_score) if np.isfinite(float(coarse_score)) else -1.0
