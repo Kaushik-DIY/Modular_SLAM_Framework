@@ -53,3 +53,6 @@ visual_slam.zip
 slam_ws*.zip
 
 third_party/pyslam_reference/
+
+# Fusion runner outputs (trajectories, occupancy grids, probe dumps)
+fusion_outputs/
