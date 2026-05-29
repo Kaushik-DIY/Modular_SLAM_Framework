@@ -10,7 +10,7 @@ Last updated: 2026-05-29T23:42:04Z          Last commit: (see Phase 1 row)
 
 | # | Phase                                       | Status   | Completed at | Commit | Notes |
 |---|---------------------------------------------|----------|--------------|--------|-------|
-| 1 | Foundation                                  | DONE     | 2026-05-29T23:42:04Z | 7d15a85 | Package skeleton + Signature, Pose3D→Pose2, SoftSync, lidar_synth, FusionDataset, probe. 22/22 tests pass; probe 20/20 sync, 3 scan dumps. Restored deleted `visual_slam/orbslam/slam/sensor_types.py` (HEAD regression blocking the TUM loader import). |
+| 1 | Foundation                                  | DONE     | 2026-05-29T23:42:04Z | 111fbdf | Package skeleton + Signature, Pose3D→Pose2, SoftSync, lidar_synth, FusionDataset, probe. 22/22 tests pass; probe 20/20 sync, 3 scan dumps. Restored deleted `visual_slam/orbslam/slam/sensor_types.py` (HEAD regression blocking the TUM loader import). |
 | 2 | Memory tier (STM + WM + LTM)                | PENDING  |              |        |       |
 | 3 | Fusion graph (FusionGraph + g2o backend)    | PENDING  |              |        |       |
 | 4 | ICP verifier (small_gicp)                   | PENDING  |              |        |       |
