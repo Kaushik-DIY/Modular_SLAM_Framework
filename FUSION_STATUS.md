@@ -4,7 +4,7 @@
 > This is the single source of truth for "where are we now?"
 > See `CLAUDE.md` §4 for the full phase definitions and `RTAB_inspired_implementation_plan.md` §13 for design detail.
 
-Last updated: 2026-05-30T04:02:12Z          Last commit: 8dacb0a (Phase 8)
+Last updated: 2026-05-30T04:05:40Z          Last commit: b436453 (Phase 9)
 
 ## Phase progress
 
@@ -18,7 +18,7 @@ Last updated: 2026-05-30T04:02:12Z          Last commit: 8dacb0a (Phase 8)
 | 6 | Adapters (propose-only + frontend services) | DONE     | 2026-05-30T03:51:52Z | ba7919a | 4 adapters via dependency injection: OrbLoopProposer (LoopDetector, no Sim3), LidarLoopProposer (TargetProvider, no verify/PGO), Visual/Lidar FrontendService (normalized streams). Propose-only is structural; no edit to loop_closing.py. 6/6 spy-based tests. |
 | 7 | Mode A and Mode B (pass-through)            | DONE     | 2026-05-30T03:54:17Z | d33d68c | runner.py mode dispatch; orb/lidar = identical subprocess invocation of existing runners (args forwarded verbatim) -> byte-equal output. vlmain/lvmain raise NotImplementedError. 7/7 tests. |
 | 8 | Mode C end-to-end (V-main + L-verify)       | DONE     | 2026-05-30T04:02:12Z | 8dacb0a | run_mode_c wires service+memory+graph+ORB proposer+ICP verifier. Runnable stand-ins: OrbRgbdVoBackend + BruteForceOrbDetector. Scripted looping fr1 run: >=1 ICP loop, ATE<=front-end baseline, caps held. 2/2 tests. |
-| 9 | Mode D end-to-end (L-main + V-verify)       | PENDING  |              |        |       |
+| 9 | Mode D end-to-end (L-main + V-verify)       | DONE     | 2026-05-30T04:05:40Z | b436453 | run_mode_d wires LiDAR service+memory+graph+proximity proposer+visual verifier. ProximityTargetProvider stand-in; ORB from synced RGB; verifier skips no-depth points. Scripted looping fr1: >=1 visual loop, ATE<=baseline, caps held. 2/2 tests. |
 | 10| Map output (trajectory + occupancy grid)    | PENDING  |              |        |       |
 | 11| Hardening & docs                            | PENDING  |              |        |       |
 
@@ -69,3 +69,5 @@ See `CLAUDE.md` §7 for the full 8-row acceptance table. Headline checks:
 - **(Phase 8)** `dispatch(VLMAIN/LVMAIN)` still raises NotImplementedError; the fusion CLI plumbing (argparse for --dataset/--output, trajectory file) is deferred to Phase 10 where map_output exists. `run_mode_c()` is the programmatic Mode-C entry today.
 - **(Phase 8)** Phase-8 acceptance ("ATE no worse than Mode A baseline +5%") is checked against the front-end (pre-optimization) trajectory as the baseline proxy, since running the real standalone ORB-SLAM Mode A here is impractical. Loop closure measurably reduces accumulated drift in the scripted run.
 - **(Phase 8)** Loop-edge residual gating (plan §10.3) still not implemented; a bad ICP/PnP loop would be trusted. Implement the post-solve rollback in Phase 11.
+- **(Phase 9)** Runnable Mode D uses a scripted LiDAR backend + `ProximityTargetProvider` instead of the real scan_to_submap front-end + `CartoTargetProvider` (B&B). Same seam story as Phase 8: real wiring is a backend swap. The proximity provider is geometric only (no branch-and-bound).
+- **(Phase 9)** Mode D ORB features are recomputed per keyframe inside `run_mode_d`; in production they should come from the synced visual front-end keyframe to avoid double ORB extraction.
