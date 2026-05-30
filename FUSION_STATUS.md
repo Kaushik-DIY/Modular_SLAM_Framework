@@ -4,7 +4,7 @@
 > This is the single source of truth for "where are we now?"
 > See `CLAUDE.md` §4 for the full phase definitions and `RTAB_inspired_implementation_plan.md` §13 for design detail.
 
-Last updated: 2026-05-30T03:51:52Z          Last commit: ba7919a (Phase 6)
+Last updated: 2026-05-30T03:54:17Z          Last commit: d33d68c (Phase 7)
 
 ## Phase progress
 
@@ -16,7 +16,7 @@ Last updated: 2026-05-30T03:51:52Z          Last commit: ba7919a (Phase 6)
 | 4 | ICP verifier (small_gicp)                   | DONE     | 2026-05-30T03:43:17Z | e05a2b7 | ICPLoopVerifier (LoopVerifier Protocol) on small_gicp GICP; 2D->z=0 promotion, KDTree fitness+RMSE scoring, corrected global pose. small_gicp 1.0.0 installed (x86_64 wheel). 5/5 tests. |
 | 5 | Visual verifier (ORB + PnP)                 | DONE     | 2026-05-30T03:46:34Z | adb5a93 | VisualLoopVerifier (LoopVerifier Protocol) via signature provider; ORB ratio-match + solvePnPRansac; relative cam pose conjugated by REP-103 cam->base to SE(2). 3/3 tests incl. known-motion recovery. |
 | 6 | Adapters (propose-only + frontend services) | DONE     | 2026-05-30T03:51:52Z | ba7919a | 4 adapters via dependency injection: OrbLoopProposer (LoopDetector, no Sim3), LidarLoopProposer (TargetProvider, no verify/PGO), Visual/Lidar FrontendService (normalized streams). Propose-only is structural; no edit to loop_closing.py. 6/6 spy-based tests. |
-| 7 | Mode A and Mode B (pass-through)            | PENDING  |              |        |       |
+| 7 | Mode A and Mode B (pass-through)            | DONE     | 2026-05-30T03:54:17Z | d33d68c | runner.py mode dispatch; orb/lidar = identical subprocess invocation of existing runners (args forwarded verbatim) -> byte-equal output. vlmain/lvmain raise NotImplementedError. 7/7 tests. |
 | 8 | Mode C end-to-end (V-main + L-verify)       | PENDING  |              |        |       |
 | 9 | Mode D end-to-end (L-main + V-verify)       | PENDING  |              |        |       |
 | 10| Map output (trajectory + occupancy grid)    | PENDING  |              |        |       |
@@ -64,3 +64,4 @@ See `CLAUDE.md` §7 for the full 8-row acceptance table. Headline checks:
 - **(Phase 5)** SE(2) projection conventions now diverge by input type: `signature.project_pose3d_to_pose2` for world keyframe poses vs the visual verifier's conjugation for *relative* camera transforms. Keep this distinction in mind in Phase 8/9.
 - **(Phase 6)** Adapters are injectable wrappers tested with fakes/spies; the REAL upstream wiring (LoopDetector+KeyFrameDatabase+vocab for ORB; CartoTargetProvider+ScanToSubmapMatcher for LiDAR; ORB-SLAM `slam.py` tracking; Hector/scan_to_submap front-end) is deferred to Phases 8/9 where the full pipelines actually run. The propose-only invariant is already proven structurally.
 - **(Phase 6)** `propose_only=False` raises NotImplementedError on both proposers (v1 never verifies upstream). Revisit only if a future mode needs the upstream verifier.
+- **(Phase 7)** Pass-through equality is verified by command-identity (the subprocess invocation IS the direct invocation), not by a live double-run + ATE compare — the ORB runner needs a DBoW vocabulary and is slow. A live end-to-end ATE diff could be added as an opt-in/CI test in Phase 11 if desired.
