@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
+
 from slam_core.fusion.config import FusionConfig, Mode
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -84,6 +86,21 @@ class FusionRunResult:
     accepted_loops: List[Tuple[int, int]] = field(default_factory=list)      # (source, target)
     loop_count: int = 0
     memory_stats: Dict[str, int] = field(default_factory=dict)
+    per_keyframe_ms: List[float] = field(default_factory=list)               # wall time / keyframe
+
+    def runtime_summary(self) -> Dict[str, float]:
+        """Per-keyframe runtime stats (ms): count/mean/median/p95/max."""
+        ms = np.asarray(self.per_keyframe_ms, dtype=float)
+        if ms.size == 0:
+            return {"keyframes": 0, "mean_ms": 0.0, "median_ms": 0.0,
+                    "p95_ms": 0.0, "max_ms": 0.0}
+        return {
+            "keyframes": int(ms.size),
+            "mean_ms": float(ms.mean()),
+            "median_ms": float(np.median(ms)),
+            "p95_ms": float(np.percentile(ms, 95)),
+            "max_ms": float(ms.max()),
+        }
 
 
 def run_mode_c(
@@ -103,6 +120,8 @@ def run_mode_c(
     (e.g. ``FusionFrame``). ``visual_backend`` exposes ``track(rgb, depth, t)``.
     The LiDAR pipeline's PGO is never invoked — the FusionGraph owns optimization.
     """
+    import time
+
     from slam_core.common.se2 import pose_compose, pose_inverse
     from slam_core.fusion.signature import Signature, project_pose3d_to_pose2
     from slam_core.fusion.memory import MemoryManager
@@ -138,6 +157,7 @@ def run_mode_c(
         rec = service.step(frame.rgb, frame.depth, float(frame.rgb_t))
         if rec is None:
             continue
+        _t0 = time.perf_counter()
 
         pose2 = project_pose3d_to_pose2(rec.pose, base_T_cam)
         sig = Signature(id=rec.id, timestamp=rec.timestamp, pose=pose2,
@@ -173,6 +193,7 @@ def run_mode_c(
         kf_count += 1
         if opt_every > 0 and kf_count % opt_every == 0 and graph.loop_count > 0:
             graph.solve()
+        result.per_keyframe_ms.append((time.perf_counter() - _t0) * 1000.0)
         prev_sig = sig
 
     if graph.loop_count > 0:
@@ -219,7 +240,7 @@ def run_mode_d(
     confirm proximity proposals. The LiDAR pipeline's own g2o PGO is not driven.
     """
     import cv2
-    import numpy as np
+    import time
 
     from slam_core.common.se2 import pose_compose, pose_inverse
     from slam_core.fusion.signature import Signature
@@ -261,6 +282,7 @@ def run_mode_d(
         step = service.step(getattr(frame, "scan", None), float(frame.rgb_t))
         if not step.is_keyframe:
             continue
+        _t0 = time.perf_counter()
 
         # ORB payload from the synced RGB frame (for visual verification).
         gray = cv2.cvtColor(frame.rgb, cv2.COLOR_BGR2GRAY) if frame.rgb.ndim == 3 else frame.rgb
@@ -304,6 +326,7 @@ def run_mode_d(
         kf_count += 1
         if opt_every > 0 and kf_count % opt_every == 0 and graph.loop_count > 0:
             graph.solve()
+        result.per_keyframe_ms.append((time.perf_counter() - _t0) * 1000.0)
         prev_sig = sig
 
     if graph.loop_count > 0:
@@ -348,7 +371,9 @@ def run_fusion_cli(mode: Mode, args: Sequence[str]) -> int:
     frames = list(dataset.iter_frames(max_frames=max_frames))
 
     if mode == Mode.VLMAIN:
-        backend = OrbRgbdVoBackend(dataset.K)
+        # 500 features keeps the brute-force stand-in detector near real-time;
+        # the production DBoW KeyFrameDatabase is O(1)-ish and faster still.
+        backend = OrbRgbdVoBackend(dataset.K, n_features=500)
         result = run_mode_c(config, frames, backend)
     else:  # LVMAIN — needs the real LiDAR front-end backend
         raise NotImplementedError(
@@ -357,12 +382,18 @@ def run_fusion_cli(mode: Mode, args: Sequence[str]) -> int:
         )
 
     paths = emit_run_outputs(result, config.output_dir)
-    print(f"mode              : {mode.value}")
-    print(f"keyframes         : {len(result.keyframe_ids)}")
-    print(f"accepted loops    : {result.loop_count}")
+    rt = result.runtime_summary()
+    print("==== fusion run diagnostics ====")
+    print(f"mode               : {mode.value}")
+    print(f"keyframes          : {len(result.keyframe_ids)}")
+    print(f"accepted loops     : {result.loop_count}")
     print(f"memory (stm/wm/ltm): {result.memory_stats}")
-    print(f"trajectory        : {paths['trajectory']}")
-    print(f"occupancy         : {paths['occupancy']}")
+    print(f"runtime/keyframe   : mean {rt['mean_ms']:.1f} ms | median "
+          f"{rt['median_ms']:.1f} ms | p95 {rt['p95_ms']:.1f} ms | max {rt['max_ms']:.1f} ms")
+    print(f"  -> per-keyframe target (<=100 ms): "
+          f"{'PASS' if rt['p95_ms'] <= 100.0 else 'OVER'}")
+    print(f"trajectory         : {paths['trajectory']}")
+    print(f"occupancy          : {paths['occupancy']}")
     return 0
 
 
