@@ -205,9 +205,12 @@ def run_mode_c(
             graph.add_neighbor_link(prev_sig, sig)
         mt["graph"] += (time.perf_counter() - _t) * 1000.0
 
-        # propose candidates against PAST keyframes, then verify with ICP
+        # propose candidates against PAST keyframes, then verify with ICP.
+        # With the real ORB-SLAM front-end, rec.source is the native KeyFrame the
+        # DBoW LoopDetector scores; otherwise the Signature drives the stand-in.
+        query = rec.source if getattr(rec, "source", None) is not None else sig
         _t = time.perf_counter()
-        proposals = proposer.poll_candidates(sig)
+        proposals = proposer.poll_candidates(query)
         mt["propose"] += (time.perf_counter() - _t) * 1000.0
         for proposal in proposals:
             cand = signatures.get(int(proposal.candidate_id))
@@ -231,7 +234,7 @@ def run_mode_c(
             else:
                 reject[res.status] = reject.get(res.status, 0) + 1
 
-        proposer.register(sig)
+        proposer.register(query)
         mem.tick()
         kf_count += 1
         if opt_every > 0 and kf_count % opt_every == 0 and graph.loop_count > 0:

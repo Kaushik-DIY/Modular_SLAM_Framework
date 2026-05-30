@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import cv2
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -31,9 +32,29 @@ import matplotlib.pyplot as plt
 from slam_core.fusion.config import FusionConfig, Mode
 from slam_core.fusion.dataset import FusionDataset
 from slam_core.fusion.frontends import OrbRgbdVoBackend, BruteForceOrbDetector
+from slam_core.fusion.lidar_synth import synthesize_2d_scan
 from slam_core.fusion.signature import CAMERA_GROUND_TRANSFORM
 from slam_core.fusion.runner import run_mode_c
 from slam_core.fusion.map_output import emit_run_outputs, assemble_occupancy_grid, save_occupancy_png
+
+
+class _RawFrame:
+    """Frame carrying RAW uint16 depth (for ORB-SLAM) + a metres-derived scan."""
+    def __init__(self, rgb, depth_raw, rgb_t, scan):
+        self.rgb, self.depth, self.rgb_t, self.scan = rgb, depth_raw, rgb_t, scan
+
+
+def build_real_frames(dataset: FusionDataset, max_frames):
+    n = len(dataset.frames) if max_frames is None else min(max_frames, len(dataset.frames))
+    out = []
+    for i in range(n):
+        fr = dataset.frames[i]
+        rgb = cv2.imread(str(fr.rgb_path), cv2.IMREAD_COLOR)
+        depth_raw = cv2.imread(str(fr.depth_path), cv2.IMREAD_UNCHANGED)
+        depth_m = depth_raw.astype(np.float64) * dataset.depth_factor
+        scan = synthesize_2d_scan(depth_m, dataset.K, num_beams=360, noise_sigma=0.0)
+        out.append(_RawFrame(rgb, depth_raw, float(fr.timestamp), scan))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -105,24 +126,39 @@ def main():
     ap.add_argument("--optimize-every", type=int, default=20)
     ap.add_argument("--keyframe-every", type=int, default=5)
     ap.add_argument("--n-features", type=int, default=500)
+    ap.add_argument("--real", action="store_true",
+                    help="use the real ORB-SLAM front-end + DBoW detector")
     ap.add_argument("--out", default="fusion_outputs/eval_mode_c")
     args = ap.parse_args()
 
     ds_path = Path(args.dataset)
     dataset = FusionDataset(ds_path, num_beams=360, noise_sigma=0.0)
     max_frames = None if args.max_frames in (0, -1) else args.max_frames
-    frames = list(dataset.iter_frames(max_frames=max_frames))
 
     cfg = FusionConfig(mode=Mode.VLMAIN, dataset_path=str(ds_path), output_dir=args.out,
                        optimize_every_n_keyframes=args.optimize_every)
-    backend = OrbRgbdVoBackend(dataset.K, n_features=args.n_features,
-                               keyframe_every=args.keyframe_every)
-    detector = BruteForceOrbDetector(min_votes=80, top_k=3)
 
-    t_wall = time.perf_counter()
-    result = run_mode_c(cfg, frames, backend, world_transform=CAMERA_GROUND_TRANSFORM,
-                        loop_detector=detector, min_index_separation=10)
-    wall = time.perf_counter() - t_wall
+    if args.real:
+        from slam_core.fusion.orbslam_frontend import OrbSlamFrontendBackend
+        print("[eval] building real ORB-SLAM front-end (this is slow, ~1 fps)...")
+        frames = build_real_frames(dataset, max_frames)
+        backend = OrbSlamFrontendBackend(dataset.camera)
+        detector = backend.make_loop_detector()
+        t_wall = time.perf_counter()
+        result = run_mode_c(cfg, frames, backend, world_transform=CAMERA_GROUND_TRANSFORM,
+                            loop_detector=detector, min_index_separation=0)
+        wall = time.perf_counter() - t_wall
+        front_label = "ORB-SLAM (real, local-BA)"
+    else:
+        frames = list(dataset.iter_frames(max_frames=max_frames))
+        backend = OrbRgbdVoBackend(dataset.K, n_features=args.n_features,
+                                   keyframe_every=args.keyframe_every)
+        detector = BruteForceOrbDetector(min_votes=80, top_k=3)
+        t_wall = time.perf_counter()
+        result = run_mode_c(cfg, frames, backend, world_transform=CAMERA_GROUND_TRANSFORM,
+                            loop_detector=detector, min_index_separation=10)
+        wall = time.perf_counter() - t_wall
+        front_label = "ORB-VO stand-in"
 
     ids = result.keyframe_ids
     kf_times = np.array([result.trajectory[i][0] for i in range(len(ids))])

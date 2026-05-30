@@ -32,6 +32,7 @@ class KeyframeRecord:
     descriptors: Optional[np.ndarray] = None
     points3d: Optional[np.ndarray] = None
     is_keyframe: bool = True
+    source: object = None        # optional native front-end keyframe (e.g. ORB KeyFrame)
 
 
 @dataclass

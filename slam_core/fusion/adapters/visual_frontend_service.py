@@ -60,6 +60,7 @@ class VisualFrontendService:
             descriptors=_opt_array(getattr(kf, "descriptors", None)),
             points3d=_opt_array(getattr(kf, "points3d", None)),
             is_keyframe=True,
+            source=getattr(kf, "source", None),
         )
 
     def finalize(self) -> None:
