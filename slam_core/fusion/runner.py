@@ -19,6 +19,7 @@ Phases 8 and 9; here they raise a clear NotImplementedError.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -50,6 +51,20 @@ def build_passthrough_command(
     return [python, script, *passthrough_args]
 
 
+def _passthrough_executor(cmd: List[str]) -> "subprocess.CompletedProcess":
+    """Run the underlying runner with the repo root on PYTHONPATH.
+
+    ``python /abs/path/script.py`` puts the *script's* directory on sys.path[0],
+    not the repo root, so the existing runners' ``slam_core`` / ``tools`` imports
+    fail. Inject the repo root (and run from it) so the delegated invocation
+    behaves exactly like the user's own from the repo root.
+    """
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(_REPO_ROOT) + (os.pathsep + existing if existing else "")
+    return subprocess.run(cmd, cwd=str(_REPO_ROOT), env=env)
+
+
 def dispatch(
     mode: Mode,
     passthrough_args: Sequence[str],
@@ -58,7 +73,7 @@ def dispatch(
     """Route a mode to its handler. Returns a process-style exit code."""
     if mode in PASSTHROUGH_SCRIPTS:
         cmd = build_passthrough_command(mode, passthrough_args)
-        run = executor if executor is not None else (lambda c: subprocess.run(c, cwd=str(_REPO_ROOT)))
+        run = executor if executor is not None else _passthrough_executor
         result = run(cmd)
         return int(getattr(result, "returncode", 0) or 0)
 
