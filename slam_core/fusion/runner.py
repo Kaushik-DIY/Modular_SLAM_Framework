@@ -80,6 +80,7 @@ class FusionRunResult:
     trajectory: List[Tuple[float, "object"]] = field(default_factory=list)  # (t, Pose2)
     frontend_poses: Dict[int, "object"] = field(default_factory=dict)        # id -> Pose2 (pre-opt)
     optimized_poses: Dict[int, "object"] = field(default_factory=dict)       # id -> Pose2
+    keyframe_scans: Dict[int, "object"] = field(default_factory=dict)        # id -> (M,2) scan
     accepted_loops: List[Tuple[int, int]] = field(default_factory=list)      # (source, target)
     loop_count: int = 0
     memory_stats: Dict[str, int] = field(default_factory=dict)
@@ -179,6 +180,7 @@ def run_mode_c(
 
     result.keyframe_ids = list(signatures.keys())
     result.optimized_poses = graph.get_all_poses()
+    result.keyframe_scans = {i: signatures[i].scan for i in result.keyframe_ids}
     result.trajectory = [(signatures[i].timestamp, graph.get_pose(i))
                          for i in result.keyframe_ids]
     result.loop_count = graph.loop_count
@@ -309,6 +311,7 @@ def run_mode_d(
 
     result.keyframe_ids = list(signatures.keys())
     result.optimized_poses = graph.get_all_poses()
+    result.keyframe_scans = {i: signatures[i].scan for i in result.keyframe_ids}
     result.trajectory = [(signatures[i].timestamp, graph.get_pose(i))
                          for i in result.keyframe_ids]
     result.loop_count = graph.loop_count
@@ -319,6 +322,50 @@ def run_mode_d(
     return result
 
 
+def run_fusion_cli(mode: Mode, args: Sequence[str]) -> int:
+    """CLI entry for the fusion modes: run on a FusionDataset and emit outputs."""
+    import numpy as np
+
+    from slam_core.fusion.dataset import FusionDataset
+    from slam_core.fusion.frontends import OrbRgbdVoBackend
+    from slam_core.fusion.map_output import emit_run_outputs
+
+    fp = argparse.ArgumentParser(prog=f"fusion {mode.value}")
+    fp.add_argument("--dataset", required=True)
+    fp.add_argument("--output", default="fusion_outputs")
+    fp.add_argument("--max-frames", type=int, default=0)
+    fp.add_argument("--stm-size", type=int, default=30)
+    fp.add_argument("--wm-cap", type=int, default=200)
+    fp.add_argument("--ltm-cap", type=int, default=1000)
+    fp.add_argument("--optimize-every", type=int, default=30)
+    fa = fp.parse_args(list(args))
+
+    dataset = FusionDataset(fa.dataset)
+    config = FusionConfig(mode=mode, dataset_path=fa.dataset, output_dir=fa.output,
+                          stm_size=fa.stm_size, wm_cap=fa.wm_cap, ltm_cap=fa.ltm_cap,
+                          optimize_every_n_keyframes=fa.optimize_every)
+    max_frames = None if fa.max_frames in (0, -1) else fa.max_frames
+    frames = list(dataset.iter_frames(max_frames=max_frames))
+
+    if mode == Mode.VLMAIN:
+        backend = OrbRgbdVoBackend(dataset.K)
+        result = run_mode_c(config, frames, backend)
+    else:  # LVMAIN — needs the real LiDAR front-end backend
+        raise NotImplementedError(
+            "Mode D CLI needs a LiDAR front-end backend; call run_mode_d() with "
+            "an injected backend (scan_to_submap wiring is future work)."
+        )
+
+    paths = emit_run_outputs(result, config.output_dir)
+    print(f"mode              : {mode.value}")
+    print(f"keyframes         : {len(result.keyframe_ids)}")
+    print(f"accepted loops    : {result.loop_count}")
+    print(f"memory (stm/wm/ltm): {result.memory_stats}")
+    print(f"trajectory        : {paths['trajectory']}")
+    print(f"occupancy         : {paths['occupancy']}")
+    return 0
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="slam_core.fusion.runner",
@@ -327,17 +374,15 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--mode", required=True, choices=[m.value for m in Mode],
                         help="orb/lidar pass through to the existing runners; "
                              "vlmain/lvmain run the fusion pipeline.")
-    parser.add_argument("passthrough", nargs=argparse.REMAINDER,
-                        help="arguments forwarded verbatim to the underlying runner "
-                             "(pass-through modes).")
-    args = parser.parse_args(argv)
+    args, rest = parser.parse_known_args(argv)
 
     mode = Mode(args.mode)
-    # argparse.REMAINDER keeps a leading '--' if present; drop it.
-    forwarded = list(args.passthrough)
-    if forwarded and forwarded[0] == "--":
-        forwarded = forwarded[1:]
-    return dispatch(mode, forwarded)
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+
+    if mode in (Mode.VLMAIN, Mode.LVMAIN):
+        return run_fusion_cli(mode, rest)
+    return dispatch(mode, rest)
 
 
 if __name__ == "__main__":
