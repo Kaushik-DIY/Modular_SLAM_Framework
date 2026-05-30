@@ -18,6 +18,7 @@ from slam_core.fusion.dataset import FusionDataset, FusionFrame
 from slam_core.fusion.memory import MemoryManager, InsertResult, TickResult
 from slam_core.fusion.graph import FusionGraph, keyframe_target_id
 from slam_core.fusion.icp_verifier import ICPLoopVerifier
+from slam_core.fusion.visual_verifier import VisualLoopVerifier
 
 __all__ = [
     "FusionConfig",
@@ -35,4 +36,5 @@ __all__ = [
     "FusionGraph",
     "keyframe_target_id",
     "ICPLoopVerifier",
+    "VisualLoopVerifier",
 ]
