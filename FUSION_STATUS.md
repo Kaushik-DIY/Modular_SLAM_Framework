@@ -52,6 +52,28 @@ See `CLAUDE.md` §7 for the full 8-row acceptance table. Headline checks:
 > against the real ORB-SLAM + DBoW / scan_to_submap front-ends before declaring
 > production acceptance.
 
+## Real ORB-SLAM front-end integration (post-v1, 2026-05-30)
+
+The Mode C visual front-end was upgraded from the `OrbRgbdVoBackend` stand-in to
+the **real ORB-SLAM** pipeline (`slam_core/fusion/orbslam_frontend.py`):
+`OrbSlamFrontendBackend` drives `Slam(enable_loop_closing=False)` in-process
+(propose-only), emitting real local-BA keyframe poses + the live DBoW3
+`KeyFrameDatabase` as the `OrbLoopProposer` detector. **No ORB-SLAM source was
+modified** — pure consumer of the public `Slam`/`KeyFrame`/`LoopDetector` API.
+Confirmed faithful to RTAB-Map (JFR'19 §3.1: ORB-SLAM2 is a supported external
+odometry source; loop candidates scored over WM via DBoW, verified by motion
+estimation + ICP refinement; odometry enters as neighbour links).
+
+Reused-code touch points (for traceability): **none edited.** The only enabler
+was restoring the deleted `visual_slam/orbslam/slam/sensor_types.py` (user
+provided an identical backup; matches git `cc80128`).
+
+Validation (fr1_room, 250-frame slice):
+- 3D front-end ATE **4.5 cm** (median 2.9) — vs **86 cm** with the VO stand-in (19× better; near the ~1.6 cm ORB-SLAM2 baseline).
+- Real DBoW detector **7.5 ms/kf** (vs 197 ms brute-force); fusion per-keyframe median **19 ms** (PASS < 100 ms).
+- Loop closure on the slice was marginal/negative (1 verified of 12 proposed; -16% 2D ATE) — odometry barely drifted on a short clip, so a single ICP loop perturbs an already-good trajectory. Full-sequence run (real revisits + accumulated drift) in progress to get the definitive loop-closure verdict; the RTAB `RGBD/OptimizeMaxError` residual gate (§3.5 / plan §10.3) is the safety mechanism if gross-outlier loops appear.
+- ORB-SLAM front-end throughput is ~1 fps (Python port) — a separate, known perf concern; the *fusion* layer is real-time.
+
 ## Open follow-ups (rolled forward across phases)
 
 - **(Phase 1)** Restored `visual_slam/orbslam/slam/sensor_types.py` from commit `cc80128` — it was deleted before HEAD and broke every import of the ORB-SLAM package (and thus the TUM loader). Worth confirming the deletion was accidental and that nothing else in `visual_slam/` regressed.
