@@ -470,6 +470,60 @@ def run_fusion_cli(mode: Mode, args: Sequence[str]) -> int:
     return 0
 
 
+def _arg_value(args: Sequence[str], name: str) -> Optional[str]:
+    """Fetch ``--name value`` or ``--name=value`` from a forwarded arg list."""
+    args = list(args)
+    if name in args:
+        i = args.index(name)
+        if i + 1 < len(args):
+            return args[i + 1]
+    for a in args:
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def _first_positional(args: Sequence[str]) -> Optional[str]:
+    for a in args:
+        if not a.startswith("-"):
+            return a
+    return None
+
+
+def _latest_lidar_trajectory(dataset: str):
+    cands = [p for p in (_REPO_ROOT / "hector_outputs").glob(f"trajectory_{dataset}_*.txt")
+             if not p.name.endswith("_debug.txt")]
+    return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+
+def _generate_passthrough_artifacts(mode: Mode, forwarded: Sequence[str]) -> None:
+    """After a pass-through run, emit trajectory plots + the rebuilt map."""
+    from slam_core.fusion.passthrough_artifacts import (
+        generate_visual_artifacts, generate_lidar_artifacts)
+
+    print("\n[artifacts] generating trajectory plots + rebuilt map ...")
+    if mode == Mode.ORB:
+        run_dir = _arg_value(forwarded, "--output")
+        if not run_dir or not Path(run_dir).exists():
+            print("[artifacts] ORB run output dir not found; skipping."); return
+        dataset = _first_positional(forwarded)
+        out = Path(run_dir) / "fusion_artifacts"
+        produced = generate_visual_artifacts(run_dir, dataset, out)
+    else:  # LIDAR
+        dataset = _arg_value(forwarded, "--dataset") or "lab_run_2"
+        traj = _latest_lidar_trajectory(dataset)
+        if traj is None:
+            print(f"[artifacts] no trajectory found for {dataset}; skipping."); return
+        variant = _arg_value(forwarded, "--scan-variant")
+        if variant is None:
+            variant = "raw" if "_raw_" in traj.name else ("360" if "_360_" in traj.name else None)
+        out = _REPO_ROOT / "fusion_outputs" / f"modeB_{dataset}"
+        produced = generate_lidar_artifacts(traj, dataset, out, scan_variant=variant)
+
+    for label, path in produced.items():
+        print(f"[artifacts]   {label}: {path}")
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="slam_core.fusion.runner",
@@ -478,6 +532,8 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--mode", required=True, choices=[m.value for m in Mode],
                         help="orb/lidar pass through to the existing runners; "
                              "vlmain/lvmain run the fusion pipeline.")
+    parser.add_argument("--no-artifacts", action="store_true",
+                        help="skip the post-run trajectory plots + rebuilt map (pass-through modes).")
     args, rest = parser.parse_known_args(argv)
 
     mode = Mode(args.mode)
@@ -486,7 +542,14 @@ def main(argv: List[str] | None = None) -> int:
 
     if mode in (Mode.VLMAIN, Mode.LVMAIN):
         return run_fusion_cli(mode, rest)
-    return dispatch(mode, rest)
+
+    rc = dispatch(mode, rest)
+    if rc == 0 and not args.no_artifacts:
+        try:
+            _generate_passthrough_artifacts(mode, rest)
+        except Exception as e:
+            print(f"[artifacts] generation skipped: {e}")
+    return rc
 
 
 if __name__ == "__main__":
