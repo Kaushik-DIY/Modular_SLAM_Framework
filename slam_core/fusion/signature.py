@@ -36,7 +36,8 @@ def _as_matrix(pose) -> np.ndarray:
     return m
 
 
-def project_pose3d_to_pose2(pose3d, base_T_cam: Optional[np.ndarray] = None) -> Pose2:
+def project_pose3d_to_pose2(pose3d, base_T_cam: Optional[np.ndarray] = None,
+                            world_transform: Optional[np.ndarray] = None) -> Pose2:
     """Project an SE(3) camera pose to a planar SE(2) base pose.
 
     ORB-SLAM keyframe poses live in SE(3). At the fusion-layer boundary
@@ -49,27 +50,39 @@ def project_pose3d_to_pose2(pose3d, base_T_cam: Optional[np.ndarray] = None) -> 
         The camera pose in world frame, ``T_world_cam``.
     base_T_cam : 4x4 array-like, optional
         The fixed camera->base extrinsic (``base_from_camera``). If omitted,
-        the SE(3) pose is taken to already be a base-frame world pose and its
-        (x, y, yaw) are extracted directly.
+        the SE(3) pose is taken to already be a base-frame world pose.
+    world_transform : 4x4 array-like, optional
+        A left-multiplied change of *world* frame applied before extracting
+        (x, y, yaw). Use this to choose the ground plane: for a forward-looking
+        camera (optical frame z=forward, y=down) the horizontal plane is the
+        camera-world x-z plane, so a world_transform that maps z->y, y->-z makes
+        the extracted (x, y) the true top-down position. Default: identity.
 
     Returns
     -------
     Pose2
         Planar pose ``(x, y, theta)`` with ``theta`` wrapped to [-pi, pi].
     """
-    T_world_cam = _as_matrix(pose3d)
+    T = _as_matrix(pose3d)
 
     if base_T_cam is not None:
-        # T_world_base = T_world_cam @ inv(base_T_cam)
-        cam_T_base = np.linalg.inv(_as_matrix(base_T_cam))
-        T_world_base = T_world_cam @ cam_T_base
-    else:
-        T_world_base = T_world_cam
+        T = T @ np.linalg.inv(_as_matrix(base_T_cam))
+    if world_transform is not None:
+        T = _as_matrix(world_transform) @ T
 
-    x = float(T_world_base[0, 3])
-    y = float(T_world_base[1, 3])
-    theta = float(np.arctan2(T_world_base[1, 0], T_world_base[0, 0]))
+    x = float(T[0, 3])
+    y = float(T[1, 3])
+    theta = float(np.arctan2(T[1, 0], T[0, 0]))
     return Pose2(x, y, wrap_angle(theta))
+
+
+# World transform mapping a forward-looking camera-start frame
+# (x=right, y=down, z=forward) onto a top-down ground frame
+# (x=right, y=forward, z=up). Use as ``world_transform`` for camera SLAM.
+CAMERA_GROUND_TRANSFORM = np.array([[1.0, 0.0, 0.0, 0.0],
+                                    [0.0, 0.0, 1.0, 0.0],
+                                    [0.0, -1.0, 0.0, 0.0],
+                                    [0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
 
 
 @dataclass

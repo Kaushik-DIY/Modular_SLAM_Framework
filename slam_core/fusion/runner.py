@@ -102,6 +102,10 @@ class FusionRunResult:
     loop_count: int = 0
     memory_stats: Dict[str, int] = field(default_factory=dict)
     per_keyframe_ms: List[float] = field(default_factory=list)               # wall time / keyframe
+    frontend_poses_3d: Dict[int, "object"] = field(default_factory=dict)     # id -> 4x4 cam pose
+    module_times_ms: Dict[str, float] = field(default_factory=dict)          # stage -> total ms
+    loop_stats: Dict[str, int] = field(default_factory=dict)                 # proposed/verified/...
+    loop_reject_reasons: Dict[str, int] = field(default_factory=dict)        # status -> count
 
     def runtime_summary(self) -> Dict[str, float]:
         """Per-keyframe runtime stats (ms): count/mean/median/p95/max."""
@@ -124,6 +128,7 @@ def run_mode_c(
     visual_backend,
     *,
     base_T_cam=None,
+    world_transform=None,
     loop_detector=None,
     verifier=None,
     optimize_every: Optional[int] = None,
@@ -167,52 +172,84 @@ def run_mode_c(
     signatures: Dict[int, Signature] = {}
     prev_sig: Optional[Signature] = None
     kf_count = 0
+    mt = {k: 0.0 for k in ("frontend", "signature", "memory", "graph",
+                           "propose", "verify", "solve")}
+    n_proposed = n_verified = 0
+    reject: Dict[str, int] = {}
 
     for frame in frames:
+        _tf = time.perf_counter()
         rec = service.step(frame.rgb, frame.depth, float(frame.rgb_t))
+        mt["frontend"] += (time.perf_counter() - _tf) * 1000.0
         if rec is None:
             continue
         _t0 = time.perf_counter()
 
-        pose2 = project_pose3d_to_pose2(rec.pose, base_T_cam)
+        _t = time.perf_counter()
+        pose2 = project_pose3d_to_pose2(rec.pose, base_T_cam, world_transform)
         sig = Signature(id=rec.id, timestamp=rec.timestamp, pose=pose2,
                         keypoints=rec.keypoints, descriptors=rec.descriptors,
                         points3d=rec.points3d, scan=getattr(frame, "scan", None))
         signatures[sig.id] = sig
         result.frontend_poses[sig.id] = pose2
+        result.frontend_poses_3d[sig.id] = np.asarray(rec.pose, dtype=float)
+        mt["signature"] += (time.perf_counter() - _t) * 1000.0
 
+        _t = time.perf_counter()
         mem.insert(sig)
+        mt["memory"] += (time.perf_counter() - _t) * 1000.0
+
+        _t = time.perf_counter()
         graph.add_node(sig)
         if prev_sig is not None:
             graph.add_neighbor_link(prev_sig, sig)
+        mt["graph"] += (time.perf_counter() - _t) * 1000.0
 
         # propose candidates against PAST keyframes, then verify with ICP
-        for proposal in proposer.poll_candidates(sig):
+        _t = time.perf_counter()
+        proposals = proposer.poll_candidates(sig)
+        mt["propose"] += (time.perf_counter() - _t) * 1000.0
+        for proposal in proposals:
             cand = signatures.get(int(proposal.candidate_id))
             if cand is None or not sig.has_scan or cand.scan is None:
                 continue
+            n_proposed += 1
             node = LoopNode(node_id=sig.id, scan_points=sig.scan,
                             pose_guess_global=sig.pose, timestamp=sig.timestamp)
             target = ClosureTarget(target_id=keyframe_target_id(cand.id),
                                    target_type="keyframe", pose_global=cand.pose,
                                    is_finished=True, is_fixed=False, map_view=cand.scan)
+            _t = time.perf_counter()
             res = verifier.verify(node, target)
+            mt["verify"] += (time.perf_counter() - _t) * 1000.0
             if res.success and res.matched_node_pose_global is not None:
                 rel = pose_relative(cand.pose, res.matched_node_pose_global)
                 graph.add_loop_edge(target_id=cand.id, source_id=sig.id, rel_pose=rel)
                 mem.confirm_loop(sig.id, cand.id)
                 result.accepted_loops.append((sig.id, cand.id))
+                n_verified += 1
+            else:
+                reject[res.status] = reject.get(res.status, 0) + 1
 
         proposer.register(sig)
         mem.tick()
         kf_count += 1
         if opt_every > 0 and kf_count % opt_every == 0 and graph.loop_count > 0:
+            _t = time.perf_counter()
             graph.solve()
+            mt["solve"] += (time.perf_counter() - _t) * 1000.0
         result.per_keyframe_ms.append((time.perf_counter() - _t0) * 1000.0)
         prev_sig = sig
 
     if graph.loop_count > 0:
+        _t = time.perf_counter()
         graph.solve()
+        mt["solve"] += (time.perf_counter() - _t) * 1000.0
+
+    result.module_times_ms = mt
+    result.loop_stats = {"proposed": n_proposed, "verified": n_verified,
+                         "rejected": n_proposed - n_verified}
+    result.loop_reject_reasons = reject
 
     result.keyframe_ids = list(signatures.keys())
     result.optimized_poses = graph.get_all_poses()
@@ -386,10 +423,12 @@ def run_fusion_cli(mode: Mode, args: Sequence[str]) -> int:
     frames = list(dataset.iter_frames(max_frames=max_frames))
 
     if mode == Mode.VLMAIN:
+        from slam_core.fusion.signature import CAMERA_GROUND_TRANSFORM
         # 500 features keeps the brute-force stand-in detector near real-time;
         # the production DBoW KeyFrameDatabase is O(1)-ish and faster still.
         backend = OrbRgbdVoBackend(dataset.K, n_features=500)
-        result = run_mode_c(config, frames, backend)
+        result = run_mode_c(config, frames, backend,
+                            world_transform=CAMERA_GROUND_TRANSFORM)
     else:  # LVMAIN — needs the real LiDAR front-end backend
         raise NotImplementedError(
             "Mode D CLI needs a LiDAR front-end backend; call run_mode_d() with "
