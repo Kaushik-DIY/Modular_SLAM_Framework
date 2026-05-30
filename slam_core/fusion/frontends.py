@@ -167,3 +167,50 @@ class BruteForceOrbDetector:
             if m.distance < self.nndr * n.distance:
                 good += 1
         return good
+
+
+class ProximityTargetProvider:
+    """Spatial-proximity loop-candidate provider (TargetProvider Protocol).
+
+    Runnable stand-in for ``carto.loop_closure_adapter.CartoTargetProvider`` in
+    Mode D: proposes past keyframes whose current pose estimate is within a
+    radius of the query and far enough apart in index. Wrapped by
+    ``LidarLoopProposer``; the real B&B/submap provider replaces it behind the
+    same interface.
+    """
+
+    def __init__(self, signatures: Dict[int, object], radius: float = 1.0,
+                 min_index_separation: int = 10):
+        self._sigs = signatures
+        self.radius = float(radius)
+        self.min_index_separation = int(min_index_separation)
+
+    def get_candidate_targets_for_node(self, node, all_nodes, config):
+        from slam_core.loop_closure import ClosureTarget
+
+        qid = int(node.node_id)
+        ranked = []
+        for cid, sig in self._sigs.items():
+            cid = int(cid)
+            if cid == qid or abs(cid - qid) < self.min_index_separation:
+                continue
+            d = float(np.hypot(node.pose_guess_global.x - sig.pose.x,
+                               node.pose_guess_global.y - sig.pose.y))
+            if d <= self.radius:
+                ranked.append((d, cid, sig))
+        ranked.sort(key=lambda x: x[0])
+        max_t = int(getattr(config, "max_candidate_targets_per_new_node", 4))
+        if max_t > 0:
+            ranked = ranked[:max_t]
+        return [
+            ClosureTarget(target_id=str(cid), target_type="keyframe",
+                          pose_global=sig.pose, is_finished=True, is_fixed=False,
+                          map_view=sig, search_source="proximity")
+            for _, cid, sig in ranked
+        ]
+
+    def get_finished_target(self, target_id):  # Protocol completeness (unused in v1)
+        raise NotImplementedError
+
+    def get_candidate_nodes_for_finished_target(self, target, all_nodes, config):
+        return []

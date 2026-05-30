@@ -84,7 +84,10 @@ class VisualLoopVerifier:
                 continue
             m, n = pair
             if m.distance < self.nndr * n.distance:
-                obj_pts.append(tgt.points3d[m.trainIdx])
+                p3 = tgt.points3d[m.trainIdx]
+                if not np.isfinite(p3).all():
+                    continue  # skip matches with invalid (no-depth) target points
+                obj_pts.append(p3)
                 img_pts.append(query.keypoints[m.queryIdx])
 
         if len(obj_pts) < self.min_inliers:

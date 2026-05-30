@@ -189,6 +189,136 @@ def run_mode_c(
     return result
 
 
+# ==========================================================================
+# Mode D — LiDAR-main + Visual (ORB+PnP) verifier  (plan §7.4)
+# ==========================================================================
+
+def run_mode_d(
+    config: FusionConfig,
+    frames: Iterable,
+    lidar_backend,
+    *,
+    camera_K,
+    base_T_cam=None,
+    target_provider=None,
+    verifier=None,
+    optimize_every: Optional[int] = None,
+    min_index_separation: int = 10,
+    proximity_radius: float = 1.0,
+    orb_features: int = 1000,
+    max_depth: float = 8.0,
+) -> FusionRunResult:
+    """Wire the LiDAR front-end + memory + graph + LiDAR proposer + visual verifier.
+
+    ``frames`` yields objects with ``rgb``, ``depth``, ``rgb_t``, ``scan``.
+    ``lidar_backend`` exposes ``process_scan(scan, t)`` (or ``step``) returning
+    a world ``pose`` (Pose2) and ``is_keyframe``. Each LiDAR keyframe also
+    carries ORB features from the synced RGB frame so the visual verifier can
+    confirm proximity proposals. The LiDAR pipeline's own g2o PGO is not driven.
+    """
+    import cv2
+    import numpy as np
+
+    from slam_core.common.se2 import pose_compose, pose_inverse
+    from slam_core.fusion.signature import Signature
+    from slam_core.fusion.memory import MemoryManager
+    from slam_core.fusion.graph import FusionGraph, keyframe_target_id
+    from slam_core.fusion.visual_verifier import VisualLoopVerifier
+    from slam_core.fusion.frontends import ProximityTargetProvider, _backproject
+    from slam_core.fusion.adapters import LidarLoopProposer, LidarFrontendService
+    from slam_core.loop_closure import ClosureTarget, LoopClosureConfig, LoopNode
+
+    def pose_relative(a, b):
+        return pose_compose(pose_inverse(a), b)
+
+    K = np.asarray(camera_K, dtype=np.float64)
+    orb = cv2.ORB_create(orb_features)
+
+    mem = MemoryManager(stm_size=config.stm_size, wm_cap=config.wm_cap,
+                        ltm_cap=config.ltm_cap, rehearsal_sim=config.rehearsal_similarity)
+    graph = FusionGraph(memory=mem)
+    service = LidarFrontendService(lidar_backend)
+
+    signatures: Dict[int, Signature] = {}
+    provider = target_provider or ProximityTargetProvider(
+        signatures, radius=proximity_radius, min_index_separation=min_index_separation)
+    proposer = LidarLoopProposer(provider=provider, config=LoopClosureConfig())
+    verifier = verifier or VisualLoopVerifier(
+        K=K, get_signature=signatures.get,
+        nndr=config.visual_nndr, min_inliers=config.visual_min_inliers,
+        base_T_cam=base_T_cam)
+    opt_every = config.optimize_every_n_keyframes if optimize_every is None else optimize_every
+
+    result = FusionRunResult()
+    loop_nodes: Dict[int, LoopNode] = {}
+    prev_sig: Optional[Signature] = None
+    next_id = 0
+    kf_count = 0
+
+    for frame in frames:
+        step = service.step(getattr(frame, "scan", None), float(frame.rgb_t))
+        if not step.is_keyframe:
+            continue
+
+        # ORB payload from the synced RGB frame (for visual verification).
+        gray = cv2.cvtColor(frame.rgb, cv2.COLOR_BGR2GRAY) if frame.rgb.ndim == 3 else frame.rgb
+        kp, desc = orb.detectAndCompute(gray, None)
+        if desc is None:
+            continue
+        kpts = np.array([k.pt for k in kp], dtype=np.float64)
+        pts3d, _ = _backproject(kpts, np.asarray(frame.depth, float), K, max_depth)
+
+        sig = Signature(id=next_id, timestamp=float(frame.rgb_t), pose=step.pose,
+                        keypoints=kpts, descriptors=desc, points3d=pts3d,
+                        scan=getattr(frame, "scan", None))
+        next_id += 1
+        signatures[sig.id] = sig
+        result.frontend_poses[sig.id] = step.pose
+
+        mem.insert(sig)
+        graph.add_node(sig)
+        if prev_sig is not None:
+            graph.add_neighbor_link(prev_sig, sig, rel_pose=step.rel_pose)
+
+        node = LoopNode(node_id=sig.id, scan_points=sig.scan,
+                        pose_guess_global=sig.pose, timestamp=sig.timestamp)
+        loop_nodes[sig.id] = node
+
+        for proposal in proposer.poll_candidates(node, all_nodes=loop_nodes):
+            cand = signatures.get(int(proposal.candidate_id))
+            if cand is None:
+                continue
+            target = proposal.target or ClosureTarget(
+                target_id=keyframe_target_id(cand.id), target_type="keyframe",
+                pose_global=cand.pose, is_finished=True, is_fixed=False, map_view=cand)
+            res = verifier.verify(node, target)
+            if res.success and res.matched_node_pose_global is not None:
+                rel = pose_relative(cand.pose, res.matched_node_pose_global)
+                graph.add_loop_edge(target_id=cand.id, source_id=sig.id, rel_pose=rel)
+                mem.confirm_loop(sig.id, cand.id)
+                result.accepted_loops.append((sig.id, cand.id))
+
+        mem.tick()
+        kf_count += 1
+        if opt_every > 0 and kf_count % opt_every == 0 and graph.loop_count > 0:
+            graph.solve()
+        prev_sig = sig
+
+    if graph.loop_count > 0:
+        graph.solve()
+
+    result.keyframe_ids = list(signatures.keys())
+    result.optimized_poses = graph.get_all_poses()
+    result.trajectory = [(signatures[i].timestamp, graph.get_pose(i))
+                         for i in result.keyframe_ids]
+    result.loop_count = graph.loop_count
+    result.memory_stats = {
+        "stm": mem.stm_count, "wm": mem.wm_count, "ltm": mem.ltm_count,
+        "live": mem.live_count,
+    }
+    return result
+
+
 def main(argv: List[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="slam_core.fusion.runner",
