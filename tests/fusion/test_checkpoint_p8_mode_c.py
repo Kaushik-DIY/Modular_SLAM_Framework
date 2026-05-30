@@ -126,8 +126,10 @@ def _ate(poses_by_id, gt_list, ids):
 
 def test_mode_c_end_to_end():
     keyframes, frames, gt = _build_run()
+    # small STM so early keyframes age into WM and become loop-searchable
+    # (RTAB-faithful: STM is protected from loop scoring).
     cfg = FusionConfig(mode=Mode.VLMAIN, dataset_path=str(DATASET), output_dir="out",
-                       optimize_every_n_keyframes=3,
+                       optimize_every_n_keyframes=3, stm_size=4, rehearsal_similarity=0.9,
                        icp_max_corr=0.5, icp_fitness=0.5, icp_inlier_rmse=0.1)
     detector = BruteForceOrbDetector(min_votes=120, top_k=3)
 
@@ -158,7 +160,7 @@ def test_mode_c_end_to_end():
 def test_mode_c_accepted_loop_links_revisit_to_origin():
     keyframes, frames, gt = _build_run()
     cfg = FusionConfig(mode=Mode.VLMAIN, dataset_path=str(DATASET), output_dir="out",
-                       optimize_every_n_keyframes=3)
+                       optimize_every_n_keyframes=3, stm_size=4, rehearsal_similarity=0.9)
     detector = BruteForceOrbDetector(min_votes=120, top_k=3)
     result = run_mode_c(cfg, frames, _ScriptedBackend(keyframes),
                         loop_detector=detector, min_index_separation=4)

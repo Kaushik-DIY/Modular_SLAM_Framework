@@ -170,6 +170,7 @@ def run_mode_c(
 
     result = FusionRunResult()
     signatures: Dict[int, Signature] = {}
+    query_objects: Dict[int, object] = {}   # id -> proposer query (KeyFrame/Signature)
     prev_sig: Optional[Signature] = None
     kf_count = 0
     mt = {k: 0.0 for k in ("frontend", "signature", "memory", "graph",
@@ -196,8 +197,16 @@ def run_mode_c(
         mt["signature"] += (time.perf_counter() - _t) * 1000.0
 
         _t = time.perf_counter()
-        mem.insert(sig)
+        ins = mem.insert(sig)
         mt["memory"] += (time.perf_counter() - _t) * 1000.0
+
+        # WM-bounded loop search (RTAB §3): a node becomes searchable only when it
+        # ages out of STM into Working Memory — register THAT node now, not the
+        # current (still-in-STM) keyframe.
+        if ins.aged_out is not None and ins.aged_out in query_objects:
+            _t = time.perf_counter()
+            proposer.register(query_objects[ins.aged_out])
+            mt["propose"] += (time.perf_counter() - _t) * 1000.0
 
         _t = time.perf_counter()
         graph.add_node(sig)
@@ -234,8 +243,15 @@ def run_mode_c(
             else:
                 reject[res.status] = reject.get(res.status, 0) + 1
 
-        proposer.register(query)
-        mem.tick()
+        # keep the query object so it can be registered when it ages into WM.
+        query_objects[sig.id] = query
+
+        tick = mem.tick()
+        # erase nodes transferred WM->LTM from the loop search index (bounds search).
+        for tid in tick.transferred:
+            if tid in query_objects:
+                proposer.erase(query_objects[tid])
+
         kf_count += 1
         if opt_every > 0 and kf_count % opt_every == 0 and graph.loop_count > 0:
             _t = time.perf_counter()

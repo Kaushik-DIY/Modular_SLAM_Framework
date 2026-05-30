@@ -44,7 +44,12 @@ class OrbLoopProposer:
         self._registered: List[int] = []
 
     def register(self, keyframe) -> None:
-        """Add a keyframe to the underlying database for future retrieval."""
+        """Add a keyframe to the underlying database for future retrieval.
+
+        Per RTAB-Map, a node becomes loop-searchable only once it leaves STM and
+        enters Working Memory — so the caller registers on STM->WM aging, not at
+        creation, keeping the search index bounded to WM.
+        """
         add = getattr(self.detector, "add", None)
         if add is None:
             db = getattr(self.detector, "keyframe_database", None)
@@ -52,6 +57,15 @@ class OrbLoopProposer:
         if add is not None:
             add(keyframe)
         self._registered.append(_kid(keyframe))
+
+    def erase(self, keyframe) -> None:
+        """Remove a keyframe from the search index (on WM->LTM transfer)."""
+        er = getattr(self.detector, "erase", None)
+        if er is None:
+            db = getattr(self.detector, "keyframe_database", None)
+            er = getattr(db, "erase", None)
+        if er is not None:
+            er(keyframe)
 
     def poll_candidates(self, keyframe) -> List[LoopProposal]:
         """Retrieve loop candidates for ``keyframe`` without verifying them."""

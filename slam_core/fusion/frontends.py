@@ -139,6 +139,10 @@ class BruteForceOrbDetector:
     def add(self, keyframe) -> None:
         self._db[int(keyframe.id)] = np.asarray(keyframe.descriptors, dtype=np.uint8)
 
+    def erase(self, keyframe) -> None:
+        """Remove a keyframe from the search index (on WM->LTM transfer)."""
+        self._db.pop(int(keyframe.id), None)
+
     def detect(self, keyframe) -> _DetectorOutput:
         qid = int(keyframe.id)
         q = np.asarray(keyframe.descriptors, dtype=np.uint8)
