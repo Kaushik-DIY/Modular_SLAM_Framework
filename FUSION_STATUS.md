@@ -4,7 +4,7 @@
 > This is the single source of truth for "where are we now?"
 > See `CLAUDE.md` §4 for the full phase definitions and `RTAB_inspired_implementation_plan.md` §13 for design detail.
 
-Last updated: 2026-05-30T03:40:27Z          Last commit: 66d6756 (Phase 3)
+Last updated: 2026-05-30T03:43:17Z          Last commit: e05a2b7 (Phase 4)
 
 ## Phase progress
 
@@ -13,7 +13,7 @@ Last updated: 2026-05-30T03:40:27Z          Last commit: 66d6756 (Phase 3)
 | 1 | Foundation                                  | DONE     | 2026-05-29T23:42:04Z | 111fbdf | Package skeleton + Signature, Pose3D→Pose2, SoftSync, lidar_synth, FusionDataset, probe. 22/22 tests pass; probe 20/20 sync, 3 scan dumps. Restored deleted `visual_slam/orbslam/slam/sensor_types.py` (HEAD regression blocking the TUM loader import). |
 | 2 | Memory tier (STM + WM + LTM)                | DONE     | 2026-05-30T03:34:32Z | 94a5a32 | MemoryManager: STM aging, multi-modal rehearsal (ORB + scan ICP-fit proxy), weight rule, oldest-of-lowest-weight transfer w/ recent-WM protection, in-RAM LTM cap, reactivation w/ neighbour pull. 12/12 tests incl. 500-kf stream. |
 | 3 | Fusion graph (FusionGraph + g2o backend)    | DONE     | 2026-05-30T03:40:27Z | 66d6756 | FusionGraph wraps G2oBackend2D unchanged via co-located submap+node duality; spine + loop edges, ConstraintSink Protocol, memory-gated write-back. 6/6 tests; toy 5-node loop deforms, anchor fixed. |
-| 4 | ICP verifier (small_gicp)                   | PENDING  |              |        |       |
+| 4 | ICP verifier (small_gicp)                   | DONE     | 2026-05-30T03:43:17Z | e05a2b7 | ICPLoopVerifier (LoopVerifier Protocol) on small_gicp GICP; 2D->z=0 promotion, KDTree fitness+RMSE scoring, corrected global pose. small_gicp 1.0.0 installed (x86_64 wheel). 5/5 tests. |
 | 5 | Visual verifier (ORB + PnP)                 | PENDING  |              |        |       |
 | 6 | Adapters (propose-only + frontend services) | PENDING  |              |        |       |
 | 7 | Mode A and Mode B (pass-through)            | PENDING  |              |        |       |
@@ -57,3 +57,6 @@ See `CLAUDE.md` §7 for the full 8-row acceptance table. Headline checks:
 - **(Phase 3)** Each keyframe costs 2 g2o vertices (submap + node) plus a stiff binding edge — the price of reusing G2oBackend2D unchanged (its only EdgeSE2 is submap->node). Fine for v1; revisit if vertex count hurts on Jetson.
 - **(Phase 3)** `solve()` optimizes the *full* graph every call and writes back to all WM/STM signatures; the §9.1 "LTM vertices not touched / corrected lazily on reactivate" optimization is deferred (perf only, not correctness).
 - **(Phase 3)** Spine edges are added explicitly via `add_neighbor_link` (INTRA constraints), not via the backend's consecutive-id `update_node_local_pose` path — this tolerates id gaps left by rehearsal merges.
+- **(Phase 4)** `small_gicp` 1.0.0 installed from the x86_64 manylinux wheel. The Jetson/aarch64 build is NOT yet verified — the §8 risk row (NumPy point-to-point ICP fallback) still stands for deployment.
+- **(Phase 4)** Loop-edge residual gating (plan §10.3, `optimize_max_error_factor` rollback after solve) is NOT yet implemented in the verifier; the manager only checks `success`. Add the post-solve residual rejection when wiring Mode C/D (Phase 8/9).
+- **(Phase 4)** ICP info-matrix is left to the constraint builder (config `translation_weight`/`rotation_weight`); the MAD-style overlap-weighted info matrix in plan §10.1 is deferred to Phase 11 hardening.
