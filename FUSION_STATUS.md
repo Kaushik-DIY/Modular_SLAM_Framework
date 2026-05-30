@@ -4,7 +4,7 @@
 > This is the single source of truth for "where are we now?"
 > See `CLAUDE.md` §4 for the full phase definitions and `RTAB_inspired_implementation_plan.md` §13 for design detail.
 
-Last updated: 2026-05-30T03:43:17Z          Last commit: e05a2b7 (Phase 4)
+Last updated: 2026-05-30T03:46:34Z          Last commit: adb5a93 (Phase 5)
 
 ## Phase progress
 
@@ -14,7 +14,7 @@ Last updated: 2026-05-30T03:43:17Z          Last commit: e05a2b7 (Phase 4)
 | 2 | Memory tier (STM + WM + LTM)                | DONE     | 2026-05-30T03:34:32Z | 94a5a32 | MemoryManager: STM aging, multi-modal rehearsal (ORB + scan ICP-fit proxy), weight rule, oldest-of-lowest-weight transfer w/ recent-WM protection, in-RAM LTM cap, reactivation w/ neighbour pull. 12/12 tests incl. 500-kf stream. |
 | 3 | Fusion graph (FusionGraph + g2o backend)    | DONE     | 2026-05-30T03:40:27Z | 66d6756 | FusionGraph wraps G2oBackend2D unchanged via co-located submap+node duality; spine + loop edges, ConstraintSink Protocol, memory-gated write-back. 6/6 tests; toy 5-node loop deforms, anchor fixed. |
 | 4 | ICP verifier (small_gicp)                   | DONE     | 2026-05-30T03:43:17Z | e05a2b7 | ICPLoopVerifier (LoopVerifier Protocol) on small_gicp GICP; 2D->z=0 promotion, KDTree fitness+RMSE scoring, corrected global pose. small_gicp 1.0.0 installed (x86_64 wheel). 5/5 tests. |
-| 5 | Visual verifier (ORB + PnP)                 | PENDING  |              |        |       |
+| 5 | Visual verifier (ORB + PnP)                 | DONE     | 2026-05-30T03:46:34Z | adb5a93 | VisualLoopVerifier (LoopVerifier Protocol) via signature provider; ORB ratio-match + solvePnPRansac; relative cam pose conjugated by REP-103 cam->base to SE(2). 3/3 tests incl. known-motion recovery. |
 | 6 | Adapters (propose-only + frontend services) | PENDING  |              |        |       |
 | 7 | Mode A and Mode B (pass-through)            | PENDING  |              |        |       |
 | 8 | Mode C end-to-end (V-main + L-verify)       | PENDING  |              |        |       |
@@ -60,3 +60,5 @@ See `CLAUDE.md` §7 for the full 8-row acceptance table. Headline checks:
 - **(Phase 4)** `small_gicp` 1.0.0 installed from the x86_64 manylinux wheel. The Jetson/aarch64 build is NOT yet verified — the §8 risk row (NumPy point-to-point ICP fallback) still stands for deployment.
 - **(Phase 4)** Loop-edge residual gating (plan §10.3, `optimize_max_error_factor` rollback after solve) is NOT yet implemented in the verifier; the manager only checks `success`. Add the post-solve residual rejection when wiring Mode C/D (Phase 8/9).
 - **(Phase 4)** ICP info-matrix is left to the constraint builder (config `translation_weight`/`rotation_weight`); the MAD-style overlap-weighted info matrix in plan §10.1 is deferred to Phase 11 hardening.
+- **(Phase 5)** The visual verifier reads ORB payload via a `get_signature` provider (LoopNode has no ORB slot); the runner must pass `memory.get` (or equivalent) in Phase 9. The plan said "reuse ORB-SLAM's PnP routine" — used `cv2.solvePnPRansac` directly instead (simpler, no dependency on the ORB-SLAM Sim3/PnP internals); revisit if scale handling needs ORB-SLAM's solver.
+- **(Phase 5)** SE(2) projection conventions now diverge by input type: `signature.project_pose3d_to_pose2` for world keyframe poses vs the visual verifier's conjugation for *relative* camera transforms. Keep this distinction in mind in Phase 8/9.
