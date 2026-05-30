@@ -44,8 +44,13 @@ class _OrbKeyframe:
 
 
 class OrbSlamFrontendBackend:
-    def __init__(self, camera, sensor_type: SensorType = SensorType.RGBD):
+    def __init__(self, camera, sensor_type: SensorType = SensorType.RGBD,
+                 feature_backend: str = "pyslam_orb2"):
+        # pyslam_orb2 = the real ORB-SLAM2 quadtree-distributed extractor; far
+        # more robust than the opencv_orb fallback (see Mode-A lab diagnosis).
+        ft_cfg = None if feature_backend in (None, "auto") else {"extractor_backend": feature_backend}
         self.slam = Slam(camera=camera, sensor_type=sensor_type,
+                         feature_tracker_config=ft_cfg,
                          enable_loop_closing=False, headless=True)
         self.frame_idx = -1
         self._seen = set()

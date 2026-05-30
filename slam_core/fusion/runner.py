@@ -490,6 +490,23 @@ def _first_positional(args: Sequence[str]) -> Optional[str]:
     return None
 
 
+def _augment_orb_passthrough(rest: Sequence[str]) -> List[str]:
+    """Mode A defaults: pyslam_orb2 extractor + outputs under fusion_outputs/.
+
+    Both are only injected when the user didn't specify them, so an explicit
+    --feature-backend / --output still wins.
+    """
+    rest = list(rest)
+    has_fb = any(a == "--feature-backend" or a.startswith("--feature-backend=") for a in rest)
+    if not has_fb:
+        rest += ["--feature-backend", "pyslam_orb2"]
+    if _arg_value(rest, "--output") is None:
+        ds = _first_positional(rest)
+        name = Path(ds).name if ds else "run"
+        rest += ["--output", str(_REPO_ROOT / "fusion_outputs" / f"modeA_{name}")]
+    return rest
+
+
 def _latest_lidar_trajectory(dataset: str):
     cands = [p for p in (_REPO_ROOT / "hector_outputs").glob(f"trajectory_{dataset}_*.txt")
              if not p.name.endswith("_debug.txt")]
@@ -519,6 +536,11 @@ def _generate_passthrough_artifacts(mode: Mode, forwarded: Sequence[str]) -> Non
             variant = "raw" if "_raw_" in traj.name else ("360" if "_360_" in traj.name else None)
         out = _REPO_ROOT / "fusion_outputs" / f"modeB_{dataset}"
         produced = generate_lidar_artifacts(traj, dataset, out, scan_variant=variant)
+        # keep everything together under fusion_outputs/
+        import shutil
+        out.mkdir(parents=True, exist_ok=True)
+        shutil.copy(traj, out / traj.name)
+        produced["trajectory_tum"] = out / traj.name
 
     for label, path in produced.items():
         print(f"[artifacts]   {label}: {path}")
@@ -542,6 +564,9 @@ def main(argv: List[str] | None = None) -> int:
 
     if mode in (Mode.VLMAIN, Mode.LVMAIN):
         return run_fusion_cli(mode, rest)
+
+    if mode == Mode.ORB:
+        rest = _augment_orb_passthrough(rest)
 
     rc = dispatch(mode, rest)
     if rc == 0 and not args.no_artifacts:

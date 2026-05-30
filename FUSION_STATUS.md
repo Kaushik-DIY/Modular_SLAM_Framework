@@ -74,6 +74,13 @@ Validation (fr1_room, 250-frame slice):
 - Loop closure on the slice was marginal/negative (1 verified of 12 proposed; -16% 2D ATE) — odometry barely drifted on a short clip, so a single ICP loop perturbs an already-good trajectory. Full-sequence run (real revisits + accumulated drift) in progress to get the definitive loop-closure verdict; the RTAB `RGBD/OptimizeMaxError` residual gate (§3.5 / plan §10.3) is the safety mechanism if gross-outlier loops appear.
 - ORB-SLAM front-end throughput is ~1 fps (Python port) — a separate, known perf concern; the *fusion* layer is real-time.
 
+## Mode A/B lab validation + feature-backend finding (2026-05-30)
+
+- Mode A/B confirmed as faithful pass-throughs on the lab datasets (Mode B byte-identical to standalone; Mode A within 6 mm = ORB nondeterminism). Both are now **complete one-command pipelines** (auto trajectory plots + rebuilt map via `slam_core/fusion/passthrough_artifacts.py`).
+- **Root cause of a bad Mode-A lab run:** `--feature-backend auto` falls back to **opencv_orb** (clumped features) → catastrophic tracking loss in one hard segment (fr lab frames 1953–2259, 307 lost) → fewer keyframes / thinner map. The clean reference + recent standalone runs all used **`pyslam_orb2`** (quadtree-distributed) with 0 losses. Fix applied: **pyslam_orb2 is now the default** for the ORB path — injected into Mode A pass-through args (unless overridden) and the default in `OrbSlamFrontendBackend` (Modes C/D).
+- **Outputs default under `fusion_outputs/`**: Mode A `--output` defaults to `fusion_outputs/modeA_<dataset>/` when omitted; Mode B artifacts + trajectory land in `fusion_outputs/modeB_<dataset>/`; fusion modes already emit to `fusion_outputs/<run_id>/`.
+- SE(2) preview on the wheeled robot: out-of-plane RMS 2.1 cm / 0.25% of an 8.5 m path → planar assumption valid here (vs catastrophic on handheld TUM) → Modes C/D justified on lab data.
+
 ## Open follow-ups (rolled forward across phases)
 
 - **(Phase 1)** Restored `visual_slam/orbslam/slam/sensor_types.py` from commit `cc80128` — it was deleted before HEAD and broke every import of the ORB-SLAM package (and thus the TUM loader). Worth confirming the deletion was accidental and that nothing else in `visual_slam/` regressed.

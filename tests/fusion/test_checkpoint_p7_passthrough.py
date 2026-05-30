@@ -70,9 +70,8 @@ def test_dispatch_propagates_returncode():
     assert rc == 3
 
 
-def test_main_forwards_remainder_verbatim():
+def _capture_dispatch(argv):
     captured = {}
-
     import slam_core.fusion.runner as runner
 
     def fake_dispatch(mode, forwarded):
@@ -83,12 +82,38 @@ def test_main_forwards_remainder_verbatim():
     orig = runner.dispatch
     runner.dispatch = fake_dispatch
     try:
-        rc = main(["--mode", "orb", "data", "--output", "o", "--max-frames", "5"])
+        rc = main(argv)
     finally:
         runner.dispatch = orig
-    assert rc == 0
-    assert captured["mode"] == Mode.ORB
-    assert captured["forwarded"] == ["data", "--output", "o", "--max-frames", "5"]
+    captured["rc"] = rc
+    return captured
+
+
+def test_lidar_forwards_remainder_verbatim():
+    # lidar pass-through forwards args verbatim (no augmentation)
+    cap = _capture_dispatch(["--mode", "lidar", "--dataset", "lab_run_2", "--max-scans", "5"])
+    assert cap["rc"] == 0 and cap["mode"] == Mode.LIDAR
+    assert cap["forwarded"] == ["--dataset", "lab_run_2", "--max-scans", "5"]
+
+
+def test_orb_injects_pyslam_orb2_and_default_output():
+    # Mode A defaults: pyslam_orb2 extractor injected; explicit --output respected
+    cap = _capture_dispatch(["--mode", "orb", "data", "--output", "o", "--max-frames", "5"])
+    assert cap["mode"] == Mode.ORB
+    fwd = cap["forwarded"]
+    assert fwd[:5] == ["data", "--output", "o", "--max-frames", "5"]
+    assert "--feature-backend" in fwd and "pyslam_orb2" in fwd
+
+    # when --output is omitted, it defaults under fusion_outputs/
+    cap2 = _capture_dispatch(["--mode", "orb", "datasets/lab_rgbd_run_2"])
+    out = cap2["forwarded"][cap2["forwarded"].index("--output") + 1]
+    assert "fusion_outputs" in out and "modeA_lab_rgbd_run_2" in out
+
+    # an explicit --feature-backend is NOT overridden
+    cap3 = _capture_dispatch(["--mode", "orb", "data", "--output", "o",
+                              "--feature-backend", "opencv_orb"])
+    assert cap3["forwarded"].count("--feature-backend") == 1
+    assert "opencv_orb" in cap3["forwarded"] and "pyslam_orb2" not in cap3["forwarded"]
 
 
 def test_fusion_modes_not_yet_runnable():
