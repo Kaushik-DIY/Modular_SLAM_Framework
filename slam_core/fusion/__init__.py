@@ -15,6 +15,7 @@ from slam_core.fusion.signature import Signature, project_pose3d_to_pose2
 from slam_core.fusion.sync import FusedSample, SoftSync
 from slam_core.fusion.lidar_synth import synthesize_2d_scan
 from slam_core.fusion.dataset import FusionDataset, FusionFrame
+from slam_core.fusion.memory import MemoryManager, InsertResult, TickResult
 
 __all__ = [
     "FusionConfig",
@@ -26,4 +27,7 @@ __all__ = [
     "synthesize_2d_scan",
     "FusionDataset",
     "FusionFrame",
+    "MemoryManager",
+    "InsertResult",
+    "TickResult",
 ]
