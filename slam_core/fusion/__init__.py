@@ -17,6 +17,7 @@ from slam_core.fusion.lidar_synth import synthesize_2d_scan
 from slam_core.fusion.dataset import FusionDataset, FusionFrame
 from slam_core.fusion.memory import MemoryManager, InsertResult, TickResult
 from slam_core.fusion.graph import FusionGraph, keyframe_target_id
+from slam_core.fusion.icp_verifier import ICPLoopVerifier
 
 __all__ = [
     "FusionConfig",
@@ -33,4 +34,5 @@ __all__ = [
     "TickResult",
     "FusionGraph",
     "keyframe_target_id",
+    "ICPLoopVerifier",
 ]
