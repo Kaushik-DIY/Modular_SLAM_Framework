@@ -353,6 +353,10 @@ static void bind_frame(py::module_ &m) {
              py::arg("x"), py::arg("y"), py::arg("r"),
              "Indices of kpsu within radius r of (x,y), sorted (scipy-compatible).")
         .def("kd_ready",            &Frame::kd_ready)
+        .def("project_world",       &Frame::project_world, py::arg("Xw"),
+             "Native C++ pinhole projection of a world point -> (u, v, depth).")
+        .def("is_in_image",         &Frame::is_in_image,
+             py::arg("u"), py::arg("v"), py::arg("z"))
 
         // ---- Depth array (RGBD/stereo — numpy array or None) ---------------
         .def_readwrite("depths",      &Frame::depths)
