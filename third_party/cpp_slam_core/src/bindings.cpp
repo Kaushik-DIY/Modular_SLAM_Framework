@@ -2,6 +2,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <pybind11/eigen.h>
+#include <pybind11/eval.h>  // py::exec — explicit in pybind11 3.x (was transitive in 2.x)
 
 #include "map_point.h"
 #include "frame.h"
