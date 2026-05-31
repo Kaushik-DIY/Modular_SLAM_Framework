@@ -155,6 +155,26 @@ void Frame::init_feature_arrays(py::object kps_in, py::array_t<uint8_t> des_in,
     // Initialize point associations
     points.assign(n_features, py::none());
     outliers.assign(n_features, false);
+
+    // kpsu changed -> invalidate any previously-built kd-tree (rebuilt lazily).
+    kd_built_ = false;
+}
+
+// ---- 2D kd-tree over kpsu --------------------------------------------------
+void Frame::ensure_kd() const {
+    if (kd_built_) return;
+    const int n = static_cast<int>(kpsu.rows());
+    if (n > 0) {
+        // kpsu is row-major (N,2) float -> contiguous x0,y0,x1,y1,...
+        kd_.build(kpsu.data(), static_cast<std::size_t>(n));
+    }
+    kd_built_ = true;
+}
+
+std::vector<int> Frame::kd_query_ball(float x, float y, float r) const {
+    ensure_kd();
+    if (kpsu.rows() == 0) return {};
+    return kd_.query_ball_point(x, y, r);
 }
 
 // ---- Pose ------------------------------------------------------------------

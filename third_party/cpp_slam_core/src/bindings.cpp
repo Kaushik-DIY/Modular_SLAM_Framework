@@ -349,6 +349,10 @@ static void bind_frame(py::module_ &m) {
         .def("replace_point_match", &Frame::replace_point_match)
         .def("reset_points",        &Frame::reset_points)
         .def("num_kps",             &Frame::num_kps)
+        .def("kd_query_ball",       &Frame::kd_query_ball,
+             py::arg("x"), py::arg("y"), py::arg("r"),
+             "Indices of kpsu within radius r of (x,y), sorted (scipy-compatible).")
+        .def("kd_ready",            &Frame::kd_ready)
 
         // ---- Depth array (RGBD/stereo — numpy array or None) ---------------
         .def_readwrite("depths",      &Frame::depths)
