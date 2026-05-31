@@ -170,6 +170,10 @@ class Parameters:
     # Bundle Adjustment
     # ================================================================
     kLocalBAWindowSize = 20
+    # Purge bad/fusion-replaced "ghost" points from the global map this often
+    # (in keyframes). Keeps Map.points ~= the live good-point count so RAM and
+    # whole-map passes (global BA, export) don't bloat. See Map.compact_points().
+    kMapCompactionEveryNKeyframes = 5
     kUseLargeWindowBA = False
     kEveryNumFramesLargeWindowBA = 10
     kLargeBAWindowSize = 20
@@ -283,6 +287,12 @@ class Parameters:
     kRelocalizationFeatureMatchRatioTestLarge = 0.9
     kRelocalizationPoseOpt1MinMatches = 10
     kRelocalizationDoPoseOpt2NumInliers = 50
+    # Robustness safety net: if tracking is LOST and relocalization fails for this
+    # many consecutive frames, re-initialize a fresh RGB-D submap from the current
+    # frame's depth (anchored at the last-known-good pose) so the system recovers
+    # instead of staying permanently dead. Only ever triggers in the already-LOST
+    # state, so it cannot affect normally-tracking runs. Set <=0 to disable.
+    kMaxRelocFailuresBeforeReinit = 30
     kRelocalizationMaxReprojectionDistanceMapSearchCoarse = 10
     kRelocalizationMaxReprojectionDistanceMapSearchFine = 3
 

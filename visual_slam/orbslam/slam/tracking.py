@@ -108,6 +108,13 @@ class Tracking:
         self.total_num_static_stereo_map_points = 0
         self.last_reloc_frame_id = -float("inf")
 
+        # Robustness safety net (see Parameters.kMaxRelocFailuresBeforeReinit):
+        # track consecutive failed relocalizations and the last good pose so a
+        # permanently-LOST run can re-initialize from depth and continue.
+        self.consecutive_reloc_failures = 0
+        self.last_good_pose = None
+        self.total_reinit_from_depth = 0
+
         self.pose_is_ok = False
         self.mean_pose_opt_chi2_error = None
         self.predicted_pose = None
@@ -1142,6 +1149,53 @@ class Tracking:
 
         return num_created >= Parameters.kInitializerNumMinTriangulatedPointsStereo
 
+    def _reinitialize_from_depth(self, f_cur: Frame, img=None) -> bool:
+        """Recover from prolonged tracking loss by seeding a fresh RGB-D keyframe
+        from the current frame's depth, anchored at the last-known-good pose.
+
+        This is the catastrophic-loss safety net: it only runs after many
+        consecutive failed relocalizations (system already dead), so it never
+        affects a normally-tracking run. The new keyframe is a disconnected map
+        component (no covisibility with the pre-loss map); the trajectory resumes
+        from the anchor pose. Imperfect (motion during the loss is unknown) but
+        far better than staying LOST for the rest of the run. Mirrors
+        _create_initial_rgbd_map but uses the anchor pose instead of identity.
+        """
+        anchor = self.last_good_pose
+        if anchor is None:
+            anchor = np.eye(4, dtype=np.float64)
+        f_cur.update_pose(g2o.Isometry3d(np.asarray(anchor, dtype=np.float64).reshape(4, 4)))
+
+        kf0 = KeyFrame(f_cur, img=img)
+        self.map.add_keyframe(kf0)
+        self._add_keyframe_to_database(kf0)
+
+        num_created = TrackingCore.create_and_add_stereo_map_points_on_new_kf(
+            f_cur, kf0, self.map, img=img,
+        )
+        if num_created < Parameters.kInitializerNumMinTriangulatedPointsStereo:
+            return False
+
+        if not Parameters.kStoreKeyFrameDepthImages:
+            kf0.release_heavy_data(release_rgb=not Parameters.kStoreKeyFrameImages,
+                                   release_depth=True, release_kd=False)
+        kf0.update_connections()
+
+        self.kf_ref = kf0
+        self.kf_last = kf0
+        self.f_ref = f_cur
+        self.f_cur = f_cur
+        f_cur.kf_ref = kf0
+        self.map.update_local_map(kf0)
+        self.motion_model.reset()
+        self.motion_model.update_pose_from_matrix(f_cur.timestamp, f_cur.pose())
+
+        self.state = SlamState.OK
+        self.pose_is_ok = True
+        self.num_matched_map_points = num_created
+        self.last_good_pose = np.asarray(anchor, dtype=np.float64).reshape(4, 4)
+        return True
+
     def _add_keyframe_to_database(self, keyframe: KeyFrame) -> None:
         keyframe_database = getattr(self.slam, "keyframe_database", None)
         if keyframe_database is None:
@@ -1233,6 +1287,7 @@ class Tracking:
                 self.last_reloc_frame_id = f_cur.id
                 self.state = SlamState.OK
                 self.pose_is_ok = True
+                self.consecutive_reloc_failures = 0
                 self.kf_ref = f_cur.kf_ref
                 self.kf_last = self.kf_ref
                 self.map.update_local_map(self.kf_ref)
@@ -1243,10 +1298,34 @@ class Tracking:
                 )
             else:
                 self.pose_is_ok = False
+                self.consecutive_reloc_failures += 1
                 Printer.red("Relocalization failed")
+                # Safety net: after prolonged unrecoverable loss, re-initialize a
+                # fresh RGB-D submap from depth (anchored at the last good pose)
+                # so the system continues instead of staying dead for the rest of
+                # the run. Only reached while already LOST -> cannot affect the
+                # normal tracking path.
+                limit = int(getattr(Parameters, "kMaxRelocFailuresBeforeReinit", 0))
+                if (limit > 0 and self.consecutive_reloc_failures >= limit
+                        and depth is not None):
+                    if self._reinitialize_from_depth(f_cur, img=img):
+                        Printer.orange(
+                            f"[recovery] re-initialized from depth at frame "
+                            f"{f_cur.id} after {self.consecutive_reloc_failures} "
+                            f"failed relocalizations"
+                        )
+                        self.consecutive_reloc_failures = 0
+                        self.total_reinit_from_depth += 1
 
         if self.pose_is_ok:
             self.state = SlamState.OK
+            self.consecutive_reloc_failures = 0
+            try:
+                _p = f_cur.pose()
+                _p = _p.matrix() if hasattr(_p, "matrix") else _p
+                self.last_good_pose = np.array(_p, dtype=np.float64).reshape(4, 4)
+            except Exception:
+                self.last_good_pose = None
             self.motion_model.update_pose_from_matrix(timestamp, f_cur.pose())
             if f_cur.id <= self.last_reloc_frame_id + 1:
                 self.motion_model.is_ok = False

@@ -19,39 +19,58 @@ from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.optimizer_g2o import local_bundle_adjustment, global_bundle_adjustment
 
 
+def _is_dead_point(point) -> bool:
+    """True if a map point is bad or fusion-replaced (same predicate the
+    exporter uses to skip points). Used by Map.compact_points()."""
+    is_bad = getattr(point, "is_bad", None)
+    if callable(is_bad) and bool(is_bad()):
+        return True
+    replacement = getattr(point, "replacement", None)
+    if replacement is None and hasattr(point, "get_replacement"):
+        try:
+            replacement = point.get_replacement()
+        except Exception:
+            replacement = None
+    return replacement is not None and replacement is not point
+
+
 # Provide a lightweight ordered set for keyframes and map points.
 class OrderedSetLite:
     """
-    Minimal ordered-set replacement.
+    Minimal insertion-ordered set.
 
-    small container preserves insertion order and supports the subset used by the
-    ORB-SLAM path.
+    Backed by a dict (insertion-ordered since Py3.7) so add / discard /
+    membership are O(1) instead of the O(n) of the previous list backing. This
+    matters because ``Map.points`` and ``Map.keyframes`` grow to thousands of
+    entries while local mapping inserts (``create_new_map_points``) and erases
+    (``cull_map_points``) points on every keyframe, and ``LocalCovisibilityMap``
+    rebuilds the local point set per keyframe — with list backing each of those
+    was O(n), i.e. O(n^2) over a run. That was the dominant reason local-mapping
+    cost grew ~linearly with map size. Items must be hashable (MapPoint/KeyFrame
+    hash by their immutable id). Integer/slice indexing is materialized on demand
+    (O(n)) and is only used for first/last/window access on Map.keyframes, never
+    in a hot loop. Membership semantics are unchanged (identity by id).
     """
 
     def __init__(self, values: Optional[Iterable] = None):
-        self._items = []
-        if values is not None:
-            for value in values:
-                self.add(value)
+        self._items: dict = dict.fromkeys(values) if values is not None else {}
 
     def add(self, value) -> None:
-        if value not in self._items:
-            self._items.append(value)
+        self._items.setdefault(value, None)
 
     def discard(self, value) -> None:
-        try:
-            self._items.remove(value)
-        except ValueError:
-            pass
+        self._items.pop(value, None)
 
     def remove(self, value) -> None:
-        self._items.remove(value)
+        del self._items[value]
 
     def clear(self) -> None:
         self._items.clear()
 
     def copy(self) -> "OrderedSetLite":
-        return OrderedSetLite(self._items)
+        new = OrderedSetLite()
+        new._items = dict(self._items)
+        return new
 
     def to_list(self) -> list:
         return list(self._items)
@@ -67,14 +86,16 @@ class OrderedSetLite:
 
     def __getitem__(self, item):
         if isinstance(item, slice):
-            return OrderedSetLite(self._items[item])
-        return self._items[item]
+            new = OrderedSetLite()
+            new._items = dict.fromkeys(list(self._items)[item])
+            return new
+        return list(self._items)[item]
 
     def __bool__(self) -> bool:
         return bool(self._items)
 
     def __repr__(self) -> str:
-        return f"OrderedSetLite({self._items!r})"
+        return f"OrderedSetLite({list(self._items)!r})"
 
 
 # Store counters recovered from a previously saved map session.
@@ -271,6 +292,26 @@ class Map:
         self.points.discard(point)
         if getattr(point, "map", None) is self:
             point.map = None
+
+    def compact_points(self) -> int:
+        """Purge points already marked bad or fusion-replaced from ``self.points``.
+
+        With the C++ MapPoint backend, ``set_bad()`` / ``replace_with()`` mark a
+        point dead but cannot call back into this Python ``Map`` to drop it from
+        ``self.points`` (the purging branch in MapPoint is gated behind
+        ``if not _USE_CPP_MP``). So fused/culled points accumulate as "ghosts" —
+        excluded from the exported map but resident in RAM and iterated by every
+        whole-map pass (global BA, export). This drops them. O(n) over the live
+        set; cheap with the dict-backed OrderedSetLite, and keeping it small
+        keeps it cheap. Uses the same bad/replaced predicate as the exporter.
+        """
+        with self._lock:
+            dead = [p for p in self.points if p is None or _is_dead_point(p)]
+            for p in dead:
+                self.points.discard(p)
+                if getattr(p, "map", None) is self:
+                    p.map = None
+            return len(dead)
 
     # Compatibility alias.
     def add_map_point(self, point: MapPoint) -> int:

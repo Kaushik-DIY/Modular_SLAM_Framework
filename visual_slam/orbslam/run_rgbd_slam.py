@@ -899,7 +899,11 @@ def create_arg_parser() -> argparse.ArgumentParser:
     gba_group = parser.add_mutually_exclusive_group()
     gba_group.add_argument("--enable-global-ba", action="store_true", help="Enable loop-triggered Global BA.")
     gba_group.add_argument("--disable-global-ba", action="store_true", help="Disable loop-triggered Global BA.")
-    parser.add_argument("--global-ba-after-loop", action="store_true", help="Run Global BA after accepted loop closures.")
+    parser.add_argument("--global-ba-after-loop", action="store_true", help="Run Global BA after accepted loop closures (online; blocks).")
+    parser.add_argument("--final-global-ba", action="store_true",
+                        help="Run ONE full Global BA at the end of the run (deferred; keeps "
+                             "online operation real-time). Recommended way to get a polished "
+                             "final map without blocking online tracking.")
     parser.add_argument("--global-ba-iterations", type=int, default=10)
     parser.add_argument("--loop-debug", action="store_true")
     parser.add_argument("--loop-retrieval-trace", action="store_true")
@@ -921,11 +925,27 @@ def create_arg_parser() -> argparse.ArgumentParser:
         ),
         default=getattr(Parameters, "kLoopCandidateSource", "auto"),
     )
-    parser.add_argument("--start-local-mapping-thread", action="store_true")
+    # Local mapping defaults to INLINE (sequential). Measured on lab_rgbd_run_2:
+    # threading is ~17% slower, stutters tracking more (GIL contention — the
+    # Python-heavy local-mapping work can't truly overlap tracking), and raises
+    # run-to-run variance. Threading only helps live streaming (fixed camera
+    # rate, tracking must not block), so it stays opt-in for future Jetson use.
+    parser.add_argument(
+        "--start-local-mapping-thread",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run local mapping on a background thread (opt-in; for live "
+             "streaming. Slower for batch dataset runs — see note in code).",
+    )
     parser.add_argument("--lm-wait-timeout", type=float, default=0.5)
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--memory-profile-every", type=int, default=1)
     parser.add_argument("--memory-profile-mode", choices=("cheap", "deep"), default="cheap")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Bit-reproducible eval mode: seed cv2 RNG, pin cv2/BLAS to 1 thread, "
+                             "disable parallel matching, force inline local mapping. SLOW "
+                             "(single-threaded BA) — for short reproducible segments / validation.")
+    parser.add_argument("--deterministic-seed", type=int, default=0)
     parser.add_argument("--profile-runtime", action="store_true")
     parser.add_argument("--runtime-profile-every", type=int, default=1)
     parser.add_argument("--profile-local-map", action="store_true")
@@ -955,6 +975,7 @@ def run_rgbd_slam(
     enable_global_ba: bool = False,
     global_ba_after_loop: bool = False,
     global_ba_iterations: int = 10,
+    final_global_ba: bool = False,
     loop_debug: bool = False,
     loop_retrieval_trace: bool = False,
     loop_retrieval_trace_raw_k: int = 0,
@@ -1437,6 +1458,21 @@ def run_rgbd_slam(
 
             elapsed = time.perf_counter() - start_t
 
+            # Threaded local mapping: drain any keyframes still queued before
+            # finalizing. stop_thread() abandons the queue, so without this the
+            # last few keyframes would miss local BA / point creation and the
+            # exported map would be incomplete. Bounded so a stuck worker can't
+            # hang shutdown.
+            if threaded_lm and slam.local_mapping is not None:
+                drain_deadline = time.perf_counter() + 60.0
+                while (slam.local_mapping.queue_size() > 0
+                       and time.perf_counter() < drain_deadline):
+                    slam.local_mapping.wait_idle(timeout=Parameters.kWaitForLocalMappingTimeout)
+                slam.local_mapping.wait_idle(timeout=5.0)
+                # Quiesce the worker before finalize/compaction/export so no
+                # concurrent map mutation races the single-threaded finalization.
+                slam.local_mapping.stop_thread()
+
             trajectory = slam.get_final_trajectory()
             ok_pairs = [
                 (pose, ts)
@@ -1560,6 +1596,39 @@ def run_rgbd_slam(
                 runtime_profile_json = output_dir / "runtime_profile.json"
                 profiler.write_csv(runtime_profile_csv)
                 profiler.write_json(runtime_profile_json)
+
+            # Final Global BA (deferred). Online operation runs only local BA +
+            # loop pose-graph correction (real-time, never blocks on GBA); one
+            # full global BA runs here, after the last frame, to polish the whole
+            # map/trajectory — "GBA at the end." Not counted in avg_fps (elapsed
+            # was measured above), reported separately.
+            final_gba_sec = 0.0
+            if final_global_ba and slam.map.num_keyframes() > 2:
+                _gba_t = time.perf_counter()
+                try:
+                    gba_result = slam.bundle_adjust()
+                    final_gba_sec = time.perf_counter() - _gba_t
+                    _ok = getattr(gba_result, "success", None)
+                    _reason = getattr(gba_result, "reason", "")
+                    _ned = getattr(gba_result, "num_edges", 0)
+                    _nin = getattr(gba_result, "num_inliers", 0)
+                    print(f"final global BA:       {final_gba_sec:.1f}s "
+                          f"(success={_ok}, reason='{_reason}', edges={_ned}, "
+                          f"inliers={_nin}, keyframes={slam.map.num_keyframes()})")
+                except Exception as _gba_exc:
+                    print(f"final global BA skipped: {_gba_exc}")
+
+            # Final purge of bad/fusion-replaced ghost points so the reported
+            # map_points count and exported map reflect the live good map (the
+            # C++ MapPoint backend leaves dead points in Map.points; see
+            # Map.compact_points()). Runs after GBA so GBA-flagged outliers are
+            # dropped too.
+            try:
+                n_compacted = slam.map.compact_points()
+                if n_compacted:
+                    print(f"final map compaction:  purged {n_compacted} ghost points")
+            except Exception as _compact_exc:
+                print(f"final map compaction skipped: {_compact_exc}")
 
             map_export = {"map_points_ply": None, "keyframes_json": None, "keyframe_graph_json": None}
             if not no_map_export:
@@ -1778,9 +1847,57 @@ def run_rgbd_slam(
                 slam.shutdown()
 
 
+_DETERMINISTIC_TP_LIMITER = None
+
+
+def apply_deterministic_mode(seed: int = 0) -> None:
+    """Maximize run-to-run reproducibility for benchmarking/validation.
+
+    Removes the *controllable* nondeterminism sources in this pipeline:
+      1. unseeded cv2 RANSAC in PnP relocalization + tracking -> seed cv2 RNG and
+         force single-threaded cv2;
+      2. ThreadPool keypoint matching in local mapping / relocalization -> disable;
+      3. multithreaded BLAS in the C++ BA -> pin to 1 thread (threadpoolctl).
+    Sim3 RANSAC is already seeded (sim3_solver seed=226) and ORB extraction is
+    already deterministic (verified bit-identical; Parameters.kORBDeterministic).
+
+    IMPORTANT LIMITATION: this gets variance down to ~mm but is NOT bit-identical.
+    The residual nondeterminism is INSIDE the C++ BA solver (slam_optimizer_core):
+    its internal threading/ordering is not controllable from Python. Pinning at
+    *launch* helps (export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+    -> ~2cm down to ~4mm), but true bit-determinism needs a single-threaded
+    deterministic build of that C++ solver (out of scope). Also slow (single-thread
+    BA) — intended for SHORT reproducible segments / unit validation, not full runs.
+    """
+    global _DETERMINISTIC_TP_LIMITER
+    np.random.seed(int(seed))
+    cv2.setRNGSeed(int(seed))
+    cv2.setNumThreads(1)
+    try:
+        import threadpoolctl
+        # Held for the process lifetime so the 1-thread BLAS limit stays active.
+        _DETERMINISTIC_TP_LIMITER = threadpoolctl.threadpool_limits(limits=1)
+    except Exception as exc:  # best-effort; env pinning is the fallback
+        print(f"[deterministic] threadpoolctl unavailable ({exc})")
+    Parameters.kLocalMappingParallelKpsMatching = False
+    Parameters.kRelocalizationParallelKpsMatching = False
+    _env_pinned = os.environ.get("OMP_NUM_THREADS") == "1"
+    print(f"[deterministic] enabled (seed={seed}): cv2 RNG seeded, single-thread "
+          f"cv2/BLAS, parallel matching off, inline LM.")
+    if not _env_pinned:
+        print("[deterministic] TIP: for best reproducibility also launch with "
+              "OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 "
+              "(C++ BA solver reads these at start). Residual ~mm variance remains "
+              "(C++ solver internals); not bit-identical.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = create_arg_parser()
     args = parser.parse_args(argv)
+
+    if getattr(args, "deterministic", False):
+        apply_deterministic_mode(int(getattr(args, "deterministic_seed", 0)))
+        args.start_local_mapping_thread = False  # inline => deterministic ordering
 
     enable_loop_closing = bool(args.enable_loop_closing and not args.disable_loop_closing)
     enable_global_ba = bool(args.enable_global_ba and not args.disable_global_ba)
@@ -1800,6 +1917,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_global_ba=enable_global_ba,
         global_ba_after_loop=bool(args.global_ba_after_loop),
         global_ba_iterations=int(args.global_ba_iterations),
+        final_global_ba=bool(args.final_global_ba),
         loop_debug=bool(args.loop_debug),
         loop_retrieval_trace=bool(args.loop_retrieval_trace),
         loop_retrieval_trace_raw_k=int(args.loop_retrieval_trace_raw_k),

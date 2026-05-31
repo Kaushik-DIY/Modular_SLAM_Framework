@@ -81,6 +81,9 @@ class LocalMapping:
         self.total_num_culled_points = 0
         self.last_num_culled_keyframes = None
         self.total_num_culled_keyframes = 0
+        self._kid_last_compaction = -1
+        self.last_num_compacted_points = 0
+        self.total_num_compacted_points = 0
 
         self.profile_keyframes = False
         self.schedule_log_rows: list[dict] = []
@@ -401,6 +404,18 @@ class LocalMapping:
                 schedule_row["ran_cull_keyframes"] = True
                 self.last_num_culled_keyframes = num_culled_keyframes
                 self.total_num_culled_keyframes += num_culled_keyframes
+
+                # Purge fusion-replaced / bad "ghost" points from the global map
+                # set every few keyframes. The C++ MapPoint backend marks points
+                # dead without removing them from the Python Map.points, so they
+                # accumulate (RAM bloat + slower whole-map passes). Amortized over
+                # kMapCompactionEveryNKeyframes so the O(n) scan stays cheap.
+                cur_kid = int(getattr(self.kf_cur, "kid", getattr(self.kf_cur, "id", 0)))
+                if cur_kid - self._kid_last_compaction >= Parameters.kMapCompactionEveryNKeyframes:
+                    with self._profile_section("local_mapping.compact_points"):
+                        self.last_num_compacted_points = self.map.compact_points()
+                    self.total_num_compacted_points += self.last_num_compacted_points
+                    self._kid_last_compaction = cur_kid
             else:
                 self.local_ba_skipped_due_queue_count += 1
                 schedule_row["skipped_local_BA_reason"] = "queue_pending_threaded"
