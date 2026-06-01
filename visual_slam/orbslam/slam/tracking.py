@@ -1014,6 +1014,27 @@ class Tracking:
                 }
             )
 
+            # Pragmatic keyframe-rate throttle (NOT pySLAM): enforce a hard minimum
+            # frame gap between keyframes. The pySLAM-correct strict matcher yields a
+            # persistently low matched/ref ratio on this dataset, so c2 (and c1c via
+            # close-point starvation) fire on nearly every frame; without a floor that
+            # cascades into keyframe/map bloat (OOM) under threaded local mapping. The
+            # max-frame interval (c1a) still forces a keyframe when genuinely stale, so
+            # this only caps the *rate*, it never blocks a needed keyframe indefinitely.
+            # TODO(v2): replace with full pySLAM threaded policy/culling parity.
+            # The floor gates only the CHRONIC triggers (relative ratio c2,
+            # close-point starvation). A genuine weak-tracking emergency — current
+            # matched inliers below an absolute floor — bypasses it so the map can
+            # densify before tracking is lost (otherwise sparse KFs starve the rover
+            # during exploration: tracked-points crash toward the loss threshold).
+            kf_emergency = num_matched_cur < int(Parameters.kEmergencyKfMatchThreshold)
+            if frames_since_last_kf < self.min_frames_between_kfs and not c1a and not kf_emergency:
+                self._append_keyframe_decision(
+                    **decision,
+                    reject_reason="min_keyframe_spacing_throttle",
+                )
+                return False
+
             # pySLAM (Tracking.need_new_keyframe) decision combination:
             #   ((c1a or c1b or c1c [or c1d]) and c2) [or c3]
             # c1a is NOT a hard override — every trigger is gated by c2 (tracking

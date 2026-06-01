@@ -104,7 +104,12 @@ class Parameters:
     kUseFovCentersBasedKfGeneration = False
     kMaxFovCentersDistanceForKfGeneration = 0.2
     kMinFramesBetweenKeyframesSequentialRgbd = 10   # phase1_lab: was 5, matches slow-rover lab dynamics
-    kMinFramesBetweenKeyframesThreadedRgbd = 0
+    kEmergencyKfMatchThreshold = 120  # matched inliers below this bypass the min-frame throttle
+    #   (genuine weak tracking -> densify the map before tracking is lost during exploration)
+    kMinFramesBetweenKeyframesThreadedRgbd = 20   # pragmatic KF-rate throttle (2026-06-01): was 0;
+    # strict (pySLAM-correct) matching yields a low matched/ref ratio on lab data, so c2/c1c fire
+    # almost every frame -> KF/map cascade under threaded LM. Hard min-frame gap caps the rate
+    # (c1a max-frame interval still forces a KF when stale). TODO(v2): full pySLAM threaded parity.
     kMaxFramesBetweenKeyframesRgbd = -1         # phase1_lab: disabled c1a hard override (was 10); -1 = use fps default = 30
     kUseFpsAwareKeyframeSpacing = True
     kMinKeyframeSpacingSeconds = 0.30   # phase1_lab: 0.30s floor (was 0.10) for slow-rover

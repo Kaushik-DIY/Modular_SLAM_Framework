@@ -253,11 +253,35 @@ def test_sequential_mode_no_longer_forces_min_frames_three(monkeypatch):
 
 
 def test_emergency_close_point_condition_can_still_request_keyframe(monkeypatch):
+    # Close-point starvation is a valid trigger once the min-frame-spacing throttle
+    # is satisfied (frame_id 10 >= min_frames 9). The throttle now also gates
+    # close-starvation, since on dense RGB-D it can fire chronically and cascade.
     monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 9)
     lm = FakeLocalMapping(accepting=True, idle=True)
-    tracking = make_tracking(local_mapping=lm, frame_id=1, last_kf_id=0, num_matched=50, tracked_close=0, total_points=200)
+    tracking = make_tracking(local_mapping=lm, frame_id=10, last_kf_id=0, num_matched=50, tracked_close=0, total_points=200)
     assert tracking.need_new_keyframe() is True
     assert tracking.keyframe_decision_rows[-1]["need_to_insert_close"] is True
+
+
+def test_min_frame_spacing_throttle_blocks_early_insert(monkeypatch):
+    # New pragmatic throttle: within the min-frame gap, a CHRONIC trigger
+    # (close-starvation with healthy matched count) is rejected with reason
+    # 'min_keyframe_spacing_throttle'. num_matched=200 (> emergency threshold)
+    # so the emergency bypass does NOT apply.
+    monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 9)
+    lm = FakeLocalMapping(accepting=True, idle=True)
+    tracking = make_tracking(local_mapping=lm, frame_id=3, last_kf_id=0, num_matched=200, ref_tracked=400, tracked_close=0, total_points=400)
+    assert tracking.need_new_keyframe() is False
+    assert tracking.keyframe_decision_rows[-1]["reject_reason"] == "min_keyframe_spacing_throttle"
+
+
+def test_weak_tracking_emergency_bypasses_throttle(monkeypatch):
+    # A genuine weak-tracking emergency (matched < kEmergencyKfMatchThreshold)
+    # bypasses the min-frame throttle so the map can densify before tracking is lost.
+    monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 9)
+    lm = FakeLocalMapping(accepting=True, idle=True)
+    tracking = make_tracking(local_mapping=lm, frame_id=3, last_kf_id=0, num_matched=50, ref_tracked=400, tracked_close=0, total_points=400)
+    assert tracking.need_new_keyframe() is True
 
 
 def test_keyframe_inserted_when_mapper_accepts_and_conditions_true(monkeypatch):
