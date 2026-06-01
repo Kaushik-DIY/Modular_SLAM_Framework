@@ -1017,17 +1017,13 @@ def _search_map_by_projection(
     found_pts_count = 0
     found_pts_fidxs = []
 
-    # Precompute current-feature occupancy once; vectorize the per-candidate
-    # descriptor distances (one batched popcount call per point instead of one
-    # cv2.norm per candidate). The best/second-best streaming selection below is
-    # byte-for-byte the original logic, just fed precomputed distances.
+    # Vectorize the per-candidate descriptor distances (one batched popcount call
+    # per point instead of one cv2.norm per candidate). The best/second-best
+    # streaming selection below is byte-for-byte the original logic, just fed
+    # precomputed distances. Occupancy is read LIVE (see below).
     cur_des = f_cur.des
     cur_octaves = f_cur.octaves
     cur_points = f_cur.points
-    cur_occupied = np.zeros(len(cur_points), dtype=bool)
-    for _k, _pc in enumerate(cur_points):
-        if _pc is not None and _pc.num_observations() > 0:
-            cur_occupied[_k] = True
 
     for i, p in idxs_and_pts:
         p.increase_visible()
@@ -1037,7 +1033,15 @@ def _search_map_by_projection(
         if candidate_idxs.size == 0:
             continue
         cand_oct = cur_octaves[candidate_idxs]
-        mask = ~cur_occupied[candidate_idxs]
+        # LIVE occupancy (matches pySLAM: f_cur.points is read at evaluation time,
+        # so a feature claimed by an earlier map point in THIS call is excluded for
+        # later ones — first-come wins). add_frame_view() mutates f_cur.points.
+        occ = np.fromiter(
+            ((cur_points[ci] is not None and cur_points[ci].num_observations() > 0)
+             for ci in candidate_idxs),
+            dtype=bool, count=candidate_idxs.size,
+        )
+        mask = ~occ
         mask &= (cand_oct >= predicted_level - 1) & (cand_oct <= predicted_level)
         valid = candidate_idxs[mask]
         if valid.size == 0:
@@ -1071,8 +1075,8 @@ def _search_map_by_projection(
         if best_k_idx > -1 and best_dist < max_descriptor_distance:
             if best_level == best_level2 and best_dist > best_dist2 * ratio_test:
                 continue
+            # pySLAM's search_map_by_projection does NOT call increase_found() here.
             if p.add_frame_view(f_cur, best_k_idx):
-                p.increase_found()
                 found_pts_count += 1
                 found_pts_fidxs.append(best_k_idx)
 

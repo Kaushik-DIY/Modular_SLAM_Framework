@@ -98,7 +98,7 @@ class Parameters:
     kNumMinTrackedClosePointsForNewKfNonMonocular = 100
     kNumMaxNonTrackedClosePointsForNewKfNonMonocular = 70
     kThNewKfRefRatioMonocular = 0.9
-    kThNewKfRefRatioStereo = 0.85   # phase1_lab: was 0.90, eased slightly since c1a hard override disabled
+    kThNewKfRefRatioStereo = 0.75   # pySLAM-aligned (2026-06-01): was 0.85, restored to pySLAM's value
     kThNewKfRefRatioNonMonocular = 0.25
     kUseFeatureCoverageControlForNewKf = False
     kUseFovCentersBasedKfGeneration = False

@@ -8,6 +8,7 @@
 #include "frame.h"
 #include "keyframe.h"
 #include "local_mapping_core.h"
+#include "geometry_matchers.h"
 
 namespace py = pybind11;
 using namespace slam;
@@ -72,6 +73,9 @@ static void bind_map_point(py::module_ &m) {
         })
         .def_property_readonly("min_distance", &MapPoint::min_distance)
         .def_property_readonly("max_distance", &MapPoint::max_distance)
+        .def("get_all_pos_info", &MapPoint::get_all_pos_info,
+             "(position, normal, 0.8*min_dist, 1.2*max_dist) — enables the Python "
+             "matcher's viewing-cos + distance filters (pySLAM-compatible).")
         .def_property("normal",
             [](const MapPoint &mp) -> py::array_t<double> {
                 return py::array_t<double>({3}, {sizeof(double)}, mp.normal.data());
@@ -545,6 +549,24 @@ PYBIND11_MODULE(cpp_slam_core, m) {
     bind_frame(m);
     bind_keyframe(m);
     bind_local_mapping_core(m);
+
+    // ---- Phase 5: C++ projection matcher (params passed from Python) -------
+    m.def("search_map_by_projection",
+          [](const py::list &points, py::object frame,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             float max_reproj_distance, float max_descriptor_distance, float ratio_test,
+             float viewing_cos_limit, float min_depth, float far_points_threshold,
+             double log_scale_factor, int num_levels) {
+              cppcore::MatchParams p{max_reproj_distance, max_descriptor_distance, ratio_test,
+                                     viewing_cos_limit, min_depth, far_points_threshold,
+                                     log_scale_factor, num_levels};
+              return cppcore::search_map_by_projection(points, frame, scale_factors, p);
+          },
+          py::arg("points"), py::arg("frame"), py::arg("scale_factors"),
+          py::arg("max_reproj_distance"), py::arg("max_descriptor_distance"),
+          py::arg("ratio_test"), py::arg("viewing_cos_limit"), py::arg("min_depth"),
+          py::arg("far_points_threshold"), py::arg("log_scale_factor"), py::arg("num_levels"),
+          "C++ search_map_by_projection -> (found_count, matched_feature_idxs).");
 
     // Python 3.11 adaptive interpreter specialization bug: calling a pybind11
     // instancemethod exactly 8 times in a tight for loop triggers a segfault

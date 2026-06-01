@@ -802,6 +802,12 @@ class Tracking:
             self.pose_optimization(self.f_cur, "local-map")
             pose_optimization_sec = time.perf_counter() - pose_optimization_start
 
+            # pySLAM (Tracking.track_local_map -> Frame.update_map_points_statistics):
+            # bump found-count for every inlier map point once per tracked frame, so
+            # get_found_ratio() (= found/visible) stays meaningful and map-point culling
+            # (found_ratio < 0.25) behaves correctly. increase_found() is intentionally
+            # NOT called inside search_map_by_projection (matches pySLAM).
+            self.f_cur.update_map_points_statistics()
             self.num_matched_map_points = self.f_cur.clean_outlier_map_points()
             track_local_map_sec = time.perf_counter() - track_local_map_start
 
@@ -949,8 +955,13 @@ class Tracking:
             # Keep cache in sync for external readers (e.g., local_BA result update)
             self.num_kf_ref_tracked_points = num_ref_tracked
 
-            # Current frame matched inlier map points
-            num_matched_cur = self.num_matched_map_points if self.num_matched_map_points is not None else 0
+            # Current frame matched inlier map points.
+            # pySLAM (Tracking.need_new_keyframe): use Frame.num_matched_inlier_map_points()
+            # (points with obs>0, not outlier) — a metric CONSISTENT with the reference side
+            # (KeyFrame.num_tracked_points). pySLAM explicitly abandoned the matcher's raw
+            # found-count (self.num_matched_map_points) for this ratio; using it broke the
+            # proportionality once the matcher was corrected (ratio collapsed 0.90 -> 0.34).
+            num_matched_cur = self.f_cur.num_matched_inlier_map_points()
 
             # Close point starvation check (RGB-D specific)
             num_tracked_close, num_non_tracked_close, _ = (
@@ -1003,20 +1014,28 @@ class Tracking:
                 }
             )
 
-            # c1a (max_frames elapsed) is a hard time-based override — insert unconditionally.
-            # c1b/c1c still require c2 (tracking quality gate).
-            if not (c1a or ((c1b or c1c) and c2)):
+            # pySLAM (Tracking.need_new_keyframe) decision combination:
+            #   ((c1a or c1b or c1c [or c1d]) and c2) [or c3]
+            # c1a is NOT a hard override — every trigger is gated by c2 (tracking
+            # quality). c1d (feature-coverage) and c3 (fov-center) are config-gated
+            # OFF in both forks, so they reduce to: (c1a or c1b or c1c) and c2.
+            if not ((c1a or c1b or c1c) and c2):
                 self._append_keyframe_decision(
                     **decision,
                     reject_reason="conditions_not_met",
                 )
                 return False
 
-            if local_mapping_accepting:
+            # Throttle (pySLAM, non-monocular): insert only if local mapping is IDLE.
+            # If it is busy, interrupt its current optimization but DO NOT insert —
+            # this is the keyframe-rate throttle that prevents map/keyframe explosion.
+            # (The previous fork "forced insert when queue < N" path is removed; it
+            # leaked the throttle and was the dominant cause of the KF explosion.)
+            if is_idle:
                 self._append_keyframe_decision(
                     **decision,
                     inserted=True,
-                    insert_reason="local_mapping_accepting",
+                    insert_reason="local_mapping_idle",
                 )
                 return True
 
@@ -1024,20 +1043,9 @@ class Tracking:
                 local_mapping.interrupt_optimization()
                 decision["local_mapping_abort_requested"] = True
 
-            if (
-                self.sensor_type != SensorType.MONOCULAR
-                and local_mapping_queue_size < int(Parameters.kLocalMappingMaxQueueForForcedInsert)
-            ):
-                self._append_keyframe_decision(
-                    **decision,
-                    inserted=True,
-                    insert_reason="busy_rgbd_queue_below_threshold",
-                )
-                return True
-
             self._append_keyframe_decision(
                 **decision,
-                reject_reason="local_mapping_busy_queue_pressure",
+                reject_reason="local_mapping_busy",
             )
             return False
 

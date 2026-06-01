@@ -505,6 +505,45 @@ class Frame(FrameBase):
 
         return num_valid
 
+    def num_matched_inlier_map_points(self) -> int:
+        """Count current map points that are inliers AND established (obs>0).
+
+        pySLAM-aligned (Frame.num_matched_inlier_map_points): this is the
+        current-side count used by the keyframe-insertion ratio, kept consistent
+        with the reference side (KeyFrame.num_tracked_points). NOT the matcher's
+        raw found-count (which pySLAM deliberately abandoned for this purpose).
+        """
+        outliers = getattr(self, "outliers", None)
+        count = 0
+        for idx, p in enumerate(self.points):
+            if p is None:
+                continue
+            if outliers is not None and idx < len(outliers) and bool(outliers[idx]):
+                continue
+            if p.num_observations() > 0:
+                count += 1
+        return count
+
+    def update_map_points_statistics(self) -> int:
+        """Bump found-count for every inlier map point and return the inlier-with-obs count.
+
+        pySLAM-aligned (Frame.update_map_points_statistics): pySLAM does NOT call
+        increase_found() inside search_map_by_projection — it does it here, once per
+        tracked frame, for every non-outlier point. This maintains get_found_ratio()
+        (= found/visible) so map-point culling (found_ratio < 0.25) behaves correctly.
+        """
+        outliers = getattr(self, "outliers", None)
+        num_matched_inlier_points = 0
+        for idx, p in enumerate(self.points):
+            if p is None:
+                continue
+            if outliers is not None and idx < len(outliers) and bool(outliers[idx]):
+                continue
+            p.increase_found()
+            if p.num_observations() > 0:
+                num_matched_inlier_points += 1
+        return num_matched_inlier_points
+
     def clean_bad_map_points(self) -> int:
         removed = 0
 

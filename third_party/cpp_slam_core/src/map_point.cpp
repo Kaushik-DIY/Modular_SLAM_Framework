@@ -57,6 +57,14 @@ float MapPoint::max_distance() const {
     return _max_distance;
 }
 
+std::tuple<Eigen::Vector3d, Eigen::Vector3d, float, float> MapPoint::get_all_pos_info() const {
+    // pySLAM MapPoint::get_all_pos_info — apply the 0.8x/1.2x distance tolerance
+    // at call time (kMin/MaxDistanceToleranceFactor). Read members directly (the
+    // caller-facing accessors lock _lock_pos, which is non-recursive).
+    std::lock_guard<std::mutex> lk(_lock_pos);
+    return std::make_tuple(_pos, normal, 0.8f * _min_distance, 1.2f * _max_distance);
+}
+
 // ---- Descriptor ------------------------------------------------------------
 cv::Mat MapPoint::get_descriptor() const {
     std::lock_guard<std::mutex> lk(_lock_features);
@@ -367,78 +375,102 @@ void MapPoint::update_best_descriptor(bool /*force*/) {
 }
 
 void MapPoint::update_normal_and_depth(bool /*force*/) {
-    // GIL held. Compute mean normal and update min/max distance.
+    // GIL held. Faithful port of MapPoint.update_normal_and_depth
+    // (visual_slam/orbslam/slam/map_point.py) and pySLAM map_point.cpp:
+    //   normal       = mean of normalized (pos - Ow) over ALL observations
+    //   dist         = || pos - Ow(kf_ref) ||            (REFERENCE keyframe ONLY)
+    //   max_distance = dist * scale_factor[ octave_in_kf_ref ]
+    //   min_distance = max_distance / scale_factor[ num_levels - 1 ]
+    // (Earlier this took the max of dist*scale over ALL observations, which both
+    // pySLAM and our Python avoid — they key the range off the reference KF.)
     std::vector<std::pair<py::object, int>> obs_copy;
+    py::object ref_kf;
     {
         std::lock_guard<std::mutex> lk(_lock_features);
         obs_copy.assign(_observations.begin(), _observations.end());
+        ref_kf = kf_ref;
     }
     if (obs_copy.empty()) return;
 
-    Eigen::Vector3d pos = get_position();
-    Eigen::Vector3d normal_sum = Eigen::Vector3d::Zero();
-    float min_dist = std::numeric_limits<float>::max();
-    float max_dist = 0.0f;
+    // Reference keyframe: kf_ref if set, else the first observation (cache it),
+    // mirroring the Python fallback.
+    if (ref_kf.is_none()) {
+        ref_kf = obs_copy.front().first;
+        std::lock_guard<std::mutex> lk(_lock_features);
+        kf_ref = ref_kf;
+    }
 
-    for (const auto &[kf, idx] : obs_copy) {
+    const Eigen::Vector3d pos = get_position();
+
+    // Read a keyframe's camera centre (Ow may be a numpy property or a method).
+    auto read_Ow = [](const py::object &kf, Eigen::Vector3d &out) -> bool {
         try {
-            // Camera center: kf.Ow may be a property (array) or method (callable)
-            Eigen::Vector3d Ow;
             py::object Ow_val = kf.attr("Ow");
             if (!py::isinstance<py::array>(Ow_val)) {
-                // callable method — call it
-                try { Ow_val = Ow_val(); } catch (...) { continue; }
+                try { Ow_val = Ow_val(); } catch (...) { return false; }
             }
             if (py::isinstance<py::array>(Ow_val)) {
                 auto a = Ow_val.cast<py::array_t<double>>();
                 auto r = a.unchecked<1>();
-                Ow = Eigen::Vector3d(r(0), r(1), r(2));
-            } else {
-                continue;
+                out = Eigen::Vector3d(r(0), r(1), r(2));
+                return true;
             }
-
-            Eigen::Vector3d n = pos - Ow;
-            float dist = static_cast<float>(n.norm());
-            if (dist > 1e-10f) {
-                normal_sum += n / dist;
-                if (dist < min_dist) min_dist = dist;
-                if (dist > max_dist) max_dist = dist;
-            }
-
-            // Scale distance by octave level
-            int octave = 0;
-            try {
-                auto octaves_attr = kf.attr("octaves");
-                if (!octaves_attr.is_none()) {
-                    octave = octaves_attr[py::int_(idx)].cast<int>();
-                }
-            } catch (...) {}
-
-            // Scale factor adjustment (ORB: each level multiplies by 1.2)
-            float scale = 1.0f;
-            try {
-                auto fm = kf.attr("_feature_manager");
-                if (!fm.is_none()) {
-                    auto sf = fm.attr("scale_factors");
-                    if (!sf.is_none()) {
-                        scale = sf[py::int_(octave)].cast<float>();
-                    }
-                }
-            } catch (...) { scale = std::pow(1.2f, octave); }
-
-            min_dist = std::min(min_dist, dist / scale);
-            max_dist = std::max(max_dist, dist * scale);
         } catch (...) {}
-    }
+        return false;
+    };
 
-    if (normal_sum.norm() > 1e-10) {
+    // ---- mean normal over ALL observations ----
+    Eigen::Vector3d normal_sum = Eigen::Vector3d::Zero();
+    for (const auto &[kf, idx] : obs_copy) {
+        (void)idx;
+        Eigen::Vector3d Ow;
+        if (!read_Ow(kf, Ow)) continue;
+        const Eigen::Vector3d n = pos - Ow;
+        const double nn = n.norm();
+        if (nn > 1e-10) normal_sum += n / nn;
+    }
+    if (normal_sum.norm() <= 1e-10) return;
+
+    // ---- distance range from the REFERENCE keyframe only ----
+    Eigen::Vector3d ref_Ow;
+    if (!read_Ow(ref_kf, ref_Ow)) return;
+    const float dist = static_cast<float>((pos - ref_Ow).norm());
+
+    const int ref_idx = get_observation_idx(ref_kf);
+    int ref_level = 0;
+    try {
+        auto octaves_attr = ref_kf.attr("octaves");
+        if (!octaves_attr.is_none() && ref_idx >= 0) {
+            ref_level = octaves_attr[py::int_(ref_idx)].cast<int>();
+        }
+    } catch (...) {}
+
+    float level_scale = 1.0f;
+    float scale_top = 1.0f;
+    try {
+        auto fm = ref_kf.attr("_feature_manager");
+        if (!fm.is_none()) {
+            auto sf = fm.attr("scale_factors");
+            if (!sf.is_none()) {
+                const int nl = static_cast<int>(py::len(sf));
+                if (ref_level < 0) ref_level = 0;
+                if (nl > 0 && ref_level > nl - 1) ref_level = nl - 1;
+                level_scale = sf[py::int_(ref_level)].cast<float>();
+                if (nl > 0) scale_top = sf[py::int_(nl - 1)].cast<float>();
+            }
+        }
+    } catch (...) { level_scale = std::pow(1.2f, ref_level); }
+
+    const float max_distance = dist * level_scale;
+    const float min_distance = (scale_top > 0.0f) ? (max_distance / scale_top) : max_distance;
+
+    {
         std::lock_guard<std::mutex> lk(_lock_pos);
         normal = normal_sum.normalized();
-        // Store raw values without invariance margins so Python predict_scale()
-        // and get_{min,max}_distance_invariance() work correctly (Python applies
-        // 0.8x / 1.2x at call time, not at storage time).
-        _min_distance = min_dist;
-        _max_distance = max_dist;
+        // Raw values stored; the 0.8x/1.2x tolerance is applied at call time in
+        // get_all_pos_info()/min_distance()/max_distance() (matching pySLAM).
+        _max_distance = max_distance;
+        _min_distance = min_distance;
     }
 }
 
