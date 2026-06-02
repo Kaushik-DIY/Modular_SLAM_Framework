@@ -24,6 +24,33 @@ from visual_slam.orbslam.utilities.geom_2views import computeF12, check_dist_epi
 
 kCheckFeaturesOrientation = Parameters.kCheckFeaturesOrientation
 
+# Phase 5d: optional C++ projection matcher. The dispatch is gated on
+# Parameters.USE_CPP_CORE AND the current frame actually being a C++ Frame
+# (cpp_slam_core.Frame). Until tracking is wired to build C++ Frames this branch
+# stays dormant, so USE_CPP_CORE=False (default) is the unchanged Python path.
+try:
+    import cpp_slam_core as _cpp_slam_core
+    _CppFrame = getattr(_cpp_slam_core, "Frame", None)
+except ImportError:
+    _cpp_slam_core = None
+    _CppFrame = None
+
+
+def _search_map_by_projection_cpp(points, f_cur, max_reproj_distance,
+                                  max_descriptor_distance, ratio_test, far_points_threshold):
+    """Dispatch to the C++ search_map_by_projection kernel (parity-validated against
+    the Python implementation). Requires f_cur to be a cpp_slam_core.Frame."""
+    fm = FeatureTrackerShared.feature_manager
+    scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
+    mdd = float(_max_descriptor_distance(max_descriptor_distance))
+    far = float(far_points_threshold) if far_points_threshold is not None else float("inf")
+    return _cpp_slam_core.search_map_by_projection(
+        list(points), f_cur, scale_factors,
+        float(max_reproj_distance), mdd, float(ratio_test),
+        float(Parameters.kViewingCosLimitForPoint), float(Parameters.kMinDepth), far,
+        float(fm.log_scale_factor), int(fm.num_levels),
+    )
+
 
 def _batch_des_distances(query_des, candidate_des):
     """Hamming distances from one representative descriptor to many candidates.
@@ -918,6 +945,19 @@ def _search_map_by_projection(
     far_points_threshold=None,
     diagnostics: dict | None = None,
 ):
+    # Phase 5d dispatch: when enabled AND the frame is a C++ Frame, run the C++
+    # kernel (no diagnostics path there). Dormant until tracking builds C++ Frames.
+    if (
+        Parameters.USE_CPP_CORE
+        and _CppFrame is not None
+        and isinstance(f_cur, _CppFrame)
+        and diagnostics is None
+    ):
+        return _search_map_by_projection_cpp(
+            points, f_cur, max_reproj_distance, max_descriptor_distance,
+            ratio_test, far_points_threshold,
+        )
+
     max_descriptor_distance = _max_descriptor_distance(max_descriptor_distance)
     input_points = list(points)
 
