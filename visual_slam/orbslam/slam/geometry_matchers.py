@@ -36,20 +36,53 @@ except ImportError:
     _CppFrame = None
 
 
+def _ensure_cpp_frame_mirror(f_cur):
+    """Return a cpp_slam_core.Frame view of a Python Frame, used by the C++ matcher.
+
+    If f_cur is already a C++ Frame it is returned as-is. Otherwise an embedded
+    mirror is built once (feature arrays + kd, which are static per frame) and
+    cached on f_cur; the pose and the points list (which change during tracking)
+    are re-synced on every call. The mirror shares f_cur.id so the matcher's
+    last_frame_id_seen gate behaves identically to the Python path.
+    """
+    if _CppFrame is not None and isinstance(f_cur, _CppFrame):
+        return f_cur
+    cpp = getattr(f_cur, "_cpp_frame_mirror", None)
+    if cpp is None:
+        kpsu = np.asarray([kp.pt for kp in f_cur.kpsu], dtype=np.float32).reshape(-1, 2)
+        des = np.ascontiguousarray(f_cur.des, dtype=np.uint8)
+        octaves = np.ascontiguousarray(f_cur.octaves, dtype=np.int32)
+        cpp = _cpp_slam_core.Frame(f_cur.camera, int(f_cur.id))
+        cpp.init_feature_arrays(kpsu, des, None, octaves, int(len(kpsu)))
+        f_cur._cpp_frame_mirror = cpp
+    cpp.update_pose(np.ascontiguousarray(f_cur.pose(), dtype=np.float64))
+    cpp.points = list(f_cur.points)
+    return cpp
+
+
 def _search_map_by_projection_cpp(points, f_cur, max_reproj_distance,
                                   max_descriptor_distance, ratio_test, far_points_threshold):
-    """Dispatch to the C++ search_map_by_projection kernel (parity-validated against
-    the Python implementation). Requires f_cur to be a cpp_slam_core.Frame."""
+    """Dispatch to the parity-validated C++ search_map_by_projection kernel via an
+    embedded C++ Frame mirror, then propagate the matches back onto the Python frame."""
+    cpp_frame = _ensure_cpp_frame_mirror(f_cur)
     fm = FeatureTrackerShared.feature_manager
     scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
     mdd = float(_max_descriptor_distance(max_descriptor_distance))
     far = float(far_points_threshold) if far_points_threshold is not None else float("inf")
-    return _cpp_slam_core.search_map_by_projection(
-        list(points), f_cur, scale_factors,
+    found_count, found_fidxs = _cpp_slam_core.search_map_by_projection(
+        list(points), cpp_frame, scale_factors,
         float(max_reproj_distance), mdd, float(ratio_test),
         float(Parameters.kViewingCosLimitForPoint), float(Parameters.kMinDepth), far,
         float(fm.log_scale_factor), int(fm.num_levels),
     )
+    # Propagate matches to the Python frame: register the frame-view keyed by f_cur
+    # (which also sets f_cur.points[idx]) so tracking + KF creation see the matches.
+    if cpp_frame is not f_cur:
+        for fidx in found_fidxs:
+            mp = cpp_frame.points[fidx]
+            if mp is not None:
+                mp.add_frame_view(f_cur, int(fidx))
+    return found_count, found_fidxs
 
 
 def _batch_des_distances(query_des, candidate_des):
@@ -945,12 +978,13 @@ def _search_map_by_projection(
     far_points_threshold=None,
     diagnostics: dict | None = None,
 ):
-    # Phase 5d dispatch: when enabled AND the frame is a C++ Frame, run the C++
-    # kernel (no diagnostics path there). Dormant until tracking builds C++ Frames.
+    # Phase 5d dispatch: when enabled, run the parity-validated C++ kernel (via an
+    # embedded C++ Frame mirror). The diagnostics path stays on Python (the C++
+    # kernel does not populate the diagnostics dict).
     if (
         Parameters.USE_CPP_CORE
         and _CppFrame is not None
-        and isinstance(f_cur, _CppFrame)
+        and getattr(f_cur, "kpsu", None) is not None
         and diagnostics is None
     ):
         return _search_map_by_projection_cpp(
