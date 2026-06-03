@@ -52,8 +52,12 @@ def _ensure_cpp_frame_mirror(f_cur):
         kpsu = np.asarray([kp.pt for kp in f_cur.kpsu], dtype=np.float32).reshape(-1, 2)
         des = np.ascontiguousarray(f_cur.des, dtype=np.uint8)
         octaves = np.ascontiguousarray(f_cur.octaves, dtype=np.int32)
+        # kps_ur (right stereo coords) is static per frame and needed by the C++
+        # search_frame_by_projection stereo check; search_map ignores it.
+        uRs = getattr(f_cur, "uRs", None)
+        kps_ur = np.ascontiguousarray(uRs, dtype=np.float32) if uRs is not None and len(uRs) > 0 else None
         cpp = _cpp_slam_core.Frame(f_cur.camera, int(f_cur.id))
-        cpp.init_feature_arrays(kpsu, des, None, octaves, int(len(kpsu)))
+        cpp.init_feature_arrays(kpsu, des, kps_ur, octaves, int(len(kpsu)))
         f_cur._cpp_frame_mirror = cpp
     cpp.update_pose(np.ascontiguousarray(f_cur.pose(), dtype=np.float64))
     cpp.points = list(f_cur.points)
@@ -83,6 +87,46 @@ def _search_map_by_projection_cpp(points, f_cur, max_reproj_distance,
             if mp is not None:
                 mp.add_frame_view(f_cur, int(fidx))
     return found_count, found_fidxs
+
+
+def _search_frame_by_projection_cpp(f_ref, f_cur, matched_ref_idxs, matched_ref_points,
+                                    max_reproj_distance, max_descriptor_distance):
+    """Dispatch to the C++ search_frame_by_projection kernel via an embedded C++
+    Frame mirror of f_cur, then reproduce the Python tail exactly: per-match
+    add_frame_view (bool-gated) in reference order, then the rotation-histogram
+    filter. The kernel only finds the best descriptor match per ref point (the
+    hot inner loop); add_frame_view's side effect + bool gate and the rotation
+    filter stay in Python so this path is bit-identical to _search_frame_by_projection.
+    """
+    cpp_frame = _ensure_cpp_frame_mirror(f_cur)
+    fm = FeatureTrackerShared.feature_manager
+    scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
+    mdd = float(_max_descriptor_distance(max_descriptor_distance))
+    ref_octaves = f_ref.octaves[matched_ref_idxs]
+    do_stereo_check = bool(f_cur.uRs is not None and len(f_cur.uRs) > 0)
+
+    cand_ref, cand_cur = _cpp_slam_core.search_frame_by_projection(
+        list(matched_ref_points),
+        [int(i) for i in matched_ref_idxs],
+        [int(o) for o in ref_octaves],
+        cpp_frame, scale_factors,
+        float(max_reproj_distance), mdd,
+        float(Parameters.kViewingCosLimitForPoint), float(Parameters.kMinDepth),
+        do_stereo_check,
+    )
+
+    # Tail (Python, matching _search_frame_by_projection): add_frame_view in
+    # reference order, keep only matches it accepts, then rotation-histogram filter.
+    idxs_ref = []
+    idxs_cur = []
+    for ref_idx, cur_idx, p_ref in zip(cand_ref, cand_cur,
+                                       (f_ref.points[i] for i in cand_ref)):
+        if p_ref is not None and p_ref.add_frame_view(f_cur, int(cur_idx)):
+            idxs_ref.append(int(ref_idx))
+            idxs_cur.append(int(cur_idx))
+
+    idxs_ref, idxs_cur = _valid_rotation_filter(idxs_ref, idxs_cur, f_ref.angles, f_cur.angles)
+    return idxs_ref, idxs_cur, len(idxs_cur)
 
 
 def _batch_des_distances(query_des, candidate_des):
@@ -785,6 +829,19 @@ def _search_frame_by_projection(
         return np.array([], dtype=np.int32), np.array([], dtype=np.int32), 0
 
     matched_ref_points = [f_ref.points[i] for i in matched_ref_idxs]
+
+    # Phase 5d dispatch: run the C++ kernel (find-best-match inner loop) via an
+    # embedded C++ Frame mirror of f_cur; the add_frame_view tail + rotation
+    # filter stay in Python (see _search_frame_by_projection_cpp).
+    if (
+        Parameters.USE_CPP_CORE
+        and _CppFrame is not None
+        and getattr(f_cur, "kpsu", None) is not None
+    ):
+        return _search_frame_by_projection_cpp(
+            f_ref, f_cur, matched_ref_idxs, matched_ref_points,
+            max_reproj_distance, max_descriptor_distance,
+        )
 
     matched_ref_idxs, matched_ref_points, projs, depths, dists = _prepare_visible_projection_candidates(
         f_cur,

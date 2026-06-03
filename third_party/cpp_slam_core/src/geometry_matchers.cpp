@@ -145,4 +145,122 @@ std::pair<int, std::vector<int>> search_map_by_projection(
     return {found_count, found_fidxs};
 }
 
+// Faithful port of _search_frame_by_projection (see header). The visibility prep
+// (project + in-image + depth + 0.8*min/1.2*max distance window + viewing-cos) is
+// identical to search_map (both Python functions share
+// _prepare_visible_projection_candidates). The differences are: REF-octave radius
+// + octave window, argmin + threshold with NO ratio test, an optional stereo
+// right-u check, and that add_frame_view + the rotation-histogram filter are left
+// to the Python dispatcher (so this returns the pre-filter (idxs_ref, idxs_cur)).
+std::pair<std::vector<int>, std::vector<int>> search_frame_by_projection(
+    const py::list &ref_points, const std::vector<int> &ref_idxs,
+    const std::vector<int> &ref_octaves, py::object f_cur_obj,
+    py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+    float max_reproj_distance, float max_descriptor_distance,
+    float viewing_cos_limit, float min_depth, bool do_stereo_check) {
+
+    Frame &f = f_cur_obj.cast<Frame &>();
+    const Eigen::Vector3d Ow = f.Ow();
+
+    const float *sf = scale_factors.data();
+    const int n_levels = static_cast<int>(scale_factors.size());
+    const int n_feat = static_cast<int>(f.octaves.size());
+    const int n_kps_ur = static_cast<int>(f.kps_ur.size());
+
+    std::vector<int> idxs_ref_out, idxs_cur_out;
+    idxs_ref_out.reserve(ref_idxs.size());
+    idxs_cur_out.reserve(ref_idxs.size());
+
+    int pi = -1;
+    for (auto handle : ref_points) {
+        ++pi;  // index into ref_idxs / ref_octaves (parallel to ref_points)
+        const int ref_idx = ref_idxs[pi];
+        const int ref_octave = ref_octaves[pi];
+
+        py::object obj = py::reinterpret_borrow<py::object>(handle);
+        if (obj.is_none()) continue;
+        MapPoint *mp = nullptr;
+        try { mp = obj.cast<MapPoint *>(); } catch (...) { continue; }
+        if (mp == nullptr || mp->is_bad()) continue;
+
+        // ---- visibility prep (matches _prepare_visible_projection_candidates) ----
+        const Eigen::Vector3d pw = mp->get_position();
+        if (!pw.allFinite() || pw.norm() > 1.0e9) continue;
+
+        const Eigen::Vector3d uvz = f.project_world(pw);  // (u, v, depth)
+        const double u = uvz(0), v = uvz(1), z = uvz(2);
+        if (!(z > min_depth)) continue;
+        if (!f.is_in_image(u, v, z)) continue;
+
+        const Eigen::Vector3d PO = pw - Ow;
+        const double dist = PO.norm();
+        const double dmin = 0.8 * static_cast<double>(mp->min_distance());
+        const double dmax = 1.2 * static_cast<double>(mp->max_distance());
+        if (dist <= dmin || dist >= dmax) continue;
+
+        const Eigen::Vector3d &normal = mp->normal;
+        if (normal.allFinite() && normal.norm() > 1e-12) {
+            const double cos_view = normal.dot(PO) / std::max(dist, 1e-12);
+            if (!(cos_view > viewing_cos_limit)) continue;
+        }
+
+        // ---- kd radius query at the REF octave scale ----
+        const float kp_ref_scale =
+            (ref_octave >= 0 && ref_octave < n_levels) ? sf[ref_octave] : 1.0f;
+        const float radius = max_reproj_distance * kp_ref_scale;
+        const std::vector<int> cand =
+            f.kd_query_ball(static_cast<float>(u), static_cast<float>(v), radius);
+        if (cand.empty()) continue;
+
+        // projected right-u coordinate (only needed for the stereo check)
+        const double proj_ur = do_stereo_check ? f.stereo_ur(u, z) : 0.0;
+
+        // ---- argmin descriptor over valid candidates (NO ratio test) ----
+        float best_dist = std::numeric_limits<float>::infinity();
+        int best_k_idx = -1;
+
+        for (int idx : cand) {
+            if (idx < 0 || idx >= n_feat) continue;
+            // occupancy: a candidate whose map point already has a keyframe
+            // observation (num_observations() > 0) is unavailable. Matches the
+            // Python precompute (num_observations is unchanged by add_frame_view).
+            if (idx < static_cast<int>(f.points.size())) {
+                const py::object &pc = f.points[idx];
+                if (!pc.is_none()) {
+                    MapPoint *mpc = nullptr;
+                    try { mpc = pc.cast<MapPoint *>(); } catch (...) { mpc = nullptr; }
+                    if (mpc != nullptr && mpc->num_observations() > 0) continue;
+                }
+            }
+            const int kp_level = f.octaves(idx);
+            // octave window: within +/-1 of the REF octave
+            if (kp_level < ref_octave - 1 || kp_level > ref_octave + 1) continue;
+            // stereo right-u consistency: reject iff measured ur >= 0 and the
+            // reprojection error exceeds max_reproj_distance * scale[cur_octave].
+            if (do_stereo_check && idx < n_kps_ur) {
+                const float kp_ur = f.kps_ur(idx);
+                if (kp_ur >= 0.0f) {
+                    const double err_ur = std::fabs(proj_ur - static_cast<double>(kp_ur));
+                    const float cur_scale =
+                        (kp_level >= 0 && kp_level < n_levels) ? sf[kp_level] : 1.0f;
+                    if (err_ur >= static_cast<double>(max_reproj_distance * cur_scale)) continue;
+                }
+            }
+
+            const float d = mp->min_des_distance(f.des.row(idx));
+            if (d < best_dist) {
+                best_dist = d;
+                best_k_idx = idx;
+            }
+        }
+
+        if (best_k_idx >= 0 && best_dist < max_descriptor_distance) {
+            idxs_ref_out.push_back(ref_idx);
+            idxs_cur_out.push_back(best_k_idx);
+        }
+    }
+
+    return {idxs_ref_out, idxs_cur_out};
+}
+
 }  // namespace cppcore

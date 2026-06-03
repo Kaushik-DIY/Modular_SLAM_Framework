@@ -568,6 +568,23 @@ PYBIND11_MODULE(cpp_slam_core, m) {
           py::arg("far_points_threshold"), py::arg("log_scale_factor"), py::arg("num_levels"),
           "C++ search_map_by_projection -> (found_count, matched_feature_idxs).");
 
+    m.def("search_frame_by_projection",
+          [](const py::list &ref_points, const std::vector<int> &ref_idxs,
+             const std::vector<int> &ref_octaves, py::object f_cur,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             float max_reproj_distance, float max_descriptor_distance,
+             float viewing_cos_limit, float min_depth, bool do_stereo_check) {
+              return cppcore::search_frame_by_projection(
+                  ref_points, ref_idxs, ref_octaves, f_cur, scale_factors,
+                  max_reproj_distance, max_descriptor_distance, viewing_cos_limit,
+                  min_depth, do_stereo_check);
+          },
+          py::arg("ref_points"), py::arg("ref_idxs"), py::arg("ref_octaves"),
+          py::arg("f_cur"), py::arg("scale_factors"), py::arg("max_reproj_distance"),
+          py::arg("max_descriptor_distance"), py::arg("viewing_cos_limit"),
+          py::arg("min_depth"), py::arg("do_stereo_check"),
+          "C++ search_frame_by_projection -> (idxs_ref, idxs_cur) pre-rotation-filter.");
+
     // Python 3.11 adaptive interpreter specialization bug: calling a pybind11
     // instancemethod exactly 8 times in a tight for loop triggers a segfault
     // (CALL opcode quickening selects the C-extension fast path which crashes).
