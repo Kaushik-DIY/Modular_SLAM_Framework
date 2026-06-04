@@ -106,11 +106,22 @@ class KeyFrameGraph:
         self.ordered_keyframes_weights = OrderedDict()
 
     def update_best_covisibles_no_lock_(self) -> None:
+        # Deterministic covisibility ordering: weight DESC, then keyframe id ASC as
+        # a STABLE tie-breaker (M0 reproducibility). Without the id tie-break,
+        # equal-weight keyframes inherit the insertion order of
+        # connected_keyframes_weights, which derives from MapPoint.observations()
+        # iteration (C++ std::map keyed by pointer ADDRESS, PyObjCompare) — stable
+        # within a run but run-to-run non-deterministic (heap/ASLR) — so the local
+        # map / trajectory diverged ~65 mm between identical runs. Sorting by a
+        # stable id makes get_best_covisible_keyframes() reproducible. Matches
+        # pySLAM's id-ordered covisibility intent.
         self.ordered_keyframes_weights = OrderedDict(
             sorted(
                 self.connected_keyframes_weights.items(),
-                key=lambda item: item[1],
-                reverse=True,
+                key=lambda item: (
+                    -int(item[1]),
+                    int(getattr(item[0], "kid", getattr(item[0], "id", 0))),
+                ),
             )
         )
 

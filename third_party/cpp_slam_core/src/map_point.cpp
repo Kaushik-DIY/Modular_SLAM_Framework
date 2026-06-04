@@ -1,9 +1,24 @@
 #include "map_point.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 
 namespace slam {
+
+// Stable sort key for an observing keyframe py::object: the keyframe id (kid),
+// falling back to frame id, then pointer address (last resort). _observations is
+// a std::map keyed by pointer ADDRESS (PyObjCompare), which is stable within a
+// run but varies run-to-run (heap/ASLR). Iterating it in pointer order made the
+// discrete choices below (medoid descriptor tie-break, reference-keyframe
+// fallback, kf_ref reassignment) + the normal-mean summation order
+// non-deterministic -> ~75 mm run-to-run trajectory drift. Sorting by this stable
+// key makes them reproducible. GIL must be held by the caller (py::object attrs).
+static long _kf_sort_key(const py::object &kf) {
+    try { return kf.attr("kid").cast<long>(); } catch (...) {}
+    try { return kf.attr("id").cast<long>(); } catch (...) {}
+    return static_cast<long>(reinterpret_cast<std::uintptr_t>(kf.ptr()));
+}
 
 // ---- Static members --------------------------------------------------------
 std::atomic<int> MapPoint::_next_id{0};
@@ -137,9 +152,13 @@ void MapPoint::remove_observation(py::object kf, int idx, bool map_no_lock) {
 
         do_set_bad = (_num_observations <= 2);
 
-        // Update kf_ref to next available observation
+        // Update kf_ref to the lowest-id remaining observation (deterministic;
+        // _observations.begin() would be pointer-order = run-to-run non-deterministic).
         if (!kf_ref.is_none() && kf_ref.ptr() == kf.ptr() && !_observations.empty()) {
-            kf_ref = _observations.begin()->first;
+            auto it_min = std::min_element(
+                _observations.begin(), _observations.end(),
+                [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
+            kf_ref = it_min->first;
         }
     }
 
@@ -156,15 +175,24 @@ void MapPoint::remove_observation(py::object kf, int idx, bool map_no_lock) {
 
 std::vector<std::pair<py::object, int>> MapPoint::observations() const {
     std::lock_guard<std::mutex> lk(_lock_features);
-    return std::vector<std::pair<py::object, int>>(
-        _observations.begin(), _observations.end());
+    // Return in stable kid order (not the std::map's pointer-address order) so
+    // every downstream consumer is deterministic — notably local-BA edge assembly,
+    // whose g2o edge insertion order otherwise varies run-to-run -> float-summation
+    // differences that accumulate into trajectory drift.
+    std::vector<std::pair<py::object, int>> out(_observations.begin(), _observations.end());
+    std::sort(out.begin(), out.end(),
+              [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
+    return out;
 }
 
 std::vector<py::object> MapPoint::keyframes() const {
     std::lock_guard<std::mutex> lk(_lock_features);
+    std::vector<std::pair<py::object, int>> obs(_observations.begin(), _observations.end());
+    std::sort(obs.begin(), obs.end(),
+              [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
     std::vector<py::object> kfs;
-    kfs.reserve(_observations.size());
-    for (const auto &kv : _observations) kfs.push_back(kv.first);
+    kfs.reserve(obs.size());
+    for (const auto &kv : obs) kfs.push_back(kv.first);
     return kfs;
 }
 
@@ -329,8 +357,13 @@ void MapPoint::update_best_descriptor(bool /*force*/) {
     std::vector<cv::Mat> descriptors;
     {
         std::lock_guard<std::mutex> lk(_lock_features);
-        descriptors.reserve(_observations.size());
-        for (const auto &[kf, idx] : _observations) {
+        // Iterate observations in stable kid order so the medoid tie-break below
+        // ("if (mx < best_max)" keeps the first on ties) is deterministic.
+        std::vector<std::pair<py::object, int>> obs_sorted(_observations.begin(), _observations.end());
+        std::sort(obs_sorted.begin(), obs_sorted.end(),
+                  [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
+        descriptors.reserve(obs_sorted.size());
+        for (const auto &[kf, idx] : obs_sorted) {
             try {
                 auto des_arr = kf.attr("des");
                 if (!des_arr.is_none()) {
@@ -391,6 +424,12 @@ void MapPoint::update_normal_and_depth(bool /*force*/) {
         ref_kf = kf_ref;
     }
     if (obs_copy.empty()) return;
+
+    // Stable kid order: makes the normal-mean summation order deterministic and
+    // the ref-keyframe fallback (obs_copy.front(), below) the lowest-id observation
+    // rather than the pointer-first one (run-to-run non-deterministic otherwise).
+    std::sort(obs_copy.begin(), obs_copy.end(),
+              [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
 
     // Reference keyframe: kf_ref if set, else the first observation (cache it),
     // mirroring the Python fallback.

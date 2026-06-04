@@ -466,7 +466,10 @@ class LoopGeometryChecker:
             with self._profile_section("loop.search_more_projection"):
                 num_new, self.success_map_point_matches, search_more_diag = (
                     ProjectionMatcher.search_more_map_points_by_projection(
-                        list(self.success_loop_map_points),
+                        # M0 reproducibility: iterate in stable id order, not the
+                        # set's pointer-hash order, so search_more's first-come
+                        # occupancy (and thus the loop correction) is deterministic.
+                        sorted(self.success_loop_map_points, key=lambda p: p.id),
                         current_keyframe,
                         Tcw_corrected,
                         self.success_map_point_matches,
