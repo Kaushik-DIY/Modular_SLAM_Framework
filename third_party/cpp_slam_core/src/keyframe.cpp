@@ -1,9 +1,21 @@
 #include "keyframe.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 
 namespace slam {
+
+// Stable sort key for a keyframe py::object: kid (then id, then pointer address as
+// last resort). Covisibility is stored in an unordered_map keyed by pointer
+// (PyObjHash) -> run-to-run varying order; ordering output by this stable key keeps
+// get_best/connected covisibles deterministic (M0/M1 reproducibility parity with
+// the Python KeyFrameGraph fix). GIL is held by all callers (py::object attr access).
+static long _kf_sort_key(const py::object &kf) {
+    try { return kf.attr("kid").cast<long>(); } catch (...) {}
+    try { return kf.attr("id").cast<long>(); } catch (...) {}
+    return static_cast<long>(reinterpret_cast<std::uintptr_t>(kf.ptr()));
+}
 
 // ---- Construction ----------------------------------------------------------
 KeyFrame::KeyFrame(int given_kid, int given_frame_id)
@@ -100,8 +112,14 @@ void KeyFrame::set_bad() {
 // ---- Covisibility graph ----------------------------------------------------
 void KeyFrame::_rebuild_ordered_covis_no_lock_() {
     _ordered_covis.assign(_covis_weights.begin(), _covis_weights.end());
+    // weight DESC, then stable keyframe id ASC (std::sort is not stable and
+    // _covis_weights iterates in pointer order, so the id tie-break is required
+    // for run-to-run deterministic covisibility — M1 parity with the Python fix).
     std::sort(_ordered_covis.begin(), _ordered_covis.end(),
-              [](const auto &a, const auto &b) { return a.second > b.second; });
+              [](const auto &a, const auto &b) {
+                  if (a.second != b.second) return a.second > b.second;
+                  return _kf_sort_key(a.first) < _kf_sort_key(b.first);
+              });
 }
 
 void KeyFrame::add_connection_no_lock_(py::object other_kf, int weight) {
@@ -133,6 +151,9 @@ std::vector<py::object> KeyFrame::get_connected_keyframes() const {
     std::vector<py::object> result;
     result.reserve(_covis_weights.size());
     for (const auto &[kf, _w] : _covis_weights) result.push_back(kf);
+    // Deterministic order (the unordered_map iterates in pointer order).
+    std::sort(result.begin(), result.end(),
+              [](const py::object &a, const py::object &b) { return _kf_sort_key(a) < _kf_sort_key(b); });
     return result;
 }
 
