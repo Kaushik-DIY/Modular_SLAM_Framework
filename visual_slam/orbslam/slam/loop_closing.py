@@ -388,6 +388,32 @@ class LoopGeometryChecker:
                 t12 = t12_opt
                 scale12 = scale12_opt
 
+                # Pose-plausibility sanity gate (restored from the pre-rewrite
+                # reference rgbd_se3_ransac path; dropped when the loop geometry
+                # was rewritten to sim3). A genuine RGB-D loop revisits a place,
+                # so the estimated relative transform between the two co-located
+                # keyframes is small; reject implausibly large estimates that
+                # would warp the essential-graph PGO. scale12 is fixed at 1 for
+                # RGB-D, so |t12| is the relative camera displacement in metres.
+                pose_dist = float(np.linalg.norm(np.asarray(t12, dtype=np.float64)))
+                _cos = (float(np.trace(np.asarray(R12, dtype=np.float64))) - 1.0) / 2.0
+                pose_rot_deg = float(np.degrees(np.arccos(float(np.clip(_cos, -1.0, 1.0)))))
+                report["estimated_pose_distance"] = pose_dist
+                report["estimated_pose_rotation_deg"] = pose_rot_deg
+                _max_pose_dist = float(getattr(Parameters, "kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3", 0.0) or 0.0)
+                _max_pose_rot = float(getattr(Parameters, "kLoopClosingMaxEstimatedPoseRotationDegForGuidedSE3", 0.0) or 0.0)
+                if (_max_pose_dist > 0.0 and pose_dist > _max_pose_dist) or (
+                    _max_pose_rot > 0.0 and pose_rot_deg > _max_pose_rot
+                ):
+                    report["passed_pose_distance_gate"] = False
+                    report["rejection_stage"] = "geometry"
+                    report["rejection_reason"] = (
+                        f"implausible loop pose (dist={pose_dist:.3f}m > {_max_pose_dist}, "
+                        f"rot={pose_rot_deg:.1f}deg > {_max_pose_rot})"
+                    )
+                    continue
+                report["passed_pose_distance_gate"] = True
+
                 # Compute corrected Sim3 pose: Sc1c2 @ Tc2w = Sc1w
                 kf_Tcw = np.asarray(kf.Tcw(), dtype=np.float64).reshape(4, 4)
                 sim3_pose = Sim3Pose(R12, t12, scale12) @ Sim3Pose().from_se3_matrix(kf_Tcw)

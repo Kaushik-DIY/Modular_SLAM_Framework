@@ -217,8 +217,15 @@ class Parameters:
     kLoopClosingParallelKpsMatchingNumWorkers = 2
     kLoopClosingGeometryCheckerMinKpsMatches = 9
     kLoopClosingSE3GuidedMinSeedInliers = 4
-    kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3 = 0.0
-    kLoopClosingMaxEstimatedPoseRotationDegForGuidedSE3 = 0.0
+    # Pose-plausibility sanity gate on the accepted loop's relative transform.
+    # A genuine RGB-D loop revisits a place, so the estimated relative camera
+    # pose between the two co-located keyframes is small; an implausibly large
+    # estimate would warp the essential-graph PGO (observed: 15 m keyframe
+    # teleports on lab). Restored to the pre-rewrite reference values (0.75 m /
+    # 45 deg) after the rgbd_se3_ransac->sim3 loop-geometry rewrite dropped the
+    # gate (was zeroed = disabled in commit 47ff8d3). 0.0 disables a gate.
+    kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3 = 0.75
+    kLoopClosingMaxEstimatedPoseRotationDegForGuidedSE3 = 45.0
     kLoopClosingSE3RansacMaxError = 0.25
     kLoopClosingSE3RansacIterations = 300
     kLoopClosingTh2 = 20
