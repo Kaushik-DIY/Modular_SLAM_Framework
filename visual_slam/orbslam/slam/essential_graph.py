@@ -377,6 +377,9 @@ def optimize_essential_graph_se3(
         non_corrected_poses=non_corrected_poses,
         corrected_poses=corrected_poses,
         loop_connections=loop_connections,
+        min_covisibility_weight=int(
+            getattr(Parameters, "kEssentialGraphMinCovisibilityWeight", 100)
+        ),
     ).build_from_map()
     return graph.optimize()
 

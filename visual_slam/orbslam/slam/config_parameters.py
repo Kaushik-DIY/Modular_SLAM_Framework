@@ -294,6 +294,22 @@ class Parameters:
     kEssentialGraphCovisibilityWeightMin = 0.5
     kEssentialGraphCovisibilityWeightMax = 5.0
     kEssentialGraphLoopEdgeWeight = 10.0
+    # Min covisibility weight (co-observation count) for an edge to enter the
+    # loop-correction essential graph. ORB-SLAM's classic value is 100, which
+    # assumes a DENSE covisibility graph. Our post-alignment maps over-insert
+    # keyframes -> covisibility is ~half as dense (~29 vs the reference's ~57
+    # neighbours/KF), so at 100 only ~31% of edges qualify and the essential graph
+    # is under-constrained: the strong loop edge flexes the corrected span out of
+    # plane (observed: 17 m without GBA, 2 m Y-bulge with GBA). Lowered to 15 to
+    # admit more covisibility edges (~77% vs 31% at 100) and constrain the PGO.
+    # Validated on lab: fixed the out-of-plane flex (Y 15.9 m -> 0.24 m, planar)
+    # and made loop closure net-POSITIVE (ATE-vs-reference 254 mm < loops-off 275 mm
+    # < the broken 745 mm). Edge information is clamped to [0.5,5] so admitting
+    # weaker edges adds constraint without letting them dominate. Residual ~11
+    # sub-meter jumps remain (traced to the KF-over-insertion map sparsity, the
+    # deeper root). NOTE: with this fix, run loop closure WITHOUT GBA -- once the
+    # PGO is well-constrained, GBA over-corrects (ATE 254 no-GBA vs 430 +GBA).
+    kEssentialGraphMinCovisibilityWeight = 15
 
     # ================================================================
     # Relocalization
