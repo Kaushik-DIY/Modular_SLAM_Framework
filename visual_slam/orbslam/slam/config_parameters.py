@@ -302,13 +302,15 @@ class Parameters:
     # is under-constrained: the strong loop edge flexes the corrected span out of
     # plane (observed: 17 m without GBA, 2 m Y-bulge with GBA). Lowered to 15 to
     # admit more covisibility edges (~77% vs 31% at 100) and constrain the PGO.
-    # Validated on lab: fixed the out-of-plane flex (Y 15.9 m -> 0.24 m, planar)
-    # and made loop closure net-POSITIVE (ATE-vs-reference 254 mm < loops-off 275 mm
-    # < the broken 745 mm). Edge information is clamped to [0.5,5] so admitting
-    # weaker edges adds constraint without letting them dominate. Residual ~11
-    # sub-meter jumps remain (traced to the KF-over-insertion map sparsity, the
-    # deeper root). NOTE: with this fix, run loop closure WITHOUT GBA -- once the
-    # PGO is well-constrained, GBA over-corrects (ATE 254 no-GBA vs 430 +GBA).
+    # Validated on lab: fixed the out-of-plane flex (Y 15.9 m -> 0.28 m, planar).
+    # Edge information is clamped to [0.5,5] so admitting weaker edges adds
+    # constraint without letting them dominate. Best deployment config is loops ON
+    # + GBA ON at this theta: ATE-vs-reference 68 mm (vs loops-off 275 mm) -- the
+    # well-constrained PGO gives GBA a clean input and GBA then refines to a
+    # near-perfect map. (Earlier "GBA degrades" was a SYMPTOM of an under-constrained
+    # PGO: at theta=30 the PGO was only partially fixed (269 mm, residual flex) so
+    # GBA optimised a still-corrupt input -> 430 mm; at theta=15 the PGO is clean ->
+    # GBA -> 68 mm. So GBA is fine; the PGO constraint was the real fix.)
     kEssentialGraphMinCovisibilityWeight = 15
 
     # ================================================================
