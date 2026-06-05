@@ -682,7 +682,13 @@ class Frame(FrameBase):
 
     def unproject_points(self, idxs):
         idxs = np.asarray(idxs, dtype=np.int32).reshape(-1)
-        pts = np.array([self.kpsu[int(i)].pt for i in idxs], dtype=np.float64).reshape(-1, 2)
+        # kpsu entries may be cv2.KeyPoint (Python Frame) or (x,y) rows (C++ Frame
+        # base, M1 C++ KeyFrame) — accept both.
+        kpsu = self.kpsu
+        pts = np.array(
+            [(kpsu[int(i)].pt if hasattr(kpsu[int(i)], "pt") else kpsu[int(i)]) for i in idxs],
+            dtype=np.float64,
+        ).reshape(-1, 2)
         return self.camera.unproject_points(pts)
 
     def unproject_points_3d(self, idxs, transform_in_world: bool = True):
@@ -704,7 +710,8 @@ class Frame(FrameBase):
             if not np.isfinite(depth) or depth <= kMinDepth:
                 continue
 
-            uv = np.array(self.kpsu[idx].pt, dtype=np.float64)
+            _kp = self.kpsu[idx]
+            uv = np.array(_kp.pt if hasattr(_kp, "pt") else _kp, dtype=np.float64)
             pc = self.camera.unproject_3d(uv, depth)
 
             if transform_in_world:

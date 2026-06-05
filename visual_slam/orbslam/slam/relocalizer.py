@@ -375,7 +375,8 @@ class Relocalizer:
             if not np.all(np.isfinite(point_w)):
                 continue
 
-            uv = np.asarray(frame.kpsu[int(idx_frame)].pt, dtype=np.float64).reshape(2)
+            _kp = frame.kpsu[int(idx_frame)]
+            uv = np.asarray(_kp.pt if hasattr(_kp, "pt") else _kp, dtype=np.float64).reshape(2)
             if not np.all(np.isfinite(uv)):
                 continue
 

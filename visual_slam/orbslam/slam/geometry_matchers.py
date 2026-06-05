@@ -445,7 +445,10 @@ class EpipolarMatcher:
             octave2 = max(0, min(int(f2.octaves[i2]), len(level_sigmas2) - 1))
             sigma2 = float(level_sigmas2[octave2])
 
-            if not check_dist_epipolar_line(f1.kpsu[i1].pt, f2.kpsu[i2].pt, F12, sigma2):
+            _k1, _k2 = f1.kpsu[i1], f2.kpsu[i2]
+            _pt1 = _k1.pt if hasattr(_k1, "pt") else _k1
+            _pt2 = _k2.pt if hasattr(_k2, "pt") else _k2
+            if not check_dist_epipolar_line(_pt1, _pt2, F12, sigma2):
                 continue
 
             out1.append(i1)
@@ -1284,7 +1287,8 @@ def _search_and_fuse(
             if kp_level < predicted_level - 1 or kp_level > predicted_level:
                 continue
 
-            err = projs[j, :2] - np.array(keyframe.kpsu[kd_idx].pt, dtype=np.float64)
+            _kp = keyframe.kpsu[kd_idx]
+            err = projs[j, :2] - np.array(_kp.pt if hasattr(_kp, "pt") else _kp, dtype=np.float64)
             chi2 = float(np.dot(err, err) * inv_level_sigmas2[kp_level])
 
             if chi2 > Parameters.kChi2Mono:
