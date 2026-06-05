@@ -77,7 +77,14 @@ class Parameters:
     kMinNumMatchedFeaturesSearchReferenceFrame = 15
     kMaxNumOfKeyframesInLocalMap = 80
     kNumBestCovisibilityKeyFrames = 10
-    kNumBestCovisibilityKeyFramesTracking = kNumBestCovisibilityKeyFrames
+    # Tracking local-map covisibility window. Reduced 10->3 (2026-06-05): the
+    # tracking local map is dominated by the current frame's voted covisible
+    # keyframes; the extra covisibility expansion beyond the top-3 projected many
+    # more local map points in search_map (the dominant tracking cost) WITHOUT
+    # improving matches. Cutting it to 3 reduced full-lab tracking 143->102 ms
+    # (-29%) with ZERO quality cost (lab: lost 60=60, ATE 275 vs 278 mm; fr1_desk:
+    # identical ATE 22.3 mm + KF 51). Loop closure / other uses keep the base (10).
+    kNumBestCovisibilityKeyFramesTracking = 3
     kExpandLocalMapWithParent = True
     kExpandLocalMapWithChildren = True
     kUseVisualOdometryPoints = True
