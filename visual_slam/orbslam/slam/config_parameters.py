@@ -16,6 +16,11 @@ class Parameters:
     # ================================================================
     USE_CPP_CORE = False
 
+    # F1 (12fps plan): wire the C++ KeyFrame (covisibility graph / spanning tree /
+    # loop edges / points in C++). Default False keeps the proven pure-Python
+    # KeyFrame(Frame, KeyFrameGraph). Enabled incrementally + A/B-validated.
+    USE_CPP_KEYFRAME = False
+
     # ================================================================
     # Sparse SLAM threading
     # ================================================================

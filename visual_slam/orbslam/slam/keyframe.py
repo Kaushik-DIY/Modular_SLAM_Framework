@@ -15,6 +15,41 @@ from visual_slam.orbslam.slam.camera_pose import CameraPose
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.frame import Frame
 
+# F1 (12fps plan): optional C++ KeyFrame base (covisibility graph / spanning tree /
+# loop edges / points in C++). Mirrors the MapPoint precedent in map_point.py.
+try:
+    import cpp_slam_core as _cpp_slam_core
+    _CppKeyFrameBase = getattr(_cpp_slam_core, "KeyFrame", None)
+except Exception:
+    _CppKeyFrameBase = None
+
+
+def build_cpp_keyframe_from_frame(frame, kid):
+    """Populate a fresh C++ KeyFrame base from a Python Frame (F1b construction).
+
+    Feature arrays (kpsu/octaves/des/kps_ur) are READONLY C++ properties, so they
+    must be set via ``init_feature_arrays`` — never assigned directly. Mirrors the
+    proven recipe in tests/.../test_cpp_slam_core_phase3_keyframe.py.
+    """
+    if _CppKeyFrameBase is None:
+        raise RuntimeError("cpp_slam_core.KeyFrame is unavailable")
+    kf = _CppKeyFrameBase(kid=int(kid), frame_id=int(frame.id), camera=frame.camera)
+    n = len(frame.kps)
+    kps_ur = getattr(frame, "kps_ur", None)
+    if kps_ur is None:
+        kps_ur = getattr(frame, "uRs", None)
+    octaves = getattr(frame, "octaves", None)
+    des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
+    kf.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
+                           kps_ur, octaves, n)
+    kf.update_pose(np.ascontiguousarray(frame.Tcw(), dtype=np.float64))
+    if getattr(frame, "depths", None) is not None:
+        kf.depths = frame.depths
+    for idx, p in enumerate(frame.points):
+        if p is not None:
+            kf.set_point_match(p, idx)
+    return kf
+
 
 # Store the graph relationships attached to one keyframe.
 class KeyFrameGraph:
