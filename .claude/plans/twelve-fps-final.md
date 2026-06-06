@@ -136,6 +136,22 @@ covisibility graph + spanning tree + loop edges + point management to C++; keep 
   tuning — each validated for ATE + the 60-lost tracking baseline before keeping. Last resort:
   float64 kd-tree only if reproducibility needs it.
 
+- **Map-density reduction (the "voxel filter" ask, 2026-06-06) lands HERE, not earlier.** The current
+  map carries **3.5× the points (32,698 vs 9,306) and 1.66× the keyframes (253 vs 152)** of the clean
+  reference for the same 8 m scene — real redundancy from KF over-insertion (the same M6 root cause).
+  Reduce it with the **loop-safe, ORB-SLAM-native** mechanisms — tune the existing `cull_keyframes`
+  (local_mapping.py:460 / local_mapping_core.cpp:310 redundancy rule) and `cull_map_points`
+  (local_mapping.py:457) toward the reference regime — **NOT** a pose-voxel keyframe dedup. *A
+  pose-voxel filter that drops spatially-close keyframes would delete exactly the revisit keyframes
+  loop closure depends on, regressing M6 — explicitly forbidden.* Why F5 (after the port), not before:
+  (1) F1–F4 are bit-parity ports validated by "ATE within band vs previous milestone" — changing map
+  density mid-port moves the reference and confounds port bugs with filter effects; (2) the port is
+  free (same accuracy) while density reduction spends the 60-lost / ATE budget — only worth spending
+  if F1–F4 don't already reach 12 fps; (3) it must not re-disturb the just-fixed M6 PGO. Each density
+  change validated for ATE-vs-reference (≤68 mm regime) + lost-frame count + loop-closure count before
+  keeping. **Separable & harmless anytime:** a *cosmetic* voxel downsample of the saved `.ply` (output
+  only, never the live tracking map) — out of scope for the fps gate; add on request.
+
 ## 6. Verification harness (every milestone)
 - `USE_CPP_CORE` **OFF**: full `visual_slam/orbslam` suite green (500 passed, 1 skipped) — fallback intact.
 - `USE_CPP_CORE` **ON**: suite green; lab loops-off A/B vs previous milestone within ATE band;
