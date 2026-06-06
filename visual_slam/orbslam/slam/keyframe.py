@@ -336,6 +336,9 @@ class KeyFrame(*_make_keyframe_bases()):
         des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
         self.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
                                  kps_ur, getattr(frame, "octaves", None), n)
+        # init_feature_arrays normalizes kps_in into kpsu but does NOT retain the
+        # cv2.KeyPoint list; consumers still read kf.kps, so store it (settable).
+        self.kps = list(frame.kps)
         self.update_pose(np.ascontiguousarray(frame.Tcw(), dtype=np.float64))
         if getattr(frame, "depths", None) is not None:
             self.depths = frame.depths
@@ -378,6 +381,57 @@ class KeyFrame(*_make_keyframe_bases()):
         self.bow_vector = None
         self.feature_vector = None
         self.outliers = np.zeros(n, dtype=bool)
+
+    if _USE_CPP_KF:
+        # ---- Frame-API compatibility for the C++ KeyFrame base -------------
+        # The fork's C++ Frame is a partial "mirror" (pySLAM's is complete), so
+        # these Python-Frame methods absent on the C++ base are provided here via
+        # the C++ pose accessors. Defined only on the C++ path (else they would
+        # shadow the proven Python Frame versions).
+        def pose(self):
+            return self.Tcw()
+
+        def Rcw(self):
+            return self.Tcw()[:3, :3].copy()
+
+        def Rwc(self):
+            return self.Twc()[:3, :3].copy()
+
+        def tcw(self):
+            return self.Tcw()[:3, 3].copy()
+
+        def position(self):
+            return self.Ow()
+
+        def isometry3d(self):
+            import g2o
+            return g2o.Isometry3d(np.ascontiguousarray(self.Tcw(), dtype=np.float64))
+
+        # Point-query family (operate on the C++ self.points / Python self.outliers;
+        # identical logic to the Python Frame versions).
+        def get_matched_points(self):
+            return [p for p in self.points if p is not None]
+
+        def get_matched_points_idxs(self):
+            return np.array([i for i, p in enumerate(self.points) if p is not None], dtype=np.int32)
+
+        def get_unmatched_points_idxs(self):
+            return np.array([i for i, p in enumerate(self.points) if p is None], dtype=np.int32)
+
+        def get_matched_inlier_points(self):
+            return self.get_matched_good_points()
+
+        def num_matched_inlier_map_points(self):
+            outliers = getattr(self, "outliers", None)
+            count = 0
+            for idx, p in enumerate(self.points):
+                if p is None:
+                    continue
+                if outliers is not None and idx < len(outliers) and bool(outliers[idx]):
+                    continue
+                if p.num_observations() > 0:
+                    count += 1
+            return count
 
     def init_observations(self) -> None:
         """Associate all currently matched map points as keyframe observations."""
@@ -640,4 +694,13 @@ class KeyFrame(*_make_keyframe_bases()):
             self.kd = None
 
     def heavy_memory_bytes(self) -> int:
+        if _USE_CPP_KF:
+            # The C++ base has no Python heavy-data accounting; sum the
+            # Python-held image buffers (diagnostics only).
+            total = 0
+            for attr in ("img", "img_right", "depth_img"):
+                a = getattr(self, attr, None)
+                if a is not None and hasattr(a, "nbytes"):
+                    total += int(a.nbytes)
+            return total
         return super().heavy_memory_bytes()

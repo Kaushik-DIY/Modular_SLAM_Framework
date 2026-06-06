@@ -54,6 +54,9 @@ def test_construction_feature_parity():
     assert kf.kid == 7
     assert kf.kpsu.shape == (n, 2)
     assert len(kf.octaves) == n
+    # init_feature_arrays keeps only kpsu; the cv2.KeyPoint list must be retained too
+    # (consumers read kf.kps; an empty kps breaks ensure_frame_feature_arrays).
+    assert len(kf.kps) == n
     # octaves must match the source frame exactly (deterministic feature mapping)
     np.testing.assert_array_equal(np.asarray(kf.octaves, dtype=np.int32),
                                   np.asarray(frame.octaves, dtype=np.int32))
