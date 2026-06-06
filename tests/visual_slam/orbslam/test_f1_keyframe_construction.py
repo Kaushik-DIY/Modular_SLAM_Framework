@@ -66,6 +66,14 @@ def test_construction_feature_parity():
                                   np.asarray(frame.des, dtype=np.uint8))
 
 
+def test_construction_timestamp_preserved():
+    """timestamp must transfer (C++ ctor doesn't set it) — a 0 timestamp disables
+    keyframe culling (the dt-to-parent guard sees dt=0 < max_time_dist)."""
+    frame = _make_real_frame(timestamp=123.456)
+    kf = build_cpp_keyframe_from_frame(frame, kid=12)
+    assert abs(float(kf.timestamp) - 123.456) < 1e-6
+
+
 def test_construction_kps_ur_stereo_preserved():
     """Stereo right-coords (uRs) must transfer — a stale all-(-1) frame.kps_ur must
     NOT win, else stereo observations score weight 1 -> num_tracked_points collapses."""

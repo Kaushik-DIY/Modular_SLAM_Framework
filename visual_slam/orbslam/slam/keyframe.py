@@ -60,6 +60,8 @@ def build_cpp_keyframe_from_frame(frame, kid):
     kf.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
                            kps_ur, octaves, n)
     kf.kps = list(frame.kps)  # init_feature_arrays keeps only kpsu; retain the kps list
+    kf.timestamp = float(frame.timestamp)   # ctor doesn't set it; gates KF culling
+    kf.img_id = int(getattr(frame, "img_id", -1) or -1)
     kf.update_pose(np.ascontiguousarray(frame.Tcw(), dtype=np.float64))
     if getattr(frame, "depths", None) is not None:
         kf.depths = frame.depths
@@ -355,6 +357,11 @@ class KeyFrame(*_make_keyframe_bases()):
                 self.set_point_match(p, idx)
 
         # C++ fields (typed) — keep loop_query_id/reloc_query_id at their -1 default.
+        # The C++ ctor takes only (kid, frame_id, camera); timestamp/img_id are NOT
+        # set by it and must be copied — timestamp gates keyframe culling
+        # (kKeyframeMaxTimeDistanceInSecForCulling), so a 0 timestamp disables culling.
+        self.timestamp = float(frame.timestamp)
+        self.img_id = int(getattr(frame, "img_id", -1) or -1)
         self.kid = kid_val
         self.map = None
         self.is_keyframe = True
