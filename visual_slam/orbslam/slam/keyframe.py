@@ -13,7 +13,7 @@ import numpy as np
 
 from visual_slam.orbslam.slam.camera_pose import CameraPose
 from visual_slam.orbslam.slam.config_parameters import Parameters
-from visual_slam.orbslam.slam.frame import Frame
+from visual_slam.orbslam.slam.frame import Frame, _as_points_array, kMinDepth
 
 # F1 (12fps plan): optional C++ KeyFrame base (covisibility graph / spanning tree /
 # loop edges / points in C++). Mirrors the MapPoint precedent in map_point.py.
@@ -447,6 +447,75 @@ class KeyFrame(*_make_keyframe_bases()):
                 if p.num_observations() > 0:
                     count += 1
             return count
+
+        # Projection family — the fork's C++ "mirror" Frame omits these, but
+        # fuse_map_points (search_and_fuse -> keyframe.are_visible) and
+        # triangulation need them. Their absence was SILENTLY swallowed by
+        # fuse's bare `except`, disabling map-point fusion on C++ keyframes
+        # (=> 2x duplicate points, sparser observations, under-culling). Reuse
+        # the exact Python Frame logic; transform via the C++ Tcw (the only
+        # _pose-private dependency). ~1 Hz path (not the tracking hot loop).
+        def transform_points(self, points):
+            Tcw = np.ascontiguousarray(self.Tcw(), dtype=np.float64)
+            points = np.ascontiguousarray(points, dtype=np.float64).reshape(-1, 3)
+            return (Tcw[:3, :3] @ points.T + Tcw[:3, 3].reshape(3, 1)).T
+
+        def transform_point(self, pw):
+            Tcw = np.ascontiguousarray(self.Tcw(), dtype=np.float64)
+            pw = np.asarray(pw, dtype=np.float64).reshape(3)
+            return (Tcw[:3, :3] @ pw) + Tcw[:3, 3]
+
+        def project_points(self, points, do_stereo_project: bool = False):
+            pcs = self.transform_points(points)
+            return (self.camera.project_stereo(pcs) if do_stereo_project
+                    else self.camera.project(pcs))
+
+        def project_point(self, pw, do_stereo_project: bool = False):
+            pc = self.transform_point(pw)
+            proj, zs = (self.camera.project_stereo(pc.reshape(1, 3)) if do_stereo_project
+                        else self.camera.project(pc.reshape(1, 3)))
+            return proj.reshape(-1), float(zs[0])
+
+        def project_map_points(self, map_points, do_stereo_project: bool = False):
+            points = _as_points_array(map_points)
+            if len(points) == 0:
+                w = 3 if do_stereo_project else 2
+                return np.empty((0, w), dtype=np.float64), np.empty((0,), dtype=np.float64)
+            return self.project_points(points, do_stereo_project=do_stereo_project)
+
+        def are_in_image(self, uvs, zs):
+            return self.camera.are_in_image(uvs, zs)
+
+        def are_visible(self, map_points, do_stereo_project: bool = False):
+            projs, depths = self.project_map_points(map_points, do_stereo_project=do_stereo_project)
+            pts = _as_points_array(map_points)
+            if len(pts) == 0:
+                return (np.empty((0,), dtype=bool), projs, depths,
+                        np.empty((0,), dtype=np.float64))
+            dists = np.linalg.norm(pts - self.Ow().reshape(1, 3), axis=1)
+            visible = self.are_in_image(projs[:, :2], depths) & (depths > kMinDepth)
+            return visible, projs, depths, dists
+
+        def unproject_points_3d(self, idxs, transform_in_world: bool = True):
+            idxs = np.asarray(idxs, dtype=np.int32).reshape(-1)
+            pts3d = np.zeros((len(idxs), 3), dtype=np.float64)
+            valid = np.zeros(len(idxs), dtype=bool)
+            if len(idxs) == 0:
+                return pts3d, valid
+            kpsu, depths = self.kpsu, self.depths
+            Rwc, Ow = self.Rwc(), self.Ow()
+            for out_i, idx in enumerate(idxs):
+                if idx < 0 or idx >= len(kpsu) or idx >= len(depths):
+                    continue
+                depth = float(depths[idx])
+                if not np.isfinite(depth) or depth <= kMinDepth:
+                    continue
+                _kp = kpsu[idx]
+                uv = np.array(_kp.pt if hasattr(_kp, "pt") else _kp, dtype=np.float64)
+                pc = self.camera.unproject_3d(uv, depth)
+                pts3d[out_i] = (Rwc @ pc.reshape(3) + Ow.reshape(3)) if transform_in_world else pc.reshape(3)
+                valid[out_i] = True
+            return pts3d, valid
 
     def init_observations(self) -> None:
         """Associate all currently matched map points as keyframe observations."""
