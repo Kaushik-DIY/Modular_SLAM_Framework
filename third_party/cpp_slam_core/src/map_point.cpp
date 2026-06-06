@@ -98,13 +98,11 @@ float MapPoint::min_des_distance(const cv::Mat &query_des) const {
 
 // ---- Observation management ------------------------------------------------
 bool MapPoint::add_observation(py::object kf, int idx) {
-    // GIL must be held by caller (py::object operations)
-    std::lock_guard<std::mutex> lk(_lock_features);
-    if (_observations.count(kf)) return false;
-
-    _observations[kf] = idx;
-
-    // Count stereo observations (kf.kps_ur[idx] >= 0) as weight 2
+    // GIL must be held by caller (py::object operations).
+    // Do all Python access OUTSIDE the _lock_features scope: holding the mutex
+    // while running Python can yield the GIL and deadlock against a thread
+    // blocked on this mutex (e.g. observations()).
+    // Count stereo observations (kf.kps_ur[idx] >= 0) as weight 2.
     int weight = 1;
     try {
         auto kps_ur = kf.attr("kps_ur");
@@ -113,9 +111,15 @@ bool MapPoint::add_observation(py::object kf, int idx) {
             if (!ur_val.is_none() && ur_val.cast<float>() >= 0.0f) weight = 2;
         }
     } catch (...) {}
-    _num_observations += weight;
 
-    // Register match in keyframe
+    {
+        std::lock_guard<std::mutex> lk(_lock_features);
+        if (_observations.count(kf)) return false;
+        _observations[kf] = idx;
+        _num_observations += weight;
+    }
+
+    // Register match in keyframe (outside the lock)
     try {
         kf.attr("set_point_match")(shared_from_this(), idx);
     } catch (...) {}
@@ -213,19 +217,28 @@ int MapPoint::num_observations() const {
 
 // ---- Frame views -----------------------------------------------------------
 bool MapPoint::add_frame_view(py::object frame, int idx) {
-    std::lock_guard<std::mutex> lk(_lock_features);
-    if (_frame_views.count(frame)) return false;
-    _frame_views[frame] = idx;
+    {
+        std::lock_guard<std::mutex> lk(_lock_features);
+        if (_frame_views.count(frame)) return false;
+        _frame_views[frame] = idx;
+    }
+    // Python callback outside the lock (avoid GIL<->mutex inversion).
     try { frame.attr("set_point_match")(shared_from_this(), idx); } catch (...) {}
     return true;
 }
 
 void MapPoint::remove_frame_view(py::object frame, int idx) {
-    std::lock_guard<std::mutex> lk(_lock_features);
-    auto it = _frame_views.find(frame);
-    if (it == _frame_views.end()) return;
-    int rm_idx = (idx >= 0) ? idx : it->second;
-    _frame_views.erase(it);
+    int rm_idx = -1;
+    {
+        std::lock_guard<std::mutex> lk(_lock_features);
+        auto it = _frame_views.find(frame);
+        if (it == _frame_views.end()) return;
+        rm_idx = (idx >= 0) ? idx : it->second;
+        _frame_views.erase(it);
+    }
+    // Python callback outside the lock. The observed threaded deadlock was here:
+    // this method held _lock_features while remove_point_match re-entered Python,
+    // vs MapPoint::observations() holding the GIL and blocking on _lock_features.
     try { frame.attr("remove_point_match")(rm_idx); } catch (...) {}
 }
 
@@ -353,31 +366,35 @@ void MapPoint::update_info() {
 }
 
 void MapPoint::update_best_descriptor(bool /*force*/) {
-    // Collect descriptors from all observing KFs (GIL held)
-    std::vector<cv::Mat> descriptors;
+    // Snapshot observations under the lock, then do all Python reads (kf.des)
+    // OUTSIDE it: holding _lock_features while touching py attrs can yield the
+    // GIL and deadlock against a thread blocked on this mutex (e.g. observations()).
+    std::vector<std::pair<py::object, int>> obs_sorted;
     {
         std::lock_guard<std::mutex> lk(_lock_features);
-        // Iterate observations in stable kid order so the medoid tie-break below
-        // ("if (mx < best_max)" keeps the first on ties) is deterministic.
-        std::vector<std::pair<py::object, int>> obs_sorted(_observations.begin(), _observations.end());
-        std::sort(obs_sorted.begin(), obs_sorted.end(),
-                  [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
-        descriptors.reserve(obs_sorted.size());
-        for (const auto &[kf, idx] : obs_sorted) {
-            try {
-                auto des_arr = kf.attr("des");
-                if (!des_arr.is_none()) {
-                    // des_arr is np.ndarray (N, 32) uint8
-                    auto np_des = des_arr.template cast<py::array_t<uint8_t>>();
-                    auto r = np_des.template unchecked<2>();
-                    if (idx < static_cast<int>(r.shape(0))) {
-                        cv::Mat d(1, 32, CV_8U);
-                        std::memcpy(d.data, &r(idx, 0), 32);
-                        descriptors.push_back(d);
-                    }
+        obs_sorted.assign(_observations.begin(), _observations.end());
+    }
+    // Iterate observations in stable kid order so the medoid tie-break below
+    // ("if (mx < best_max)" keeps the first on ties) is deterministic.
+    std::sort(obs_sorted.begin(), obs_sorted.end(),
+              [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
+
+    std::vector<cv::Mat> descriptors;
+    descriptors.reserve(obs_sorted.size());
+    for (const auto &[kf, idx] : obs_sorted) {
+        try {
+            auto des_arr = kf.attr("des");
+            if (!des_arr.is_none()) {
+                // des_arr is np.ndarray (N, 32) uint8
+                auto np_des = des_arr.template cast<py::array_t<uint8_t>>();
+                auto r = np_des.template unchecked<2>();
+                if (idx < static_cast<int>(r.shape(0))) {
+                    cv::Mat d(1, 32, CV_8U);
+                    std::memcpy(d.data, &r(idx, 0), 32);
+                    descriptors.push_back(d);
                 }
-            } catch (...) {}
-        }
+            }
+        } catch (...) {}
     }
 
     if (descriptors.empty()) return;
