@@ -47,8 +47,23 @@ required, neither alone suffices.
 Fixed prerequisites: tracking lever `kNumBestCovisibilityKeyFramesTracking=3` (config:87); M6
 loop quality 68 mm (θ=15); **threaded+cpp GIL deadlock fixed** (1b22f2f) — threaded mode is now a
 working baseline. C++ KeyFrame still built-but-dormant (the F1 linchpin).
-**Still open:** within-tracking split (search_map vs track_previous vs local-map-build) needs a
-short *profiled* run to set exact F2/F3 sub-targets.
+**Within-tracking split** (profiled 1500-frame run, `lab_threaded_cpp_loopsoff_profiled1500/`;
+absolute ms profiling-inflated ~2×, **proportions are the signal**):
+
+| Sub-stage | Profiled mean | Share of track_local_map | F-target |
+|---|---|---|---|
+| `track_local_map` (all of it) | 257 ms | 100% | F2+F3 |
+| → **`search_map_by_projection`** | **204 ms** | **~79%** | **F2 (C++ local-map vector) + F3 (C++ tracking_core)** |
+| → `local_map_build` (covis traversal) | 39 ms | ~15% | F2 |
+| → `pose_optimization` | 9 ms | ~4% | already C++/SOC — leave |
+| `track_previous_frame` (separate) | 16 ms | — | minor |
+
+**Why search_map is the giant:** `num_local_points` ≈ **3,817** py::object MapPoints looped **in
+Python** every frame (~231 descriptor comparisons each), each cast `py::object→MapPoint*`. The
+matcher kernel is C++ but the surrounding loop is Python — exactly the boundary F2/F3 remove.
+In unprofiled terms (~110 ms tracking): search_map ≈ **~85 ms**, local-map build ≈ ~17 ms. To hit
+≤70 ms tracking, search_map must drop ~85→~40 ms (F2+F3 put the whole loop on C++ objects) and the
+~80 ms KF premium must go (F4). **F0 is now complete.**
 
 **F0 below re-profiles this on current HEAD to produce the authoritative per-stage breakdown before
 any C++ work — the numbers above are the working hypothesis, F0 makes them exact.**
