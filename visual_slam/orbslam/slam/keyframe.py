@@ -55,6 +55,7 @@ def build_cpp_keyframe_from_frame(frame, kid):
     des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
     kf.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
                            kps_ur, octaves, n)
+    kf.kps = list(frame.kps)  # init_feature_arrays keeps only kpsu; retain the kps list
     kf.update_pose(np.ascontiguousarray(frame.Tcw(), dtype=np.float64))
     if getattr(frame, "depths", None) is not None:
         kf.depths = frame.depths
