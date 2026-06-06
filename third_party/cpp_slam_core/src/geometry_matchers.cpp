@@ -1,6 +1,7 @@
 #include "geometry_matchers.h"
 
 #include "frame.h"
+#include "keyframe.h"
 #include "map_point.h"
 
 #include <algorithm>
@@ -283,105 +284,99 @@ std::pair<py::list, py::list> build_local_map(
     py::object f_cur, int num_best, int max_kfs, int frame_id) {
     (void)frame_id;  // dedup is per-call (see note above)
 
-    auto is_bad = [](const py::object &o) -> bool {
-        try { return o.attr("is_bad")().cast<bool>(); } catch (...) { return true; }
+    // NATIVE C++ object access (F2 3/n): the KFs/MapPoints are Python subclasses of
+    // the C++ base, so cast py::object -> slam::KeyFrame*/MapPoint* and call the C++
+    // methods DIRECTLY (no obj.attr() -> _w trampoline -> C++ round-trip). Only f_cur
+    // is a Python Frame, so its single entry call goes via attr().
+    auto as_kf = [](const py::object &o) -> slam::KeyFrame * {
+        if (o.is_none()) return nullptr;
+        try { return o.cast<slam::KeyFrame *>(); } catch (...) { return nullptr; }
     };
-    auto kid_of = [](const py::object &kf) -> int {
-        try { return kf.attr("kid").cast<int>(); } catch (...) { return -1; }
+    auto as_mp = [](const py::object &o) -> slam::MapPoint * {
+        if (o.is_none()) return nullptr;
+        try { return o.cast<slam::MapPoint *>(); } catch (...) { return nullptr; }
     };
 
     // 1. Votes: current frame's matched good points -> observing KFs (dedup by kid).
     std::unordered_map<int, int> vote_count;
-    std::vector<py::object> vote_kf;  // first-seen kf per kid, in encounter order
+    std::vector<py::object> vote_kf;  // first-seen kf py::object per kid, in order
     {
-        py::object cur_pts = f_cur.attr("get_matched_good_points")();
+        py::object cur_pts = f_cur.attr("get_matched_good_points")();  // Python Frame entry
         for (auto item : cur_pts) {
-            py::object p = py::reinterpret_borrow<py::object>(item);
-            if (p.is_none() || is_bad(p)) continue;
-            py::object obs = p.attr("observations")();
-            for (auto o : obs) {
-                py::tuple t = o.cast<py::tuple>();
-                py::object kf = py::reinterpret_borrow<py::object>(t[0]);
-                if (kf.is_none() || is_bad(kf)) continue;
-                int kid = kid_of(kf);
-                if (kid < 0) continue;
+            py::object pobj = py::reinterpret_borrow<py::object>(item);
+            slam::MapPoint *mp = as_mp(pobj);
+            if (!mp || mp->is_bad()) continue;
+            for (auto &pr : mp->observations()) {          // native
+                slam::KeyFrame *kf = as_kf(pr.first);
+                if (!kf || kf->is_bad()) continue;
+                int kid = kf->kid;
                 auto it = vote_count.find(kid);
-                if (it == vote_count.end()) { vote_count[kid] = 1; vote_kf.push_back(kf); }
+                if (it == vote_count.end()) { vote_count[kid] = 1; vote_kf.push_back(pr.first); }
                 else { it->second++; }
             }
         }
     }
 
     // 2. Expanding local keyframes (transitive, capped at max_kfs).
-    std::vector<py::object> local_kfs;
+    std::vector<py::object> local_obj;
+    std::vector<slam::KeyFrame *> local_ptr;
     std::vector<int> local_counts;
     std::unordered_set<int> in_local;
-    for (auto &kf : vote_kf) {
-        local_kfs.push_back(kf);
-        local_counts.push_back(vote_count[kid_of(kf)]);
-        in_local.insert(kid_of(kf));
+    for (auto &kfobj : vote_kf) {
+        slam::KeyFrame *kf = as_kf(kfobj);
+        local_obj.push_back(kfobj);
+        local_ptr.push_back(kf);
+        local_counts.push_back(vote_count[kf->kid]);
+        in_local.insert(kf->kid);
     }
-    auto try_add = [&](py::object kf) -> bool {
-        if (kf.is_none() || is_bad(kf)) return false;
-        int kid = kid_of(kf);
-        if (kid < 0 || in_local.count(kid)) return false;
-        local_kfs.push_back(kf);
+    auto try_add = [&](const py::object &kfobj) -> bool {
+        slam::KeyFrame *kf = as_kf(kfobj);
+        if (!kf || kf->is_bad() || in_local.count(kf->kid)) return false;
+        local_obj.push_back(kfobj);
+        local_ptr.push_back(kf);
         local_counts.push_back(1);
-        in_local.insert(kid);
+        in_local.insert(kf->kid);
         return true;
     };
-    for (std::size_t i = 0; i < local_kfs.size(); ++i) {
-        if (static_cast<int>(local_kfs.size()) >= max_kfs) break;
-        py::object kf = local_kfs[i];
-        try {
-            py::object neighbors = kf.attr("get_best_covisible_keyframes")(num_best);
-            for (auto n : neighbors)
-                if (try_add(py::reinterpret_borrow<py::object>(n))) break;
-        } catch (...) {}
-        try {
-            py::object children = kf.attr("get_children")();
-            for (auto c : children)
-                if (try_add(py::reinterpret_borrow<py::object>(c))) break;
-        } catch (...) {}
-        try { try_add(kf.attr("get_parent")()); } catch (...) {}
+    for (std::size_t i = 0; i < local_obj.size(); ++i) {
+        if (static_cast<int>(local_obj.size()) >= max_kfs) break;
+        slam::KeyFrame *kf = local_ptr[i];
+        if (!kf) continue;
+        for (auto &n : kf->get_best_covisible_keyframes(num_best))  // native
+            if (try_add(n)) break;
+        for (auto &c : kf->get_children())                          // native
+            if (try_add(c)) break;
+        try_add(kf->get_parent());                                  // native
     }
 
     // sort by count desc (stable), keep top max_kfs
-    std::vector<std::size_t> order(local_kfs.size());
+    std::vector<std::size_t> order(local_obj.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(),
                      [&](std::size_t a, std::size_t b) { return local_counts[a] > local_counts[b]; });
     int n_keep = std::min<int>(max_kfs, static_cast<int>(order.size()));
 
     py::list local_keyframes_out;
-    std::vector<py::object> kept;
-    kept.reserve(n_keep);
+    std::vector<slam::KeyFrame *> kept_ptr;
+    kept_ptr.reserve(n_keep);
     for (int i = 0; i < n_keep; ++i) {
-        local_keyframes_out.append(local_kfs[order[i]]);
-        kept.push_back(local_kfs[order[i]]);
+        local_keyframes_out.append(local_obj[order[i]]);
+        kept_ptr.push_back(local_ptr[order[i]]);
     }
 
-    // 3. Collect local points (per-call dedup by MapPoint identity).
-    auto is_good_mp = [](const py::object &p) -> bool {
-        if (p.is_none()) return false;
-        try { if (p.attr("is_bad")().cast<bool>()) return false; } catch (...) { return false; }
-        try { if (!p.attr("get_replacement")().is_none()) return false; } catch (...) {}
-        return true;
-    };
+    // 3. Collect local points (per-call dedup by MapPoint identity). get_points() is
+    // the C++ base method (full list incl None); the is_good filter makes it == the
+    // Python _collect's get_matched_points.
     py::list local_points_out;
-    std::unordered_set<PyObject *> seen_pts;
-    for (auto &kf : kept) {
-        // get_points() = the C++ base method (full list incl None); the is_good_mp
-        // None-filter below makes this == the Python _collect's get_matched_points.
-        // Using the base method (not the Python-compat get_matched_points) keeps
-        // build_local_map runnable on raw C++ KeyFrames too (isolation-testable).
-        py::object pts;
-        try { pts = kf.attr("get_points")(); } catch (...) { continue; }
-        for (auto item : pts) {
-            py::object p = py::reinterpret_borrow<py::object>(item);
-            if (!is_good_mp(p)) continue;
-            if (!seen_pts.insert(p.ptr()).second) continue;
-            local_points_out.append(p);
+    std::unordered_set<slam::MapPoint *> seen_pts;
+    for (auto *kf : kept_ptr) {
+        if (!kf) continue;
+        for (auto &pobj : kf->get_points()) {                       // native
+            slam::MapPoint *mp = as_mp(pobj);
+            if (!mp || mp->is_bad()) continue;
+            if (mp->get_replacement()) continue;                    // replacement set -> skip
+            if (!seen_pts.insert(mp).second) continue;
+            local_points_out.append(pobj);
         }
     }
 
