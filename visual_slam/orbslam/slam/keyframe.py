@@ -23,6 +23,19 @@ try:
 except Exception:
     _CppKeyFrameBase = None
 
+# Resolved at import (the base class is fixed at class-definition time). Toggle via
+# Parameters.USE_CPP_KEYFRAME, which defaults from $SLAM_USE_CPP_KEYFRAME so a run/test
+# can opt in before this module is imported.
+_USE_CPP_KF = bool(getattr(Parameters, "USE_CPP_KEYFRAME", False)) and (_CppKeyFrameBase is not None)
+
+
+def _make_keyframe_bases():
+    """Base class(es) for KeyFrame: the C++ KeyFrame when enabled, else the proven
+    pure-Python (Frame, KeyFrameGraph). One class either way, so isinstance() holds."""
+    if _USE_CPP_KF:
+        return (_CppKeyFrameBase,)
+    return (Frame, KeyFrameGraph)
+
 
 def build_cpp_keyframe_from_frame(frame, kid):
     """Populate a fresh C++ KeyFrame base from a Python Frame (F1b construction).
@@ -220,7 +233,7 @@ class KeyFrameGraph:
 
 
 # Represent a selected map keyframe with graph and observation state.
-class KeyFrame(Frame, KeyFrameGraph):
+class KeyFrame(*_make_keyframe_bases()):
 
     def __init__(
         self,
@@ -230,6 +243,9 @@ class KeyFrame(Frame, KeyFrameGraph):
         depth=None,
         kid: Optional[int] = None,
     ):
+        if _USE_CPP_KF:
+            self._init_from_frame_cpp(frame, img, img_right, depth, kid)
+            return
         KeyFrameGraph.__init__(self)
 
         # Create a Frame shell without recomputing features.
@@ -302,6 +318,67 @@ class KeyFrame(Frame, KeyFrameGraph):
         self.points = list(frame.points)
         self.outliers = np.zeros(len(self.kps), dtype=bool)
 
+    def _init_from_frame_cpp(self, frame, img, img_right, depth, kid):
+        """C++ KeyFrame path: populate the C++ base from a Python Frame.
+
+        Feature arrays go through init_feature_arrays (kpsu/octaves/des/kps_ur are
+        READONLY C++ properties). _is_bad is a readonly C++ property (never assigned).
+        loop_query_id/reloc_query_id keep their C++ int(-1) default (consumers compare
+        with != / == only). Python-only state lives on the instance via dynamic_attr.
+        """
+        kid_val = int(kid) if kid is not None else int(frame.id)
+        _CppKeyFrameBase.__init__(self, kid=kid_val, frame_id=int(frame.id),
+                                  camera=frame.camera)
+        n = len(frame.kps)
+        kps_ur = getattr(frame, "kps_ur", None)
+        if kps_ur is None:
+            kps_ur = getattr(frame, "uRs", None)
+        des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
+        self.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
+                                 kps_ur, getattr(frame, "octaves", None), n)
+        self.update_pose(np.ascontiguousarray(frame.Tcw(), dtype=np.float64))
+        if getattr(frame, "depths", None) is not None:
+            self.depths = frame.depths
+        for idx, p in enumerate(frame.points):
+            if p is not None:
+                self.set_point_match(p, idx)
+
+        # C++ fields (typed) — keep loop_query_id/reloc_query_id at their -1 default.
+        self.kid = kid_val
+        self.map = None
+        self.is_keyframe = True
+        self.to_be_erased = False
+        self.GBA_kf_id = 0
+        self.is_Tcw_GBA_valid = False
+        self.Tcw_GBA = None
+        self.Tcw_before_GBA = None
+        self.num_loop_words = 0
+        self.loop_score = 0.0
+        self.num_reloc_words = 0
+        self.reloc_score = 0.0
+
+        # Python-only state (held on the C++ instance via dynamic_attr).
+        self.img = frame.img if frame.img is not None else img
+        self.img_right = frame.img_right if frame.img_right is not None else img_right
+        self.depth_img = frame.depth_img if frame.depth_img is not None else depth
+        # NB: uRs / kps_ur are readonly C++ properties (aliases of kps_ur, already
+        # populated by init_feature_arrays) — readable, not assignable.
+        self.lba_count = 0
+        self.is_blurry = getattr(frame, "is_blurry", False)
+        self.laplacian_var = getattr(frame, "laplacian_var", None)
+        self._pose_Tcp = CameraPose()
+        self.kpsn = getattr(frame, "kpsn", None)
+        self.sizes = np.array([float(getattr(kp, "size", 0.0)) for kp in frame.kps], dtype=np.float32)
+        self.angles = np.array([float(getattr(kp, "angle", -1.0)) for kp in frame.kps], dtype=np.float32)
+        self.median_depth = frame.median_depth
+        self.fov_center_c = frame.fov_center_c
+        self.fov_center_w = frame.fov_center_w
+        self.g_des = None
+        self.f_des = None
+        self.bow_vector = None
+        self.feature_vector = None
+        self.outliers = np.zeros(n, dtype=bool)
+
     def init_observations(self) -> None:
         """Associate all currently matched map points as keyframe observations."""
         if not hasattr(self, "_lock_features"):
@@ -320,6 +397,8 @@ class KeyFrame(Frame, KeyFrameGraph):
     def update_connections(self) -> None:
         """
         """
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.update_connections(self)
         points = self.get_matched_good_points()
         if len(points) == 0:
             return
@@ -370,10 +449,14 @@ class KeyFrame(Frame, KeyFrameGraph):
                 self.is_first_connection = False
 
     def Tcp(self):
+        if _USE_CPP_KF:
+            return self._pose_Tcp.get_matrix()
         with self._lock_connections:
             return self._pose_Tcp.get_matrix()
 
     def is_bad(self) -> bool:
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.is_bad(self)
         with self._lock_connections:
             return self._is_bad
 
@@ -383,10 +466,14 @@ class KeyFrame(Frame, KeyFrameGraph):
         return compute_bow_for_frame(self, vocabulary)
 
     def set_not_erase(self) -> None:
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.set_not_erase(self)
         with self._lock_connections:
             self.not_to_erase = True
 
     def set_erase(self) -> None:
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.set_erase(self)
         should_set_bad = False
         with self._lock_connections:
             if len(self.loop_edges) == 0:
@@ -398,6 +485,18 @@ class KeyFrame(Frame, KeyFrameGraph):
 
     def set_bad(self) -> None:
         """Mark this keyframe bad and detach its graph and point links."""
+        if _USE_CPP_KF:
+            # The C++ set_bad stubs the Tcp computation; do it here (Python),
+            # faithful to pySLAM, BEFORE the C++ side erases the parent link.
+            # Guards mirror the C++ early-returns (kid==0 / not_to_erase).
+            if self.kid != 0 and not self.not_to_erase:
+                parent = self.get_parent()
+                if parent is not None:
+                    try:
+                        self._pose_Tcp.update(self.Tcw() @ parent.Twc())
+                    except Exception:
+                        pass
+            return _CppKeyFrameBase.set_bad(self)
         with self._lock_connections:
             if self.kid == 0:
                 return

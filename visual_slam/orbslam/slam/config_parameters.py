@@ -6,6 +6,7 @@ This module collects feature, tracking, mapping, loop-closing, and optimization 
 from __future__ import annotations
 
 import math
+import os as _os
 from dataclasses import dataclass
 
 
@@ -19,7 +20,11 @@ class Parameters:
     # F1 (12fps plan): wire the C++ KeyFrame (covisibility graph / spanning tree /
     # loop edges / points in C++). Default False keeps the proven pure-Python
     # KeyFrame(Frame, KeyFrameGraph). Enabled incrementally + A/B-validated.
-    USE_CPP_KEYFRAME = False
+    # This selects the KeyFrame BASE class at import time (unlike USE_CPP_CORE,
+    # which is dispatched at runtime), so it is read from the environment so a
+    # run/test can opt in before the slam package is imported.
+    USE_CPP_KEYFRAME = _os.environ.get("SLAM_USE_CPP_KEYFRAME", "0").lower() in (
+        "1", "true", "yes", "on")
 
     # ================================================================
     # Sparse SLAM threading
