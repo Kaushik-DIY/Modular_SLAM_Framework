@@ -19,6 +19,14 @@ from visual_slam.orbslam.slam.frame import Frame, ensure_frame_feature_arrays
 from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher
 from visual_slam.orbslam.slam.keyframe import KeyFrame
 from visual_slam.orbslam.slam.map import Map
+
+# F2: C++ expanding local-map build (used when the C++ KeyFrame is active).
+try:
+    import cpp_slam_core as _cpp_core
+    _cpp_build_local_map = getattr(_cpp_core, "build_local_map", None)
+except Exception:
+    _cpp_build_local_map = None
+_USE_CPP_LOCAL_MAP = bool(getattr(Parameters, "USE_CPP_KEYFRAME", False)) and (_cpp_build_local_map is not None)
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.motion_model import MotionModel
 from visual_slam.orbslam.slam.optimizer_g2o import pose_optimization as g2o_pose_optimization
@@ -730,15 +738,27 @@ class Tracking:
         if keyframe_votes:
             self.kf_ref = reference
             self.f_cur.kf_ref = reference
-            self.local_keyframes = self._build_local_keyframes_from_votes(
-                keyframe_votes,
-                self.f_cur,
-                num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
-            )
-            self.local_points = self._collect_local_points_from_keyframes(
-                self.local_keyframes,
-                self.f_cur,
-            )
+            if _USE_CPP_LOCAL_MAP:
+                # F2: build the expanding local map in C++ (parity-faithful port of
+                # _build_local_keyframes_from_votes + _collect_local_points_from_keyframes).
+                lk, lp = _cpp_build_local_map(
+                    self.f_cur,
+                    int(Parameters.kNumBestCovisibilityKeyFramesTracking),
+                    int(Parameters.kMaxNumOfKeyframesInLocalMap),
+                    int(getattr(self.f_cur, "id", -1)),
+                )
+                self.local_keyframes = list(lk)
+                self.local_points = list(lp)
+            else:
+                self.local_keyframes = self._build_local_keyframes_from_votes(
+                    keyframe_votes,
+                    self.f_cur,
+                    num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
+                )
+                self.local_points = self._collect_local_points_from_keyframes(
+                    self.local_keyframes,
+                    self.f_cur,
+                )
         elif reference is not None:
             self.map.update_local_map(
                 reference,
