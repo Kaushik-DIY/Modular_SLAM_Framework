@@ -148,6 +148,18 @@ covisibility graph + spanning tree + loop edges + point management to C++; keep 
 - **Verify:** tracking inner loop pure C++; measured steady-state tracking toward ≤ 75 ms; A/B band.
 
 ### F4 — Close the LM matcher callback, GIL-released (M4) — **the KF-stall fix**
+> **🔴 PRIORITY BLOCKER (must fix in F4, found 2026-06-06): threaded + C++ KeyFrame DEADLOCKS.**
+> Full-lab threaded flag-on (USE_CPP_KEYFRAME=1 + --start-local-mapping-thread) wedges at ~frame
+> 1001 (5-min stall, RSS flat). faulthandler: LM thread in BA write-back unpack_local_ba ->
+> remove_observation (`_w`, blocked) vs tracking thread in C++ search_map_by_projection. SAME
+> GIL↔C++-mutex inversion class as the original deadlock (1b22f2f), newly exposed by F1's C++
+> KeyFrame adding _lock_pose/_lock_features/_lock_connections into the concurrent matcher+BA paths
+> (search_map reads MapPoint mutexes then calls the GIL-releasing kd_query_ball -> LM interleaves and
+> wedges). F1 is parity-clean in SEQUENTIAL mode; this is the THREADED-deployment blocker. FIX as
+> part of F4's GIL discipline: ensure no C++ object mutex is held across a GIL-yield (mirror 1b22f2f),
+> or wrap search_map_by_projection in one gil_scoped_release with scoped re-acquire for py::object
+> ops. F2/F3 proceed in sequential mode meanwhile (decision 2026-06-06). Default flag-off is safe.
+
 - Make C++ `LocalMappingCore` call the **C++** matcher (`search_more_map_points_by_projection` /
   `search_and_fuse` + map-point creation) instead of the Python callback at
   local_mapping_core.cpp:218/250. Wrap the LM matcher body in `py::gil_scoped_release` (the SOC BA
