@@ -23,8 +23,10 @@ from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam import run_rgbd_slam
 
 if __name__ == "__main__":
-    # Diagnostics: `kill -USR1 <pid>` dumps every thread's Python stack to stderr
-    # (stdlib, no deps; no-op unless the signal is sent). Used to pin threaded deadlocks.
+    # Diagnostics: dump the Python traceback to stderr on a FATAL signal
+    # (SIGSEGV/SIGFPE/SIGABRT/SIGBUS) — localizes a C++ segfault to the Python
+    # call site. And `kill -USR1 <pid>` dumps every thread's stack (deadlocks).
+    faulthandler.enable(all_threads=True)
     if hasattr(signal, "SIGUSR1"):
         faulthandler.register(signal.SIGUSR1, all_threads=True)
     Parameters.USE_CPP_CORE = True
