@@ -23,17 +23,32 @@
   ≤ 83 ms/frame (≥12 fps) on the dev machine, suite green flag-ON and flag-OFF, lab ATE within band
   vs the previous milestone, and Mode-C fusion smoke still accepts ≥1 cross-modal loop.
 
-## 2. Current baseline (committed HEAD `2dc8978`)
+## 2. Current baseline — F0 MEASURED (2026-06-06, commit 1b22f2f, threaded+cpp loops-off)
 
-| Fact | Value | Source |
+Authoritative threaded steady-state from the first full threaded+cpp lab run to complete
+(`visual_slam_outputs/lab_threaded_cpp_loopsoff_deadlockfix/`, no profiling overhead):
+
+| Metric | Measured | Note |
 |---|---|---|
-| Tracking lever applied | `kNumBestCovisibilityKeyFramesTracking = 3` | config_parameters.py:87 |
-| Loop-closure quality | 68 mm ATE-vs-reference (loops+GBA, θ=15) | M6 |
-| Non-KF frame rate (loops-off) | **~12 fps (~83 ms)** | prior profiling |
-| Mean frame rate (loops-off) | **~5.8 fps** — dragged down by KF-frame stalls | prior profiling |
-| Mean fps loops+GBA (t15_GBA run) | 4.77 fps (includes 5 GBA stalls) | run_summary.json |
-| **The KF-frame stall root** | LM calls the **Python** matcher `search_and_fuse` under the GIL | local_mapping_core.cpp:218,250 |
-| C++ KeyFrame | built + unit-tested on 3.11.9, **dormant** (not subclassed) | keyframe.cpp |
+| **Per-frame total — median** | **127 ms (7.9 fps)** | the realistic steady-state rate |
+| Per-frame total — mean | 177 ms (5.6 fps) | dragged up by KF bursts / relocalization (p99 802 ms) |
+| **non-KF median** | **124 ms (8.1 fps)** | the *floor* — already above the 83 ms gate ⚠️ |
+| KF-frame median | 205 ms (4.9 fps), mean 223 ms | ~80 ms KF premium (LM not fully overlapping) |
+| **tracking (`slam_track`)** | **mean 110 ms, median 105 ms, p90 170 ms** | the dominant cost → F2/F3 target |
+| local_mapping (inline, threaded) | mean 43 ms | overlaps in its own thread |
+| <100 ms frames | 27% | only ~1/4 already beat 10 fps |
+| KF count / map points | 201 KF / 36,309 pts (loops-off) | vs reference 152 / 9,306 → F5 density |
+
+**KEY CORRECTION vs the earlier hypothesis:** the non-KF floor is **~124 ms (8 fps), not ~83 ms
+(12 fps)** as guessed. Tracking itself is ~110 ms. So 12 fps needs a **bigger** cut than assumed:
+tracking must drop ~110 → ≤70 ms (F2+F3) **and** the ~80 ms KF premium must go (F4) — both are
+required, neither alone suffices.
+
+Fixed prerequisites: tracking lever `kNumBestCovisibilityKeyFramesTracking=3` (config:87); M6
+loop quality 68 mm (θ=15); **threaded+cpp GIL deadlock fixed** (1b22f2f) — threaded mode is now a
+working baseline. C++ KeyFrame still built-but-dormant (the F1 linchpin).
+**Still open:** within-tracking split (search_map vs track_previous vs local-map-build) needs a
+short *profiled* run to set exact F2/F3 sub-targets.
 
 **F0 below re-profiles this on current HEAD to produce the authoritative per-stage breakdown before
 any C++ work — the numbers above are the working hypothesis, F0 makes them exact.**
