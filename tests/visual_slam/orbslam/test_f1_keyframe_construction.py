@@ -66,21 +66,6 @@ def test_construction_feature_parity():
                                   np.asarray(frame.des, dtype=np.uint8))
 
 
-def test_construction_projection_family_present():
-    """The projection family must exist on the C++ KeyFrame. Its absence was swallowed
-    by fuse_map_points' bare `except`, silently disabling map-point fusion (-> 2x
-    duplicate points, under-culling). are_visible must project + return correct shapes."""
-    import cpp_slam_core
-    frame = _make_real_frame()
-    kf = build_cpp_keyframe_from_frame(frame, kid=13)
-    for m in ("are_visible", "are_in_image", "project_points", "project_point",
-              "project_map_points", "transform_points", "transform_point", "unproject_points_3d"):
-        assert hasattr(kf, m), f"C++ KeyFrame missing {m} (fuse/triangulation needs it)"
-    mps = [cpp_slam_core.MapPoint([0.05 * i, 0.0, 2.0]) for i in range(6)]
-    vis, projs, depths, dists = kf.are_visible(mps, kf.camera.is_stereo())
-    assert len(vis) == len(mps) and projs.shape[0] == len(mps)
-
-
 def test_construction_timestamp_preserved():
     """timestamp must transfer (C++ ctor doesn't set it) — a 0 timestamp disables
     keyframe culling (the dt-to-parent guard sees dt=0 < max_time_dist)."""

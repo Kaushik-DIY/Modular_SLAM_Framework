@@ -59,6 +59,16 @@ def _smoke():
     kf1.add_connection(kf2, 17)
     assert kf1.get_weight(kf2) == 17
 
+    # Projection family must be present + functional on the LIVE C++ KeyFrame —
+    # its absence was silently swallowed by fuse_map_points, disabling fusion.
+    import cpp_slam_core
+    for m in ("are_visible", "are_in_image", "project_points", "project_point",
+              "project_map_points", "transform_points", "transform_point", "unproject_points_3d"):
+        assert hasattr(kf1, m), f"live C++ KeyFrame missing {m}"
+    mps = [cpp_slam_core.MapPoint([0.05 * i, 0.0, 2.0]) for i in range(6)]
+    vis, projs, depths, dists = kf1.are_visible(mps, kf1.camera.is_stereo())
+    assert len(vis) == len(mps) and projs.shape[0] == len(mps)
+
     # spanning tree + set_bad must populate Tcp (Python-side; C++ set_bad stubs it)
     kf2.set_parent(kf1)
     T = np.eye(4); T[0, 3] = 2.0
