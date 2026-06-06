@@ -585,6 +585,10 @@ PYBIND11_MODULE(cpp_slam_core, m) {
           py::arg("min_depth"), py::arg("do_stereo_check"),
           "C++ search_frame_by_projection -> (idxs_ref, idxs_cur) pre-rotation-filter.");
 
+    m.def("build_local_map", &cppcore::build_local_map,
+          py::arg("f_cur"), py::arg("num_best"), py::arg("max_kfs"), py::arg("frame_id"),
+          "F2 C++ expanding tracking local-map build -> (local_keyframes, local_points).");
+
     // Python 3.11 adaptive interpreter specialization bug: calling a pybind11
     // instancemethod exactly 8 times in a tight for loop triggers a segfault
     // (CALL opcode quickening selects the C-extension fast path which crashes).

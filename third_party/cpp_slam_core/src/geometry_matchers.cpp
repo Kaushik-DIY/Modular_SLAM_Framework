@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace cppcore {
 
@@ -261,6 +264,128 @@ std::pair<std::vector<int>, std::vector<int>> search_frame_by_projection(
     }
 
     return {idxs_ref_out, idxs_cur_out};
+}
+
+// ---- F2: expanding tracking local-map build --------------------------------
+// Port of tracking._build_local_keyframes_from_votes +
+// _collect_local_points_from_keyframes. Parity notes vs OUR Python:
+//  - KFs deduped by KID (C++ KeyFrame __hash__/__eq__ are kid-based; the Python
+//    keyframe_counts dict keys on kf whose __hash__==kid).
+//  - TRANSITIVE expansion: the index loop reads the GROWING vector, mirroring
+//    Python `for kf in local_keyframes_list` (which sees appends), capped at
+//    max_kfs via the size check at the loop top.
+//  - sort by vote count desc, STABLE (ties keep insertion order, == Python sorted).
+//  - local_points deduped per-call by MapPoint identity == the Python
+//    last_track_reference_frame_id==frame_id check (read nowhere else), so the
+//    per-point attr write is intentionally omitted. The diagnostics side-effects
+//    (last_tracking_frame_id / tracking_vote_count) are also omitted (profiling-only).
+std::pair<py::list, py::list> build_local_map(
+    py::object f_cur, int num_best, int max_kfs, int frame_id) {
+    (void)frame_id;  // dedup is per-call (see note above)
+
+    auto is_bad = [](const py::object &o) -> bool {
+        try { return o.attr("is_bad")().cast<bool>(); } catch (...) { return true; }
+    };
+    auto kid_of = [](const py::object &kf) -> int {
+        try { return kf.attr("kid").cast<int>(); } catch (...) { return -1; }
+    };
+
+    // 1. Votes: current frame's matched good points -> observing KFs (dedup by kid).
+    std::unordered_map<int, int> vote_count;
+    std::vector<py::object> vote_kf;  // first-seen kf per kid, in encounter order
+    {
+        py::object cur_pts = f_cur.attr("get_matched_good_points")();
+        for (auto item : cur_pts) {
+            py::object p = py::reinterpret_borrow<py::object>(item);
+            if (p.is_none() || is_bad(p)) continue;
+            py::object obs = p.attr("observations")();
+            for (auto o : obs) {
+                py::tuple t = o.cast<py::tuple>();
+                py::object kf = py::reinterpret_borrow<py::object>(t[0]);
+                if (kf.is_none() || is_bad(kf)) continue;
+                int kid = kid_of(kf);
+                if (kid < 0) continue;
+                auto it = vote_count.find(kid);
+                if (it == vote_count.end()) { vote_count[kid] = 1; vote_kf.push_back(kf); }
+                else { it->second++; }
+            }
+        }
+    }
+
+    // 2. Expanding local keyframes (transitive, capped at max_kfs).
+    std::vector<py::object> local_kfs;
+    std::vector<int> local_counts;
+    std::unordered_set<int> in_local;
+    for (auto &kf : vote_kf) {
+        local_kfs.push_back(kf);
+        local_counts.push_back(vote_count[kid_of(kf)]);
+        in_local.insert(kid_of(kf));
+    }
+    auto try_add = [&](py::object kf) -> bool {
+        if (kf.is_none() || is_bad(kf)) return false;
+        int kid = kid_of(kf);
+        if (kid < 0 || in_local.count(kid)) return false;
+        local_kfs.push_back(kf);
+        local_counts.push_back(1);
+        in_local.insert(kid);
+        return true;
+    };
+    for (std::size_t i = 0; i < local_kfs.size(); ++i) {
+        if (static_cast<int>(local_kfs.size()) >= max_kfs) break;
+        py::object kf = local_kfs[i];
+        try {
+            py::object neighbors = kf.attr("get_best_covisible_keyframes")(num_best);
+            for (auto n : neighbors)
+                if (try_add(py::reinterpret_borrow<py::object>(n))) break;
+        } catch (...) {}
+        try {
+            py::object children = kf.attr("get_children")();
+            for (auto c : children)
+                if (try_add(py::reinterpret_borrow<py::object>(c))) break;
+        } catch (...) {}
+        try { try_add(kf.attr("get_parent")()); } catch (...) {}
+    }
+
+    // sort by count desc (stable), keep top max_kfs
+    std::vector<std::size_t> order(local_kfs.size());
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](std::size_t a, std::size_t b) { return local_counts[a] > local_counts[b]; });
+    int n_keep = std::min<int>(max_kfs, static_cast<int>(order.size()));
+
+    py::list local_keyframes_out;
+    std::vector<py::object> kept;
+    kept.reserve(n_keep);
+    for (int i = 0; i < n_keep; ++i) {
+        local_keyframes_out.append(local_kfs[order[i]]);
+        kept.push_back(local_kfs[order[i]]);
+    }
+
+    // 3. Collect local points (per-call dedup by MapPoint identity).
+    auto is_good_mp = [](const py::object &p) -> bool {
+        if (p.is_none()) return false;
+        try { if (p.attr("is_bad")().cast<bool>()) return false; } catch (...) { return false; }
+        try { if (!p.attr("get_replacement")().is_none()) return false; } catch (...) {}
+        return true;
+    };
+    py::list local_points_out;
+    std::unordered_set<PyObject *> seen_pts;
+    for (auto &kf : kept) {
+        // get_points() = the C++ base method (full list incl None); the is_good_mp
+        // None-filter below makes this == the Python _collect's get_matched_points.
+        // Using the base method (not the Python-compat get_matched_points) keeps
+        // build_local_map runnable on raw C++ KeyFrames too (isolation-testable).
+        py::object pts;
+        try { pts = kf.attr("get_points")(); } catch (...) { continue; }
+        for (auto item : pts) {
+            py::object p = py::reinterpret_borrow<py::object>(item);
+            if (!is_good_mp(p)) continue;
+            if (!seen_pts.insert(p.ptr()).second) continue;
+            local_points_out.append(p);
+        }
+    }
+
+    return {local_keyframes_out, local_points_out};
 }
 
 }  // namespace cppcore

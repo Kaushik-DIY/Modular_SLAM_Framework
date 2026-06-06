@@ -60,4 +60,14 @@ std::pair<std::vector<int>, std::vector<int>> search_frame_by_projection(
     float max_reproj_distance, float max_descriptor_distance,
     float viewing_cos_limit, float min_depth, bool do_stereo_check);
 
+// F2: port of tracking._build_local_keyframes_from_votes +
+// _collect_local_points_from_keyframes (the expanding, pySLAM-faithful tracking
+// local map). `f_cur` = current Frame (py::object). Returns (local_keyframes,
+// local_points) so search_map_by_projection consumes the C++-built point list
+// without a per-point Python loop. Parity-faithful to OUR Python (see .cpp notes):
+// KFs deduped by KID; TRANSITIVE expansion (the index loop reads the growing
+// list) capped at max_kfs; local_points deduped per-call by MapPoint identity.
+std::pair<py::list, py::list> build_local_map(
+    py::object f_cur, int num_best, int max_kfs, int frame_id);
+
 }  // namespace cppcore
