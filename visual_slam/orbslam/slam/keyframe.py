@@ -48,9 +48,13 @@ def build_cpp_keyframe_from_frame(frame, kid):
         raise RuntimeError("cpp_slam_core.KeyFrame is unavailable")
     kf = _CppKeyFrameBase(kid=int(kid), frame_id=int(frame.id), camera=frame.camera)
     n = len(frame.kps)
-    kps_ur = getattr(frame, "kps_ur", None)
+    # Canonical stereo right-coords live in uRs (matches the Python KeyFrame:
+    # self.kps_ur = frame.uRs). frame.kps_ur may be a stale all-(-1) placeholder,
+    # so prefer uRs — using kps_ur would zero the stereo weights and halve
+    # num_observations downstream (breaks num_tracked_points / KF insertion).
+    kps_ur = getattr(frame, "uRs", None)
     if kps_ur is None:
-        kps_ur = getattr(frame, "uRs", None)
+        kps_ur = getattr(frame, "kps_ur", None)
     octaves = getattr(frame, "octaves", None)
     des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
     kf.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
@@ -331,9 +335,12 @@ class KeyFrame(*_make_keyframe_bases()):
         _CppKeyFrameBase.__init__(self, kid=kid_val, frame_id=int(frame.id),
                                   camera=frame.camera)
         n = len(frame.kps)
-        kps_ur = getattr(frame, "kps_ur", None)
+        # Stereo right-coords: prefer uRs (canonical; matches the Python KeyFrame).
+        # frame.kps_ur may be a stale all-(-1) placeholder -> would zero stereo
+        # weights and halve num_observations (breaks num_tracked_points/KF insertion).
+        kps_ur = getattr(frame, "uRs", None)
         if kps_ur is None:
-            kps_ur = getattr(frame, "uRs", None)
+            kps_ur = getattr(frame, "kps_ur", None)
         des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
         self.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
                                  kps_ur, getattr(frame, "octaves", None), n)

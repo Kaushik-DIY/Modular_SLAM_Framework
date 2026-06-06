@@ -66,6 +66,18 @@ def test_construction_feature_parity():
                                   np.asarray(frame.des, dtype=np.uint8))
 
 
+def test_construction_kps_ur_stereo_preserved():
+    """Stereo right-coords (uRs) must transfer — a stale all-(-1) frame.kps_ur must
+    NOT win, else stereo observations score weight 1 -> num_tracked_points collapses."""
+    frame = _make_real_frame()
+    n_valid = int(np.sum(np.asarray(frame.uRs) >= 0))
+    assert n_valid > 20, "RGB-D frame should have many valid stereo coords"
+    kf = build_cpp_keyframe_from_frame(frame, kid=11)
+    np.testing.assert_allclose(np.asarray(kf.kps_ur, dtype=np.float32),
+                               np.asarray(frame.uRs, dtype=np.float32), atol=1e-3)
+    assert int(np.sum(np.asarray(kf.kps_ur) >= 0)) == n_valid
+
+
 def test_construction_kpsu_matches_frame():
     frame = _make_real_frame()
     kf = build_cpp_keyframe_from_frame(frame, kid=8)
