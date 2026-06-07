@@ -266,6 +266,20 @@ void KeyFrame::update_connections() {
     std::sort(sorted_counter.begin(), sorted_counter.end(),
               [](const auto &a, const auto &b) { return a.second > b.second; });
 
+    // F4 invariant: write only pure-C++ state under _lock_connections; collect the
+    // cross-KF notifications (each calls into ANOTHER keyframe's locked methods via
+    // Python — a GIL op) and perform them OUTSIDE the lock. Holding our own
+    // _lock_connections while calling kf.add_connection_no_lock_/add_child would be a
+    // KF<->KF lock + GIL<->mutex inversion once the LM matcher runs GIL-released.
+    std::vector<std::pair<py::object, int>> notify;   // (kf, w) to add_connection_no_lock_
+    py::object parent_to_set;                          // kf_max if first connection set here
+
+    // The parent candidate's is_bad gate is a callout -> evaluate outside the lock.
+    bool kf_max_ok = false;
+    if (_is_first_connection && kid != 0 && !kf_max.is_none()) {
+        try { kf_max_ok = !kf_max.attr("is_bad")().cast<bool>(); } catch (...) { kf_max_ok = false; }
+    }
+
     {
         std::lock_guard<std::mutex> lk(_lock_connections);
         _covis_weights = counter;
@@ -274,31 +288,35 @@ void KeyFrame::update_connections() {
         if (w_max >= min_covis) {
             for (const auto &[kf, w] : sorted_counter) {
                 if (w >= min_covis) {
-                    // Notify other KF of connection (needs GIL — calling Python method)
-                    try {
-                        kf.attr("add_connection_no_lock_")(self_obj, py::int_(w));
-                    } catch (...) {}
+                    notify.push_back({kf, w});
                     _ordered_covis.push_back({kf, w});
                 } else {
                     break;
                 }
             }
         } else {
-            try {
-                kf_max.attr("add_connection_no_lock_")(self_obj, py::int_(w_max));
-            } catch (...) {}
+            notify.push_back({kf_max, w_max});
             _ordered_covis.push_back({kf_max, w_max});
         }
 
-        // Set spanning tree parent on first connection
-        if (_is_first_connection && kid != 0 && !kf_max.is_none()) {
-            try {
-                if (!kf_max.attr("is_bad")().cast<bool>()) {
-                    set_parent_no_lock_(kf_max);
-                    _is_first_connection = false;
-                }
-            } catch (...) {}
+        // Spanning-tree parent on first connection: pure-C++ state write here; the
+        // parent.add_child(self) notification is performed outside the lock below
+        // (mirrors set_parent_no_lock_, whose only callout is add_child).
+        if (_is_first_connection && kid != 0 && !kf_max.is_none() && kf_max_ok) {
+            _parent = kf_max;
+            _init_parent = true;
+            _is_first_connection = false;
+            parent_to_set = kf_max;
         }
+    }
+
+    // Cross-KF notifications OUTSIDE the lock.
+    for (auto &[kf, w] : notify) {
+        try { kf.attr("add_connection_no_lock_")(self_obj, py::int_(w)); } catch (...) {}
+    }
+    if (parent_to_set) {   // bool(py::object) is a NULL-ptr check (a default-constructed
+                           // py::object is NULL, not None — is_none() would be false on it)
+        try { parent_to_set.attr("add_child")(self_obj); } catch (...) {}
     }
 }
 
