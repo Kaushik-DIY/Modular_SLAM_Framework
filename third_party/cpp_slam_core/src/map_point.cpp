@@ -128,11 +128,16 @@ bool MapPoint::add_observation(py::object kf, int idx) {
 }
 
 void MapPoint::remove_observation(py::object kf, int idx, bool map_no_lock) {
-    // GIL must be held by caller
+    // GIL must be held by caller. INVARIANT (F4): do no GIL op (kf.attr) while holding
+    // _lock_features — it would invert against a GIL-released matcher/LM thread.
     bool do_remove_match = false;
     bool do_set_bad = false;
     int obs_idx = idx;
 
+    // Phase 1 (under lock, pure C++): erase the observation; snapshot the remaining
+    // keys if kf_ref must be recomputed. No kf.attr here.
+    bool recompute_kf_ref = false;
+    std::vector<py::object> remaining;
     {
         std::lock_guard<std::mutex> lk(_lock_features);
         auto it = _observations.find(kf);
@@ -143,27 +148,36 @@ void MapPoint::remove_observation(py::object kf, int idx, bool map_no_lock) {
 
         _observations.erase(it);
 
-        // Re-count weight for removed observation
-        int weight = 1;
-        try {
-            auto kps_ur = kf.attr("kps_ur");
-            if (!kps_ur.is_none()) {
-                auto ur_val = kps_ur[py::int_(obs_idx)];
-                if (!ur_val.is_none() && ur_val.cast<float>() >= 0.0f) weight = 2;
-            }
-        } catch (...) {}
-        _num_observations = std::max(0, _num_observations - weight);
-
-        do_set_bad = (_num_observations <= 2);
-
-        // Update kf_ref to the lowest-id remaining observation (deterministic;
-        // _observations.begin() would be pointer-order = run-to-run non-deterministic).
         if (!kf_ref.is_none() && kf_ref.ptr() == kf.ptr() && !_observations.empty()) {
-            auto it_min = std::min_element(
-                _observations.begin(), _observations.end(),
-                [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
-            kf_ref = it_min->first;
+            recompute_kf_ref = true;
+            remaining.reserve(_observations.size());
+            for (const auto &kv : _observations) remaining.push_back(kv.first);
         }
+    }
+
+    // Phase 2 (OUTSIDE lock, GIL ops): stereo weight + the lowest-kid kf_ref pick.
+    int weight = 1;
+    try {
+        auto kps_ur = kf.attr("kps_ur");
+        if (!kps_ur.is_none()) {
+            auto ur_val = kps_ur[py::int_(obs_idx)];
+            if (!ur_val.is_none() && ur_val.cast<float>() >= 0.0f) weight = 2;
+        }
+    } catch (...) {}
+
+    py::object new_kf_ref;
+    if (recompute_kf_ref && !remaining.empty()) {
+        new_kf_ref = *std::min_element(
+            remaining.begin(), remaining.end(),
+            [](const py::object &a, const py::object &b) { return _kf_sort_key(a) < _kf_sort_key(b); });
+    }
+
+    // Phase 3 (under lock, pure C++): apply the weight + kf_ref.
+    {
+        std::lock_guard<std::mutex> lk(_lock_features);
+        _num_observations = std::max(0, _num_observations - weight);
+        do_set_bad = (_num_observations <= 2);
+        if (recompute_kf_ref && !new_kf_ref.is_none()) kf_ref = new_kf_ref;
     }
 
     if (do_remove_match && obs_idx >= 0) {
@@ -178,20 +192,28 @@ void MapPoint::remove_observation(py::object kf, int idx, bool map_no_lock) {
 }
 
 std::vector<std::pair<py::object, int>> MapPoint::observations() const {
-    std::lock_guard<std::mutex> lk(_lock_features);
-    // Return in stable kid order (not the std::map's pointer-address order) so
-    // every downstream consumer is deterministic — notably local-BA edge assembly,
-    // whose g2o edge insertion order otherwise varies run-to-run -> float-summation
-    // differences that accumulate into trajectory drift.
-    std::vector<std::pair<py::object, int>> out(_observations.begin(), _observations.end());
+    // Snapshot under the lock; SORT outside it. The sort comparator (_kf_sort_key)
+    // touches kf.attr("kid") — a GIL operation — and holding _lock_features across a
+    // GIL op would create a GIL<->mutex inversion the moment the matcher/LM run
+    // GIL-released (F4). Returned in stable kid order (not std::map pointer order) so
+    // downstream consumers (notably local-BA edge assembly) are deterministic.
+    std::vector<std::pair<py::object, int>> out;
+    {
+        std::lock_guard<std::mutex> lk(_lock_features);
+        out.assign(_observations.begin(), _observations.end());
+    }
     std::sort(out.begin(), out.end(),
               [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
     return out;
 }
 
 std::vector<py::object> MapPoint::keyframes() const {
-    std::lock_guard<std::mutex> lk(_lock_features);
-    std::vector<std::pair<py::object, int>> obs(_observations.begin(), _observations.end());
+    std::vector<std::pair<py::object, int>> obs;
+    {
+        std::lock_guard<std::mutex> lk(_lock_features);
+        obs.assign(_observations.begin(), _observations.end());
+    }
+    // Sort OUTSIDE the lock (see observations(): _kf_sort_key is a GIL op).
     std::sort(obs.begin(), obs.end(),
               [](const auto &a, const auto &b) { return _kf_sort_key(a.first) < _kf_sort_key(b.first); });
     std::vector<py::object> kfs;
