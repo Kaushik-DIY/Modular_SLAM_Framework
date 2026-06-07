@@ -585,6 +585,23 @@ PYBIND11_MODULE(cpp_slam_core, m) {
           py::arg("min_depth"), py::arg("do_stereo_check"),
           "C++ search_frame_by_projection -> (idxs_ref, idxs_cur) pre-rotation-filter.");
 
+    m.def("search_and_fuse",
+          [](const py::list &points, py::object keyframe,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             py::array_t<float, py::array::c_style | py::array::forcecast> inv_level_sigmas2,
+             float max_reproj_distance, float max_descriptor_distance,
+             double log_scale_factor, int num_levels, float min_depth, float chi2_mono) {
+              return cppcore::search_and_fuse(
+                  points, keyframe, scale_factors, inv_level_sigmas2,
+                  max_reproj_distance, max_descriptor_distance,
+                  log_scale_factor, num_levels, min_depth, chi2_mono);
+          },
+          py::arg("points"), py::arg("keyframe"), py::arg("scale_factors"),
+          py::arg("inv_level_sigmas2"), py::arg("max_reproj_distance"),
+          py::arg("max_descriptor_distance"), py::arg("log_scale_factor"),
+          py::arg("num_levels"), py::arg("min_depth"), py::arg("chi2_mono"),
+          "C++ local-mapping search_and_fuse -> fused point count.");
+
     m.def("build_local_map", &cppcore::build_local_map,
           py::arg("f_cur"), py::arg("num_best"), py::arg("max_kfs"), py::arg("frame_id"),
           "F2 C++ expanding tracking local-map build -> (local_keyframes, local_points).");

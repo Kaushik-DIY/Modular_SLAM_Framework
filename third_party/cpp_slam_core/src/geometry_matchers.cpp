@@ -14,6 +14,7 @@
 namespace cppcore {
 
 using slam::Frame;
+using slam::KeyFrame;
 using slam::MapPoint;
 
 // Faithful port of visual_slam/orbslam/slam/geometry_matchers.py
@@ -265,6 +266,147 @@ std::pair<std::vector<int>, std::vector<int>> search_frame_by_projection(
     }
 
     return {idxs_ref_out, idxs_cur_out};
+}
+
+int search_and_fuse(
+    const py::list &points, py::object keyframe_obj,
+    py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+    py::array_t<float, py::array::c_style | py::array::forcecast> inv_level_sigmas2,
+    float max_reproj_distance, float max_descriptor_distance,
+    double log_scale_factor, int num_levels, float min_depth, float chi2_mono) {
+
+    KeyFrame *kf = nullptr;
+    try { kf = keyframe_obj.cast<KeyFrame *>(); } catch (...) { return 0; }
+    if (kf == nullptr || kf->is_bad()) return 0;
+
+    const float descriptor_gate = 0.5f * max_descriptor_distance;
+    if (!(descriptor_gate > 0.0f) || points.size() == 0) return 0;
+
+    struct Candidate {
+        py::object obj;
+        MapPoint *mp;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(points.size());
+    for (auto handle : points) {
+        py::object obj = py::reinterpret_borrow<py::object>(handle);
+        if (obj.is_none()) continue;
+        MapPoint *mp = nullptr;
+        try { mp = obj.cast<MapPoint *>(); } catch (...) { continue; }
+        if (mp == nullptr || mp->is_bad()) continue;
+        if (mp->is_in_keyframe(keyframe_obj)) continue;
+        candidates.push_back({obj, mp});
+    }
+    if (candidates.empty()) return 0;
+
+    // Cache Python camera intrinsics while the GIL is still held; projection is
+    // pure C++ after this point.
+    (void)kf->is_in_image(0.0, 0.0, 1.0);
+
+    struct FuseMatch {
+        int candidate_idx;
+        int keypoint_idx;
+    };
+    std::vector<FuseMatch> matches;
+    matches.reserve(candidates.size());
+
+    const float *sf = scale_factors.data();
+    const int n_scale = static_cast<int>(scale_factors.size());
+    const float *inv_sigmas = inv_level_sigmas2.data();
+    const int n_sigmas = static_cast<int>(inv_level_sigmas2.size());
+    const int n_feat = static_cast<int>(kf->octaves.size());
+    const Eigen::Vector3d Ow = kf->Ow();
+
+    {
+        py::gil_scoped_release release;
+
+        for (int ci = 0; ci < static_cast<int>(candidates.size()); ++ci) {
+            MapPoint *mp = candidates[ci].mp;
+            if (mp == nullptr) continue;
+
+            const Eigen::Vector3d pw = mp->get_position();
+            if (!pw.allFinite() || pw.norm() > 1.0e9) continue;
+
+            const Eigen::Vector3d uvz = kf->project_world(pw);
+            const double u = uvz(0), v = uvz(1), z = uvz(2);
+            if (!(z > min_depth)) continue;
+            if (!kf->is_in_image(u, v, z)) continue;
+
+            const Eigen::Vector3d PO = pw - Ow;
+            const double dist = PO.norm();
+
+            int predicted_level = 0;
+            const double max_d = static_cast<double>(mp->max_distance());
+            if (max_d > 0.0 && std::isfinite(max_d) && log_scale_factor > 0.0) {
+                const double ratio = max_d / std::max(dist, 1e-12);
+                int level = static_cast<int>(std::ceil(std::log(ratio) / log_scale_factor));
+                if (level < 0) level = 0;
+                else if (level >= num_levels) level = num_levels - 1;
+                predicted_level = level;
+            }
+
+            const float kp_scale =
+                (predicted_level >= 0 && predicted_level < n_scale) ? sf[predicted_level] : 1.0f;
+            const float radius = max_reproj_distance * kp_scale;
+            const std::vector<int> kd_idxs =
+                kf->kd_query_ball(static_cast<float>(u), static_cast<float>(v), radius);
+            if (kd_idxs.empty()) continue;
+
+            float best_dist = std::numeric_limits<float>::infinity();
+            int best_kd_idx = -1;
+
+            for (int kd_idx : kd_idxs) {
+                if (kd_idx < 0 || kd_idx >= n_feat) continue;
+                const int kp_level = kf->octaves(kd_idx);
+                if (kp_level < predicted_level - 1 || kp_level > predicted_level) continue;
+
+                const float inv_sigma2 =
+                    (kp_level >= 0 && kp_level < n_sigmas) ? inv_sigmas[kp_level] : 1.0f;
+                const double dx = u - static_cast<double>(kf->kpsu(kd_idx, 0));
+                const double dy = v - static_cast<double>(kf->kpsu(kd_idx, 1));
+                const double chi2 = (dx * dx + dy * dy) * static_cast<double>(inv_sigma2);
+                if (chi2 > static_cast<double>(chi2_mono)) continue;
+
+                const float descriptor_dist = mp->min_des_distance(kf->des.row(kd_idx));
+                if (descriptor_dist < best_dist) {
+                    best_dist = descriptor_dist;
+                    best_kd_idx = kd_idx;
+                }
+            }
+
+            if (best_kd_idx > -1 && best_dist < descriptor_gate) {
+                matches.push_back({ci, best_kd_idx});
+            }
+        }
+    }
+
+    int fused_pts_count = 0;
+    for (const auto &m : matches) {
+        Candidate &cand = candidates[m.candidate_idx];
+        MapPoint *point = cand.mp;
+        if (point == nullptr) continue;
+
+        py::object existing = kf->get_point_match(m.keypoint_idx);
+        if (!existing.is_none()) {
+            MapPoint *existing_mp = nullptr;
+            try { existing_mp = existing.cast<MapPoint *>(); } catch (...) { existing_mp = nullptr; }
+            if (existing_mp != nullptr) {
+                if (existing_mp->num_observations() > point->num_observations()) {
+                    point->replace_with(existing_mp->shared_from_this());
+                } else {
+                    existing_mp->replace_with(point->shared_from_this());
+                    point->add_observation(keyframe_obj, m.keypoint_idx);
+                }
+            }
+        } else {
+            point->add_observation(keyframe_obj, m.keypoint_idx);
+        }
+
+        point->update_info();
+        ++fused_pts_count;
+    }
+
+    return fused_pts_count;
 }
 
 // ---- F2: expanding tracking local-map build --------------------------------

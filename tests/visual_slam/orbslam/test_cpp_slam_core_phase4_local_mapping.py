@@ -298,6 +298,34 @@ class TestLocalBA:
 
 
 class TestFuseMapPoints:
+    def test_native_search_and_fuse_adds_observation(self):
+        """Native fuse matcher projects a C++ MapPoint into a C++ KeyFrame."""
+        import cpp_slam_core
+        from types import SimpleNamespace
+
+        camera = SimpleNamespace(
+            fx=100.0, fy=100.0, cx=320.0, cy=240.0,
+            width=640, height=480, bf=0.0,
+        )
+        kf = cpp_slam_core.KeyFrame(kid=10, frame_id=10, camera=camera)
+        des = np.zeros((1, 32), dtype=np.uint8)
+        kps = [cv2.KeyPoint(x=320.0, y=240.0, size=1.0, octave=0)]
+        kf.init_feature_arrays(kps, des, None, None, 1)
+
+        mp = cpp_slam_core.MapPoint(np.array([0.0, 0.0, 5.0], dtype=np.float64))
+        mp.set_des(des[0])
+
+        n_fused = cpp_slam_core.search_and_fuse(
+            [mp], kf,
+            np.ones(8, dtype=np.float32),
+            np.ones(8, dtype=np.float32),
+            3.0, 50.0, float(np.log(1.2)), 8, 1e-2, 5.991,
+        )
+
+        assert n_fused == 1
+        assert kf.get_point_match(0) is mp
+        assert mp.is_in_keyframe(kf)
+
     def test_returns_int(self):
         """fuse_map_points() returns an integer (number of fused points)."""
         import cpp_slam_core

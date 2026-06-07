@@ -1,5 +1,7 @@
 #include "local_mapping_core.h"
 
+#include "geometry_matchers.h"
+
 #include <algorithm>
 
 namespace slam {
@@ -211,16 +213,64 @@ int LocalMappingCore::fuse_map_points(float desc_dist_sigma, py::object pm_cls) 
     std::vector<py::object> local_kfs = _get_neighbor_keyframes(num_neighbors);
     int total = 0;
 
+    py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors;
+    py::array_t<float, py::array::c_style | py::array::forcecast> inv_level_sigmas2;
+    double log_scale_factor = 0.0;
+    int num_levels = 0;
+    float min_depth = 1.0e-2f;
+    float chi2_mono = 5.991f;
+    bool native_ready = py::isinstance<KeyFrame>(kf_cur);
+    if (native_ready) {
+        try {
+            py::object shared = py::module_::import(
+                "visual_slam.orbslam.slam.feature_tracker_shared").attr("FeatureTrackerShared");
+            py::object fm = shared.attr("feature_manager");
+            if (fm.is_none()) {
+                native_ready = false;
+            } else {
+                scale_factors = fm.attr("scale_factors").cast<
+                    py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                inv_level_sigmas2 = fm.attr("inv_level_sigmas2").cast<
+                    py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                log_scale_factor = fm.attr("log_scale_factor").cast<double>();
+                num_levels = fm.attr("num_levels").cast<int>();
+            }
+
+            py::object params = py::module_::import(
+                "visual_slam.orbslam.slam.config_parameters").attr("Parameters");
+            min_depth = params.attr("kMinDepth").cast<float>();
+            chi2_mono = params.attr("kChi2Mono").cast<float>();
+        } catch (...) {
+            native_ready = false;
+        }
+    }
+
     // 1. Fuse current KF points into each neighbor.
     auto cur_pts = kf_cur.attr("get_matched_good_points")();
+    py::list cur_pts_list;
+    if (native_ready) {
+        try {
+            for (auto item : cur_pts) cur_pts_list.append(py::reinterpret_borrow<py::object>(item));
+        } catch (...) {
+            native_ready = false;
+        }
+    }
     for (const auto &kf : local_kfs) {
         try {
-            int n = pm_cls.attr("search_and_fuse")(
-                cur_pts, kf,
-                py::arg("max_reproj_distance") = max_reproj_dist,
-                py::arg("max_descriptor_distance") = desc_dist_sigma,
-                py::arg("ratio_test") = ratio_test
-            ).cast<int>();
+            int n = 0;
+            if (native_ready && py::isinstance<KeyFrame>(kf)) {
+                n = cppcore::search_and_fuse(
+                    cur_pts_list, kf, scale_factors, inv_level_sigmas2,
+                    max_reproj_dist, desc_dist_sigma, log_scale_factor, num_levels,
+                    min_depth, chi2_mono);
+            } else {
+                n = pm_cls.attr("search_and_fuse")(
+                    cur_pts, kf,
+                    py::arg("max_reproj_distance") = max_reproj_dist,
+                    py::arg("max_descriptor_distance") = desc_dist_sigma,
+                    py::arg("ratio_test") = ratio_test
+                ).cast<int>();
+            }
             total += n;
         } catch (...) {}
     }
@@ -247,12 +297,20 @@ int LocalMappingCore::fuse_map_points(float desc_dist_sigma, py::object pm_cls) 
     try {
         py::list cand_list;
         for (auto &p : fuse_candidates) cand_list.append(p);
-        int n = pm_cls.attr("search_and_fuse")(
-            cand_list, kf_cur,
-            py::arg("max_reproj_distance") = max_reproj_dist,
-            py::arg("max_descriptor_distance") = desc_dist_sigma,
-            py::arg("ratio_test") = ratio_test
-        ).cast<int>();
+        int n = 0;
+        if (native_ready) {
+            n = cppcore::search_and_fuse(
+                cand_list, kf_cur, scale_factors, inv_level_sigmas2,
+                max_reproj_dist, desc_dist_sigma, log_scale_factor, num_levels,
+                min_depth, chi2_mono);
+        } else {
+            n = pm_cls.attr("search_and_fuse")(
+                cand_list, kf_cur,
+                py::arg("max_reproj_distance") = max_reproj_dist,
+                py::arg("max_descriptor_distance") = desc_dist_sigma,
+                py::arg("ratio_test") = ratio_test
+            ).cast<int>();
+        }
         total += n;
     } catch (...) {}
 

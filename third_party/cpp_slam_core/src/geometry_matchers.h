@@ -60,6 +60,16 @@ std::pair<std::vector<int>, std::vector<int>> search_frame_by_projection(
     float max_reproj_distance, float max_descriptor_distance,
     float viewing_cos_limit, float min_depth, bool do_stereo_check);
 
+// Port of ProjectionMatcher._search_and_fuse for local mapping. The projection
+// and descriptor-search loop runs natively; the observation/replacement writes
+// are applied afterward with the GIL held.
+int search_and_fuse(
+    const py::list &points, py::object keyframe_obj,
+    py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+    py::array_t<float, py::array::c_style | py::array::forcecast> inv_level_sigmas2,
+    float max_reproj_distance, float max_descriptor_distance,
+    double log_scale_factor, int num_levels, float min_depth, float chi2_mono);
+
 // F2: port of tracking._build_local_keyframes_from_votes +
 // _collect_local_points_from_keyframes (the expanding, pySLAM-faithful tracking
 // local map). `f_cur` = current Frame (py::object). Returns (local_keyframes,
