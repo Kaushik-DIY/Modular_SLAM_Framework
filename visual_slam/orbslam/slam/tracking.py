@@ -24,8 +24,10 @@ from visual_slam.orbslam.slam.map import Map
 try:
     import cpp_slam_core as _cpp_core
     _cpp_build_local_map = getattr(_cpp_core, "build_local_map", None)
+    _cpp_mark_current_frame_matched_points_seen = getattr(_cpp_core, "mark_current_frame_matched_points_seen", None)
 except Exception:
     _cpp_build_local_map = None
+    _cpp_mark_current_frame_matched_points_seen = None
 _USE_CPP_LOCAL_MAP = bool(getattr(Parameters, "USE_CPP_KEYFRAME", False)) and (_cpp_build_local_map is not None)
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.motion_model import MotionModel
@@ -747,8 +749,8 @@ class Tracking:
                     int(Parameters.kMaxNumOfKeyframesInLocalMap),
                     int(getattr(self.f_cur, "id", -1)),
                 )
-                self.local_keyframes = list(lk)
-                self.local_points = list(lp)
+                self.local_keyframes = lk if isinstance(lk, list) else list(lk)
+                self.local_points = lp if isinstance(lp, list) else list(lp)
             else:
                 self.local_keyframes = self._build_local_keyframes_from_votes(
                     keyframe_votes,
@@ -802,7 +804,10 @@ class Tracking:
             local_map_build_sec = time.perf_counter() - local_map_build_start
 
             if len(self.local_points) > 0:
-                self._mark_current_frame_matched_points_seen(self.f_cur)
+                if _cpp_mark_current_frame_matched_points_seen is not None:
+                    _cpp_mark_current_frame_matched_points_seen(self.f_cur)
+                else:
+                    self._mark_current_frame_matched_points_seen(self.f_cur)
                 search_start = time.perf_counter()
                 found_pts_count, found_pts_fidxs = ProjectionMatcher.search_map_by_projection(
                     self.local_points,

@@ -152,6 +152,40 @@ std::pair<int, std::vector<int>> search_map_by_projection(
     return {found_count, found_fidxs};
 }
 
+int mark_current_frame_matched_points_seen(py::object f_cur) {
+    if (f_cur.is_none()) return 0;
+
+    int frame_id = -1;
+    try {
+        frame_id = py::cast<int>(f_cur.attr("id"));
+    } catch (...) {
+        return 0;
+    }
+
+    auto as_mp = [](const py::object &o) -> slam::MapPoint * {
+        if (o.is_none()) return nullptr;
+        try { return o.cast<slam::MapPoint *>(); } catch (...) { return nullptr; }
+    };
+
+    int marked = 0;
+    py::object cur_pts;
+    try {
+        cur_pts = f_cur.attr("get_matched_good_points")();
+    } catch (...) {
+        return 0;
+    }
+    for (auto item : cur_pts) {
+        py::object pobj = py::reinterpret_borrow<py::object>(item);
+        slam::MapPoint *mp = as_mp(pobj);
+        if (!mp || mp->is_bad()) continue;
+        if (mp->get_replacement()) continue;
+        mp->increase_visible();
+        mp->last_frame_id_seen = frame_id;
+        ++marked;
+    }
+    return marked;
+}
+
 // Faithful port of _search_frame_by_projection (see header). The visibility prep
 // (project + in-image + depth + 0.8*min/1.2*max distance window + viewing-cos) is
 // identical to search_map (both Python functions share

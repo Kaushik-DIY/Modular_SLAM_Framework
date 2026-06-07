@@ -75,8 +75,9 @@ def _search_map_by_projection_cpp(points, f_cur, max_reproj_distance,
     scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
     mdd = float(_max_descriptor_distance(max_descriptor_distance))
     far = float(far_points_threshold) if far_points_threshold is not None else float("inf")
+    points_arg = points if isinstance(points, list) else list(points)
     found_count, found_fidxs = _cpp_slam_core.search_map_by_projection(
-        list(points), cpp_frame, scale_factors,
+        points_arg, cpp_frame, scale_factors,
         float(max_reproj_distance), mdd, float(ratio_test),
         float(Parameters.kViewingCosLimitForPoint), float(Parameters.kMinDepth), far,
         float(fm.log_scale_factor), int(fm.num_levels),

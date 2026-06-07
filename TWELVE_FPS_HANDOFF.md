@@ -17,12 +17,23 @@
   you do goes wrong, you can always `git checkout d0c774f` and rebuild to get back to a
   known-good, fully-validated state.
 - **What is DONE:** F0 (baseline), F1 (C++ KeyFrame wired), F2 (C++ local-map build), and the
-  **F4 deadlock-class invariant** (commits `a9fb879`, `6f3f855`, `d0c774f`). The flag-on path is
-  correct and parity-clean; the threaded path completes without deadlock.
-- **What is NOT done (the actual fps win):** **F4(2/N)b — GIL-release the local-mapping
-  matcher so local mapping overlaps tracking.** This requires porting `LocalMappingCore` to
-  native C++. Plus the optional F3 (C++ `tracking_core`) and F5 (map-density reduction).
-  **This is your main task. See §6.**
+  **F4 deadlock-class invariant** (commits `a9fb879`, `6f3f855`, `d0c774f`). Since this handoff
+  was first written, native local-mapping fuse (`550b6b3`) and native triangulation epipolar
+  matching (`4b29341`) were also added and validated.
+- **Current full-run reference:** checkpoint
+  `visual_slam/reference_audit/checkpoint_2_37_full_lab_native_lm_fuse_triang_threaded_20260607/`
+  completed all 4494 lab frames at commit `4b29341` with `tracking_lost_count=76`,
+  `final_state=OK`, and `avg_fps=2.86`. Tracking loss is now a `MONITOR` flag: raise it to
+  high priority only if later full lab runs grow materially above this range; otherwise revisit
+  after the remaining runtime-efficiency porting.
+- **Latest implementation step:** native `mark_current_frame_matched_points_seen` plus removal
+  of redundant local-map/projection list copies in the C++ tracking path. Short validation:
+  targeted tests passed, sequential 600-frame lab run had 0 lost / 3.84 FPS, threaded 600-frame
+  lab run had 0 lost / 5.09 FPS.
+- **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
+  work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
+  F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
+  orchestration) and by further reducing Python/GIL work in local mapping/BA write-back.
 
 ---
 

@@ -41,6 +41,11 @@ std::pair<int, std::vector<int>> search_map_by_projection(
     py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
     const MatchParams &p);
 
+// Native helper for tracking._mark_current_frame_matched_points_seen. This is
+// intentionally separate from search_map_by_projection because pySLAM marks
+// already-matched current-frame points visible before searching the local map.
+int mark_current_frame_matched_points_seen(py::object f_cur);
+
 // Port of _search_frame_by_projection. `ref_points` = the reference frame's
 // matched map points (pre-filtered in Python: non-outlier, not already-matched);
 // `ref_idxs`/`ref_octaves` are the parallel actual f_ref feature indices and

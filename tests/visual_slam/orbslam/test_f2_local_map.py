@@ -135,7 +135,26 @@ def test_build_local_map_empty_frame():
     assert list(cpp_kfs) == [] and list(cpp_pts) == []
 
 
+def test_mark_current_frame_matched_points_seen():
+    """Native helper matches tracking._mark_current_frame_matched_points_seen effects."""
+    f_cur = _make_kf(300, n_kps=4)
+    good = cpp_slam_core.MapPoint([0.0, 0.0, 3.0])
+    bad = cpp_slam_core.MapPoint([1.0, 0.0, 3.0])
+    bad.set_bad()
+    f_cur.set_point_match(good, 0)
+    f_cur.set_point_match(bad, 1)
+
+    visible_before = good.num_times_visible
+    marked = cpp_slam_core.mark_current_frame_matched_points_seen(f_cur)
+
+    assert marked == 1
+    assert good.num_times_visible == visible_before + 1
+    assert good.last_frame_id_seen == f_cur.id
+    assert bad.last_frame_id_seen != f_cur.id
+
+
 if __name__ == "__main__":
     test_build_local_map_parity()
     test_build_local_map_empty_frame()
+    test_mark_current_frame_matched_points_seen()
     print("F2_LOCAL_MAP_PARITY_OK")

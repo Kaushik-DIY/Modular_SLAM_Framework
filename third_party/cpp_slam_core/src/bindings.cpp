@@ -568,6 +568,10 @@ PYBIND11_MODULE(cpp_slam_core, m) {
           py::arg("far_points_threshold"), py::arg("log_scale_factor"), py::arg("num_levels"),
           "C++ search_map_by_projection -> (found_count, matched_feature_idxs).");
 
+    m.def("mark_current_frame_matched_points_seen", &cppcore::mark_current_frame_matched_points_seen,
+          py::arg("f_cur"),
+          "C++ tracking helper: mark current-frame matched good points visible/seen.");
+
     m.def("search_frame_by_projection",
           [](const py::list &ref_points, const std::vector<int> &ref_idxs,
              const std::vector<int> &ref_octaves, py::object f_cur,
