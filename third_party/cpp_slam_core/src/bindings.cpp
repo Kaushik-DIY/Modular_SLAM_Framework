@@ -585,6 +585,22 @@ PYBIND11_MODULE(cpp_slam_core, m) {
           py::arg("min_depth"), py::arg("do_stereo_check"),
           "C++ search_frame_by_projection -> (idxs_ref, idxs_cur) pre-rotation-filter.");
 
+    m.def("search_frame_for_triangulation",
+          [](py::object f1, py::object f2,
+             const std::vector<int> &idxs1, const std::vector<int> &idxs2,
+             py::array_t<float, py::array::c_style | py::array::forcecast> level_sigmas2,
+             const std::vector<float> &angles1, const std::vector<float> &angles2,
+             float max_descriptor_distance, float matcher_ratio_test, bool check_orientation) {
+              return cppcore::search_frame_for_triangulation(
+                  f1, f2, idxs1, idxs2, level_sigmas2, angles1, angles2,
+                  max_descriptor_distance, matcher_ratio_test, check_orientation);
+          },
+          py::arg("f1"), py::arg("f2"), py::arg("idxs1"), py::arg("idxs2"),
+          py::arg("level_sigmas2"), py::arg("angles1"), py::arg("angles2"),
+          py::arg("max_descriptor_distance"), py::arg("matcher_ratio_test"),
+          py::arg("check_orientation"),
+          "C++ EpipolarMatcher.search_frame_for_triangulation -> (idxs1, idxs2, count).");
+
     m.def("search_and_fuse",
           [](const py::list &points, py::object keyframe,
              py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,

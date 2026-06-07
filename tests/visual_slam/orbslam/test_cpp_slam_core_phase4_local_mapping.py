@@ -326,6 +326,61 @@ class TestFuseMapPoints:
         assert kf.get_point_match(0) is mp
         assert mp.is_in_keyframe(kf)
 
+    def test_native_search_frame_for_triangulation_matches_python_filter(self):
+        """Native epipolar triangulation matcher agrees with the Python filter."""
+        import cpp_slam_core
+        from types import SimpleNamespace
+        from visual_slam.orbslam.slam.config_parameters import Parameters
+        from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
+        from visual_slam.orbslam.slam.geometry_matchers import EpipolarMatcher
+
+        K = np.array([[100.0, 0.0, 320.0], [0.0, 100.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        camera = SimpleNamespace(
+            fx=100.0, fy=100.0, cx=320.0, cy=240.0,
+            width=640, height=480, bf=10.0, K=K, Kinv=np.linalg.inv(K),
+        )
+        kf1 = cpp_slam_core.KeyFrame(kid=20, frame_id=20, camera=camera)
+        kf2 = cpp_slam_core.KeyFrame(kid=21, frame_id=21, camera=camera)
+        des = np.zeros((1, 32), dtype=np.uint8)
+        kps1 = [cv2.KeyPoint(x=320.0, y=240.0, size=1.0, octave=0)]
+        kps2 = [cv2.KeyPoint(x=318.0, y=240.0, size=1.0, octave=0)]
+        kf1.init_feature_arrays(kps1, des, None, None, 1)
+        kf2.init_feature_arrays(kps2, des.copy(), None, None, 1)
+        kf1.kps = kps1
+        kf2.kps = kps2
+        kf1.update_pose(np.eye(4, dtype=np.float64))
+        Tcw2 = np.eye(4, dtype=np.float64)
+        Tcw2[0, 3] = -0.1
+        kf2.update_pose(Tcw2)
+        kf1.angles = np.array([0.0], dtype=np.float32)
+        kf2.angles = np.array([0.0], dtype=np.float32)
+
+        old_cpp = Parameters.USE_CPP_CORE
+        old_fm = FeatureTrackerShared.feature_manager
+        old_dist = FeatureTrackerShared.descriptor_distance
+        old_oriented = FeatureTrackerShared.oriented_features
+        try:
+            FeatureTrackerShared.feature_manager = SimpleNamespace(level_sigmas2=np.ones(8, dtype=np.float32))
+            FeatureTrackerShared.descriptor_distance = lambda a, b: cv2.norm(a, b, cv2.NORM_HAMMING)
+            FeatureTrackerShared.oriented_features = False
+            Parameters.USE_CPP_CORE = False
+            py1, py2, pyn = EpipolarMatcher.search_frame_for_triangulation(
+                kf1, kf2, [0], [0], max_descriptor_distance=50.0, is_monocular=False
+            )
+            cpp1, cpp2, cppn = cpp_slam_core.search_frame_for_triangulation(
+                kf1, kf2, [0], [0], np.ones(8, dtype=np.float32), [0.0], [0.0],
+                50.0, 0.7, False,
+            )
+        finally:
+            Parameters.USE_CPP_CORE = old_cpp
+            FeatureTrackerShared.feature_manager = old_fm
+            FeatureTrackerShared.descriptor_distance = old_dist
+            FeatureTrackerShared.oriented_features = old_oriented
+
+        assert cppn == pyn == 1
+        assert list(cpp1) == list(py1) == [0]
+        assert list(cpp2) == list(py2) == [0]
+
     def test_returns_int(self):
         """fuse_map_points() returns an integer (number of fused points)."""
         import cpp_slam_core

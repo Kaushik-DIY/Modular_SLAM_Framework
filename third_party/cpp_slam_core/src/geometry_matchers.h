@@ -10,6 +10,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -59,6 +60,16 @@ std::pair<std::vector<int>, std::vector<int>> search_frame_by_projection(
     py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
     float max_reproj_distance, float max_descriptor_distance,
     float viewing_cos_limit, float min_depth, bool do_stereo_check);
+
+// Port of EpipolarMatcher.search_frame_for_triangulation. If idxs1/idxs2 are
+// empty it first BF-ratio-matches currently-unmatched features, then applies the
+// descriptor threshold, epipolar-line chi2 gate, and optional orientation filter.
+std::tuple<std::vector<int>, std::vector<int>, int> search_frame_for_triangulation(
+    py::object f1_obj, py::object f2_obj,
+    const std::vector<int> &idxs1_in, const std::vector<int> &idxs2_in,
+    py::array_t<float, py::array::c_style | py::array::forcecast> level_sigmas2,
+    const std::vector<float> &angles1, const std::vector<float> &angles2,
+    float max_descriptor_distance, float matcher_ratio_test, bool check_orientation);
 
 // Port of ProjectionMatcher._search_and_fuse for local mapping. The projection
 // and descriptor-search loop runs natively; the observation/replacement writes

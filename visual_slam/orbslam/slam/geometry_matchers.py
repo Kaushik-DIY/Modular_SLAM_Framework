@@ -31,9 +31,11 @@ kCheckFeaturesOrientation = Parameters.kCheckFeaturesOrientation
 try:
     import cpp_slam_core as _cpp_slam_core
     _CppFrame = getattr(_cpp_slam_core, "Frame", None)
+    _CppKeyFrame = getattr(_cpp_slam_core, "KeyFrame", None)
 except ImportError:
     _cpp_slam_core = None
     _CppFrame = None
+    _CppKeyFrame = None
 
 
 def _ensure_cpp_frame_mirror(f_cur):
@@ -377,6 +379,45 @@ class EpipolarMatcher:
         It returns only matches where both keypoints currently have no assigned
         map point, which is the intended local-mapping triangulation input.
         """
+        if (
+            Parameters.USE_CPP_CORE
+            and _cpp_slam_core is not None
+            and hasattr(_cpp_slam_core, "search_frame_for_triangulation")
+            and _CppKeyFrame is not None
+            and isinstance(f1, _CppKeyFrame)
+            and isinstance(f2, _CppKeyFrame)
+        ):
+            try:
+                max_dist = float(_max_descriptor_distance(max_descriptor_distance))
+                fm = FeatureTrackerShared.feature_manager
+                matcher = FeatureTrackerShared.feature_matcher
+                level_sigmas2 = np.asarray(
+                    fm.level_sigmas2 if fm is not None else np.ones(8, dtype=np.float32),
+                    dtype=np.float32,
+                )
+                ratio = float(getattr(matcher, "ratio_test", 0.7))
+                idxs1_arg = [] if idxs1 is None else [int(i) for i in np.asarray(idxs1, dtype=np.int32).reshape(-1)]
+                idxs2_arg = [] if idxs2 is None else [int(i) for i in np.asarray(idxs2, dtype=np.int32).reshape(-1)]
+                out1, out2, n = _cpp_slam_core.search_frame_for_triangulation(
+                    f1,
+                    f2,
+                    idxs1_arg,
+                    idxs2_arg,
+                    level_sigmas2,
+                    [float(a) for a in np.asarray(getattr(f1, "angles", []), dtype=np.float32).reshape(-1)],
+                    [float(a) for a in np.asarray(getattr(f2, "angles", []), dtype=np.float32).reshape(-1)],
+                    max_dist,
+                    ratio,
+                    bool(FeatureTrackerShared.oriented_features),
+                )
+                return (
+                    np.asarray(out1, dtype=np.int32),
+                    np.asarray(out2, dtype=np.int32),
+                    int(n),
+                )
+            except Exception:
+                pass
+
         ensure_frame_feature_arrays(f1)
         ensure_frame_feature_arrays(f2)
 

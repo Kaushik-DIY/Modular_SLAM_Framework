@@ -11,6 +11,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <opencv2/features2d.hpp>
+
 namespace cppcore {
 
 using slam::Frame;
@@ -266,6 +268,234 @@ std::pair<std::vector<int>, std::vector<int>> search_frame_by_projection(
     }
 
     return {idxs_ref_out, idxs_cur_out};
+}
+
+static std::vector<int> rotation_histogram_valid_idxs(
+    const std::vector<int> &idxs1, const std::vector<int> &idxs2,
+    const std::vector<float> &angles1, const std::vector<float> &angles2) {
+    constexpr int kHistLen = 12;
+    if (idxs1.empty() || idxs2.empty() || idxs1.size() != idxs2.size()) return {};
+    if (angles1.empty() || angles2.empty()) {
+        std::vector<int> all(idxs1.size());
+        for (int i = 0; i < static_cast<int>(idxs1.size()); ++i) all[i] = i;
+        return all;
+    }
+
+    std::vector<std::vector<int>> hist(kHistLen);
+    const double factor = static_cast<double>(kHistLen) / 360.0;
+    for (int i = 0; i < static_cast<int>(idxs1.size()); ++i) {
+        const int i1 = idxs1[i], i2 = idxs2[i];
+        if (i1 < 0 || i2 < 0 ||
+            i1 >= static_cast<int>(angles1.size()) || i2 >= static_cast<int>(angles2.size())) {
+            continue;
+        }
+        double rot = std::fmod(static_cast<double>(angles1[i1] - angles2[i2]), 360.0);
+        if (rot < 0.0) rot += 360.0;
+        int bin = static_cast<int>(std::round(rot * factor));
+        if (bin == kHistLen) bin = 0;
+        if (bin >= 0 && bin < kHistLen) hist[bin].push_back(i);
+    }
+
+    std::vector<int> bins(kHistLen);
+    for (int i = 0; i < kHistLen; ++i) bins[i] = i;
+    std::sort(bins.begin(), bins.end(), [&](int a, int b) {
+        const auto ca = hist[a].size();
+        const auto cb = hist[b].size();
+        if (ca != cb) return ca > cb;
+        return a > b;  // matches np.argsort(counts)[::-1] tie order.
+    });
+
+    int max1 = bins[0], max2 = bins[1], max3 = bins[2];
+    if (hist[max2].size() < 0.1 * static_cast<double>(hist[max1].size())) max2 = -1;
+    if (hist[max3].size() < 0.1 * static_cast<double>(hist[max1].size())) max3 = -1;
+
+    std::vector<int> valid;
+    if (max1 != -1) valid.insert(valid.end(), hist[max1].begin(), hist[max1].end());
+    if (max2 != -1) valid.insert(valid.end(), hist[max2].begin(), hist[max2].end());
+    if (max3 != -1) valid.insert(valid.end(), hist[max3].begin(), hist[max3].end());
+    return valid;
+}
+
+std::tuple<std::vector<int>, std::vector<int>, int> search_frame_for_triangulation(
+    py::object f1_obj, py::object f2_obj,
+    const std::vector<int> &idxs1_in, const std::vector<int> &idxs2_in,
+    py::array_t<float, py::array::c_style | py::array::forcecast> level_sigmas2,
+    const std::vector<float> &angles1, const std::vector<float> &angles2,
+    float max_descriptor_distance, float matcher_ratio_test, bool check_orientation) {
+
+    KeyFrame *f1 = nullptr;
+    KeyFrame *f2 = nullptr;
+    try {
+        f1 = f1_obj.cast<KeyFrame *>();
+        f2 = f2_obj.cast<KeyFrame *>();
+    } catch (...) {
+        return {{}, {}, 0};
+    }
+    if (f1 == nullptr || f2 == nullptr || f1->is_bad() || f2->is_bad()) return {{}, {}, 0};
+    if (!(max_descriptor_distance > 0.0f)) return {{}, {}, 0};
+
+    const int n1 = f1->des.rows;
+    const int n2 = f2->des.rows;
+    if (n1 <= 0 || n2 <= 0) return {{}, {}, 0};
+
+    std::vector<char> unmatched1(n1, 0), unmatched2(n2, 0);
+    std::vector<int> candidate1, candidate2;
+    candidate1.reserve(n1);
+    candidate2.reserve(n2);
+    for (int i = 0; i < n1; ++i) {
+        if (i >= static_cast<int>(f1->points.size()) || f1->points[i].is_none()) {
+            unmatched1[i] = 1;
+            candidate1.push_back(i);
+        }
+    }
+    for (int i = 0; i < n2; ++i) {
+        if (i >= static_cast<int>(f2->points.size()) || f2->points[i].is_none()) {
+            unmatched2[i] = 1;
+            candidate2.push_back(i);
+        }
+    }
+    if (candidate1.empty() || candidate2.empty()) return {{}, {}, 0};
+
+    double fx1 = 0.0, fy1 = 0.0, cx1 = 0.0, cy1 = 0.0;
+    double fx2 = 0.0, fy2 = 0.0, cx2 = 0.0, cy2 = 0.0;
+    try {
+        py::object c1 = f1_obj.attr("camera");
+        py::object c2 = f2_obj.attr("camera");
+        fx1 = c1.attr("fx").cast<double>();
+        fy1 = c1.attr("fy").cast<double>();
+        cx1 = c1.attr("cx").cast<double>();
+        cy1 = c1.attr("cy").cast<double>();
+        fx2 = c2.attr("fx").cast<double>();
+        fy2 = c2.attr("fy").cast<double>();
+        cx2 = c2.attr("cx").cast<double>();
+        cy2 = c2.attr("cy").cast<double>();
+    } catch (...) {
+        return {{}, {}, 0};
+    }
+
+    const Eigen::Matrix4d Tcw1 = f1->Tcw();
+    const Eigen::Matrix4d Tcw2 = f2->Tcw();
+    const float *sigmas = level_sigmas2.data();
+    const int n_sigmas = static_cast<int>(level_sigmas2.size());
+
+    std::vector<std::pair<int, int>> pair_candidates;
+
+    {
+        py::gil_scoped_release release;
+
+        if (!idxs1_in.empty() && !idxs2_in.empty()) {
+            if (idxs1_in.size() != idxs2_in.size()) return {{}, {}, 0};
+            pair_candidates.reserve(idxs1_in.size());
+            for (std::size_t i = 0; i < idxs1_in.size(); ++i) {
+                const int i1 = idxs1_in[i], i2 = idxs2_in[i];
+                if (i1 >= 0 && i1 < n1 && i2 >= 0 && i2 < n2 &&
+                    unmatched1[i1] && unmatched2[i2]) {
+                    pair_candidates.push_back({i1, i2});
+                }
+            }
+        } else {
+            cv::Mat des1_sub(static_cast<int>(candidate1.size()), f1->des.cols, CV_8U);
+            cv::Mat des2_sub(static_cast<int>(candidate2.size()), f2->des.cols, CV_8U);
+            for (int r = 0; r < static_cast<int>(candidate1.size()); ++r) {
+                f1->des.row(candidate1[r]).copyTo(des1_sub.row(r));
+            }
+            for (int r = 0; r < static_cast<int>(candidate2.size()); ++r) {
+                f2->des.row(candidate2[r]).copyTo(des2_sub.row(r));
+            }
+
+            cv::BFMatcher matcher(cv::NORM_HAMMING, false);
+            std::vector<std::vector<cv::DMatch>> raw;
+            matcher.knnMatch(des1_sub, des2_sub, raw, 2);
+            pair_candidates.reserve(raw.size());
+            for (const auto &pair : raw) {
+                if (pair.size() < 2) continue;
+                const cv::DMatch &m = pair[0];
+                const cv::DMatch &n = pair[1];
+                if (m.distance >= matcher_ratio_test * n.distance) continue;
+                if (m.queryIdx < 0 || m.queryIdx >= static_cast<int>(candidate1.size()) ||
+                    m.trainIdx < 0 || m.trainIdx >= static_cast<int>(candidate2.size())) {
+                    continue;
+                }
+                pair_candidates.push_back({candidate1[m.queryIdx], candidate2[m.trainIdx]});
+            }
+        }
+
+        if (pair_candidates.empty()) return {{}, {}, 0};
+
+        const Eigen::Matrix3d R1w = Tcw1.block<3, 3>(0, 0);
+        const Eigen::Vector3d t1w = Tcw1.block<3, 1>(0, 3);
+        const Eigen::Matrix3d R2w = Tcw2.block<3, 3>(0, 0);
+        const Eigen::Vector3d t2w = Tcw2.block<3, 1>(0, 3);
+        const Eigen::Matrix3d R12 = R1w * R2w.transpose();
+        const Eigen::Vector3d t12 = -R1w * (R2w.transpose() * t2w) + t1w;
+        Eigen::Matrix3d t12x;
+        t12x << 0.0, -t12.z(), t12.y(),
+                t12.z(), 0.0, -t12.x(),
+                -t12.y(), t12.x(), 0.0;
+
+        Eigen::Matrix3d K1inv = Eigen::Matrix3d::Identity();
+        K1inv(0, 0) = 1.0 / fx1;
+        K1inv(1, 1) = 1.0 / fy1;
+        K1inv(0, 2) = -cx1 / fx1;
+        K1inv(1, 2) = -cy1 / fy1;
+        Eigen::Matrix3d K2inv = Eigen::Matrix3d::Identity();
+        K2inv(0, 0) = 1.0 / fx2;
+        K2inv(1, 1) = 1.0 / fy2;
+        K2inv(0, 2) = -cx2 / fx2;
+        K2inv(1, 2) = -cy2 / fy2;
+
+        const Eigen::Matrix3d F12 = (K1inv.transpose() * t12x) * R12 * K2inv;
+
+        std::vector<int> out1;
+        std::vector<int> out2;
+        out1.reserve(pair_candidates.size());
+        out2.reserve(pair_candidates.size());
+
+        for (const auto &[i1, i2] : pair_candidates) {
+            if (i1 < 0 || i1 >= n1 || i2 < 0 || i2 >= n2) continue;
+            const float d = static_cast<float>(cv::norm(f1->des.row(i1), f2->des.row(i2), cv::NORM_HAMMING));
+            if (d > max_descriptor_distance) continue;
+
+            int octave2 = f2->octaves(i2);
+            if (octave2 < 0) octave2 = 0;
+            if (n_sigmas > 0 && octave2 >= n_sigmas) octave2 = n_sigmas - 1;
+            const float sigma2 = (n_sigmas > 0) ? sigmas[octave2] : 1.0f;
+
+            const Eigen::Vector3d kp1(
+                static_cast<double>(f1->kpsu(i1, 0)),
+                static_cast<double>(f1->kpsu(i1, 1)),
+                1.0);
+            const Eigen::Vector3d line = F12.transpose() * kp1;
+            const double num =
+                static_cast<double>(f2->kpsu(i2, 0)) * line(0) +
+                static_cast<double>(f2->kpsu(i2, 1)) * line(1) + line(2);
+            const double den = line(0) * line(0) + line(1) * line(1);
+            if (den == 0.0) continue;
+            const double dist_sq = (num * num) / den;
+            if (dist_sq >= 3.84 * static_cast<double>(sigma2)) continue;
+
+            out1.push_back(i1);
+            out2.push_back(i2);
+        }
+
+        if (check_orientation && !out1.empty()) {
+            const std::vector<int> valid = rotation_histogram_valid_idxs(out1, out2, angles1, angles2);
+            std::vector<int> filt1, filt2;
+            filt1.reserve(valid.size());
+            filt2.reserve(valid.size());
+            for (int idx : valid) {
+                if (idx >= 0 && idx < static_cast<int>(out1.size())) {
+                    filt1.push_back(out1[idx]);
+                    filt2.push_back(out2[idx]);
+                }
+            }
+            out1 = std::move(filt1);
+            out2 = std::move(filt2);
+        }
+
+        const int n_found = static_cast<int>(out1.size());
+        return {std::move(out1), std::move(out2), n_found};
+    }
 }
 
 int search_and_fuse(
