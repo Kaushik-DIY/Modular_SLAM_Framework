@@ -84,23 +84,27 @@ void KeyFrame::set_bad() {
         points[idx] = py::none();
     }
 
+    py::object parent_snapshot;
     {
         std::lock_guard<std::mutex> lk(_lock_connections);
         reset_covisibility();
-
-        // Compute Tcp relative to parent
-        if (!_parent.is_none()) {
-            try {
-                // Tcp = Tcw * parent.Twc()
-                auto parent_Twc = _parent.attr("Twc")();
-                // Store Tcp as pose attribute — simplified for now
-            } catch (...) {}
-            try {
-                _parent.attr("erase_child")(py::cast(shared_from_this()));
-            } catch (...) {}
-        }
+        parent_snapshot = _parent;   // snapshot; the parent callouts run outside the lock
         _children.clear();
         _kf_is_bad.store(true);
+    }
+
+    // Detach from parent OUTSIDE _lock_connections: erase_child acquires the PARENT's
+    // _lock_connections -> a KF<->KF nesting if done under our own (F4 invariant).
+    // bool(py::object) guards against a default-constructed (NULL) _parent.
+    if (parent_snapshot && !parent_snapshot.is_none()) {
+        try {
+            // Tcp = Tcw * parent.Twc() (stored as pose attribute — simplified for now)
+            auto parent_Twc = parent_snapshot.attr("Twc")();
+            (void)parent_Twc;
+        } catch (...) {}
+        try {
+            parent_snapshot.attr("erase_child")(py::cast(shared_from_this()));
+        } catch (...) {}
     }
 
     // Remove from map
