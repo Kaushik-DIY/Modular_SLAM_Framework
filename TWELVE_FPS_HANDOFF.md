@@ -43,6 +43,16 @@
   `final_state=OK`, `avg_fps=6.29`). This is a stability-preserving cleanup, not the main FPS
   unlock; `local_mapping.fuse_map_points` still averages about 164 ms in the 600-frame threaded
   smoke.
+- **Latest helper-level milestone:** `5ecbfca` (`F4b: use native keyframe point helpers`) moved
+  shared C++ `KeyFrame` helpers used by local mapping away from Python `attr()` dispatch where the
+  referenced objects are native C++ objects. `update_connections`, `get_matched_good_points`,
+  `get_matched_good_points_and_idxs`, and `num_tracked_points` now use direct `MapPoint` /
+  `KeyFrame` calls with Python fallback preserved. Validation passed: F4 invariant audit, focused
+  LocalMappingCore/KeyFrame tests (`32 passed`), full ORB-SLAM suite (`514 passed, 1 skipped`),
+  and a 600-frame threaded lab smoke (`600/600 OK`, `0` lost, `final_state=OK`, `avg_fps=6.30`).
+  In that smoke, `local_mapping.process_new_keyframe` averaged about 9.4 ms and
+  `local_mapping.fuse_map_points` averaged about 154 ms; the larger remaining costs are still
+  `local_mapping.local_BA` and `local_mapping.create_new_map_points` / fuse orchestration.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
