@@ -12,6 +12,8 @@ from threading import Condition, RLock
 import time
 import traceback
 
+import numpy as np
+
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.geometry_matchers import EpipolarMatcher
 from visual_slam.orbslam.slam.local_mapping_core import LocalMappingCore
@@ -24,9 +26,11 @@ import threading as _threading
 try:
     import cpp_slam_core as _cpp_slam_core
     _CppLocalMappingCore = getattr(_cpp_slam_core, "LocalMappingCore", None)
+    _CppKeyFrame = getattr(_cpp_slam_core, "KeyFrame", None)
     _CPP_LMC_AVAILABLE = _CppLocalMappingCore is not None
 except ImportError:
     _CppLocalMappingCore = None
+    _CppKeyFrame = None
     _CPP_LMC_AVAILABLE = False
 
 kVerbose = True
@@ -507,17 +511,47 @@ class LocalMapping:
                 kf.kpsn[idxs],
             )
 
-            new_pts_count, _, list_added_points = self.map.add_points(
-                pts3d,
-                mask_pts3d,
-                self.kf_cur,
-                kf,
-                idxs_cur,
-                idxs,
-                self.img_cur,
-                do_check=True,
-                far_points_threshold=self.far_points_threshold,
-            )
+            list_added_points = None
+            if (
+                _cpp_slam_core is not None
+                and hasattr(_cpp_slam_core, "add_triangulated_map_points_batch")
+                and _CppKeyFrame is not None
+                and isinstance(self.kf_cur, _CppKeyFrame)
+                and isinstance(kf, _CppKeyFrame)
+            ):
+                try:
+                    far_threshold = (
+                        -1.0 if self.far_points_threshold is None
+                        else float(self.far_points_threshold)
+                    )
+                    new_pts_count, _, list_added_points = (
+                        _cpp_slam_core.add_triangulated_map_points_batch(
+                            self.map,
+                            pts3d,
+                            mask_pts3d,
+                            self.kf_cur,
+                            kf,
+                            np.asarray(idxs_cur, dtype=np.int32),
+                            np.asarray(idxs, dtype=np.int32),
+                            far_threshold,
+                        )
+                    )
+                    new_pts_count = int(new_pts_count)
+                except Exception:
+                    list_added_points = None
+
+            if list_added_points is None:
+                new_pts_count, _, list_added_points = self.map.add_points(
+                    pts3d,
+                    mask_pts3d,
+                    self.kf_cur,
+                    kf,
+                    idxs_cur,
+                    idxs,
+                    self.img_cur,
+                    do_check=True,
+                    far_points_threshold=self.far_points_threshold,
+                )
 
             total_new_pts += new_pts_count
             self.local_mapping_core.add_points(list_added_points)

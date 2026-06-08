@@ -145,6 +145,93 @@ static int update_local_ba_points_batch(
     return updated;
 }
 
+static py::tuple add_triangulated_map_points_batch(
+    py::object map_obj,
+    py::array_t<double, py::array::c_style | py::array::forcecast> pts3d,
+    py::array_t<bool, py::array::c_style | py::array::forcecast> pts3d_mask,
+    py::object kf1_obj,
+    py::object kf2_obj,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> idxs1,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> idxs2,
+    double far_points_threshold)
+{
+    auto pts = pts3d.unchecked<2>();
+    auto valid = pts3d_mask.unchecked<1>();
+    auto i1s = idxs1.unchecked<1>();
+    auto i2s = idxs2.unchecked<1>();
+
+    const ssize_t n = std::min<ssize_t>(
+        pts.shape(0),
+        std::min<ssize_t>(valid.shape(0), std::min<ssize_t>(i1s.shape(0), i2s.shape(0))));
+
+    py::array_t<bool> added_mask({n});
+    auto added = added_mask.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < n; ++i) added(i) = false;
+
+    py::list added_points;
+
+    KeyFrame *kf1 = nullptr;
+    KeyFrame *kf2 = nullptr;
+    try {
+        kf1 = kf1_obj.cast<KeyFrame *>();
+        kf2 = kf2_obj.cast<KeyFrame *>();
+    } catch (...) {
+        return py::make_tuple(0, added_mask, added_points);
+    }
+    if (kf1 == nullptr || kf2 == nullptr || kf1->is_bad() || kf2->is_bad()) {
+        return py::make_tuple(0, added_mask, added_points);
+    }
+
+    const bool use_far_threshold = std::isfinite(far_points_threshold) && far_points_threshold > 0.0;
+    const Eigen::Vector3d Ow1 = use_far_threshold ? kf1->Ow() : Eigen::Vector3d::Zero();
+    const Eigen::Vector3d Ow2 = use_far_threshold ? kf2->Ow() : Eigen::Vector3d::Zero();
+
+    int count = 0;
+    for (ssize_t i = 0; i < n; ++i) {
+        if (!valid(i)) continue;
+
+        const int idx1 = i1s(i);
+        const int idx2 = i2s(i);
+        if (idx1 < 0 || idx1 >= static_cast<int>(kf1->points.size())) continue;
+        if (idx2 < 0 || idx2 >= static_cast<int>(kf2->points.size())) continue;
+        if (!kf1->points[idx1].is_none() || !kf2->points[idx2].is_none()) continue;
+
+        const Eigen::Vector3d pw(pts(i, 0), pts(i, 1), pts(i, 2));
+        if (!pw.allFinite()) continue;
+        if (use_far_threshold) {
+            if ((pw - Ow1).norm() > far_points_threshold ||
+                (pw - Ow2).norm() > far_points_threshold) {
+                continue;
+            }
+        }
+
+        auto mp = std::make_shared<MapPoint>(-1);
+        mp->update_position(pw);
+        mp->map = map_obj;
+        mp->kf_ref = kf1_obj;
+        mp->rgb = py::none();
+        mp->replacement = py::none();
+        py::object mp_obj = py::cast(mp);
+
+        mp->add_observation(kf1_obj, idx1);
+        mp->add_observation(kf2_obj, idx2);
+        try {
+            map_obj.attr("add_point")(mp_obj);
+        } catch (...) {
+            kf1->remove_point_match(idx1);
+            kf2->remove_point_match(idx2);
+            continue;
+        }
+        mp->update_info();
+
+        added(i) = true;
+        added_points.append(mp_obj);
+        ++count;
+    }
+
+    return py::make_tuple(count, added_mask, added_points);
+}
+
 // ---------------------------------------------------------------------------
 // MapPoint binding
 // ---------------------------------------------------------------------------
@@ -680,6 +767,11 @@ PYBIND11_MODULE(cpp_slam_core, m) {
     m.def("update_local_ba_points_batch", &update_local_ba_points_batch,
           py::arg("points"), py::arg("positions"), py::arg("update_mask"),
           "Batch write-back of local BA map-point positions and normal/depth info.");
+    m.def("add_triangulated_map_points_batch", &add_triangulated_map_points_batch,
+          py::arg("map_obj"), py::arg("pts3d"), py::arg("pts3d_mask"),
+          py::arg("kf1"), py::arg("kf2"), py::arg("idxs1"), py::arg("idxs2"),
+          py::arg("far_points_threshold"),
+          "Batch-create triangulated map points for native local mapping.");
 
     // ---- Phase 5: C++ projection matcher (params passed from Python) -------
     m.def("search_map_by_projection",
@@ -724,10 +816,19 @@ PYBIND11_MODULE(cpp_slam_core, m) {
           [](py::object f1, py::object f2,
              const std::vector<int> &idxs1, const std::vector<int> &idxs2,
              py::array_t<float, py::array::c_style | py::array::forcecast> level_sigmas2,
-             const std::vector<float> &angles1, const std::vector<float> &angles2,
+             py::array_t<float, py::array::c_style | py::array::forcecast> angles1,
+             py::array_t<float, py::array::c_style | py::array::forcecast> angles2,
              float max_descriptor_distance, float matcher_ratio_test, bool check_orientation) {
+              auto a1 = angles1.unchecked<1>();
+              auto a2 = angles2.unchecked<1>();
+              std::vector<float> angles1_vec;
+              std::vector<float> angles2_vec;
+              angles1_vec.reserve(static_cast<std::size_t>(a1.shape(0)));
+              angles2_vec.reserve(static_cast<std::size_t>(a2.shape(0)));
+              for (ssize_t i = 0; i < a1.shape(0); ++i) angles1_vec.push_back(a1(i));
+              for (ssize_t i = 0; i < a2.shape(0); ++i) angles2_vec.push_back(a2(i));
               return cppcore::search_frame_for_triangulation(
-                  f1, f2, idxs1, idxs2, level_sigmas2, angles1, angles2,
+                  f1, f2, idxs1, idxs2, level_sigmas2, angles1_vec, angles2_vec,
                   max_descriptor_distance, matcher_ratio_test, check_orientation);
           },
           py::arg("f1"), py::arg("f2"), py::arg("idxs1"), py::arg("idxs2"),

@@ -117,6 +117,19 @@
   so keep checkpoint 2.39 as the quality/reference checkpoint and treat 2.41 as the current
   performance reference with a tracking-stability flag. If later full runs increase lost frames
   further, make tracking stability high priority before more runtime work.
+- **Latest native local-mapping milestone:** checkpoint 2.42 (`native triangulated point batch
+  smoke`) routes native C++ keyframe pairs in `create_new_map_points` through
+  `cpp_slam_core.add_triangulated_map_points_batch`, moving candidate validation, far-point
+  filtering, C++ `MapPoint` construction, observation insertion, map insertion, and point-info
+  update into one binding call. The epipolar matcher binding now accepts contiguous NumPy angle
+  arrays directly instead of Python float lists. Validation passed: C++ rebuild/install, F4
+  invariant audit, focused tests (`64 passed`), full ORB-SLAM suite (`514 passed, 1 skipped`), and
+  a threaded 600-frame smoke under
+  `visual_slam/reference_audit/checkpoint_2_42_native_triangulated_point_batch_smoke2_20260608/`
+  (`600/600 OK`, `0` lost, `final_state=OK`, `avg_fps=8.42`). Compared with the 2.41 smoke,
+  `local_mapping.create_new_map_points` mean improved from 221.2 ms to 148.6 ms and `frame.total`
+  mean improved from 122.6 ms to 118.0 ms. This is still partially GIL-held for Python map
+  insertion / observation callbacks, and needs a full lab run before becoming a reference.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
