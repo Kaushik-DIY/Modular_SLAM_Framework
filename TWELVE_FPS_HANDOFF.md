@@ -21,17 +21,18 @@
   was first written, native local-mapping fuse (`550b6b3`) and native triangulation epipolar
   matching (`4b29341`) were also added and validated.
 - **Current full-run reference:** checkpoint
-  `visual_slam/reference_audit/checkpoint_2_37_full_lab_native_lm_fuse_triang_threaded_20260607/`
-  completed all 4494 lab frames at commit `4b29341` with `tracking_lost_count=76`,
-  `final_state=OK`, and `avg_fps=2.86`. Tracking loss is now a `MONITOR` flag: raise it to
-  high priority only if later full lab runs grow materially above this range; otherwise revisit
-  after the remaining runtime-efficiency porting.
+  `visual_slam/reference_audit/checkpoint_2_38_full_lab_f3b_build_mark_search_threaded_20260608/`
+  completed all 4494 lab frames at commit `a5f6403` with `tracking_lost_count=76`,
+  `final_state=OK`, and `avg_fps=6.03`. This improves over checkpoint 2.37's 2.86 FPS while
+  keeping tracking loss in the same monitored range. Tracking loss remains a `MONITOR` flag:
+  raise it to high priority only if later full lab runs grow materially above this range;
+  otherwise revisit after the remaining runtime-efficiency porting.
 - **Latest implementation step:** native combined tracking local-map path:
   `build_local_map -> mark_current_frame_matched_points_seen -> search_map_by_projection` in one
   C++ binding call, with the no-vote reference-keyframe fallback preserved in Python. Short
   validation: targeted tests passed, full suite passed, sequential 600-frame profiled lab run had
-  0 lost / 6.04 FPS, threaded 600-frame profiled lab run had 0 lost / 7.68 FPS, and
-  `tracking.track_local_map` averaged about 20.7 ms on those 600-frame slices.
+  0 lost / 6.04 FPS, threaded 600-frame profiled lab run had 0 lost / 7.68 FPS, and the full
+  threaded lab run reached 6.03 FPS with `tracking.track_local_map` averaging 24.0 ms.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
