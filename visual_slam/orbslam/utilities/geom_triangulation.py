@@ -23,25 +23,29 @@ def triangulate_normalized_points(Tcw1, Tcw2, kpn1, kpn2):
 
     pts4 = cv2.triangulatePoints(P1, P2, kpn1.T, kpn2.T).T
 
-    pts3 = np.zeros((len(pts4), 3), dtype=np.float64)
-    mask = np.zeros(len(pts4), dtype=bool)
+    n = len(pts4)
+    pts3 = np.zeros((n, 3), dtype=np.float64)
+    mask = np.zeros(n, dtype=bool)
 
-    for i, ph in enumerate(pts4):
-        w = ph[3]
-        if abs(w) < 1e-12:
-            continue
+    w = pts4[:, 3]
+    valid_w = np.abs(w) >= 1e-12
+    if not np.any(valid_w):
+        return pts3, mask
 
-        pw = ph[:3] / w
+    pw = np.zeros((n, 3), dtype=np.float64)
+    pw[valid_w] = pts4[valid_w, :3] / w[valid_w, None]
 
-        pc1 = Tcw1[:3, :3] @ pw + Tcw1[:3, 3]
-        pc2 = Tcw2[:3, :3] @ pw + Tcw2[:3, 3]
+    R1, t1 = Tcw1[:3, :3], Tcw1[:3, 3]
+    R2, t2 = Tcw2[:3, :3], Tcw2[:3, 3]
+    pc1 = pw @ R1.T + t1
+    pc2 = pw @ R2.T + t2
 
-        if not np.all(np.isfinite(pw)):
-            continue
-        if pc1[2] <= 0.0 or pc2[2] <= 0.0:
-            continue
-
-        pts3[i] = pw
-        mask[i] = True
+    mask = (
+        valid_w
+        & np.all(np.isfinite(pw), axis=1)
+        & (pc1[:, 2] > 0.0)
+        & (pc2[:, 2] > 0.0)
+    )
+    pts3[mask] = pw[mask]
 
     return pts3, mask
