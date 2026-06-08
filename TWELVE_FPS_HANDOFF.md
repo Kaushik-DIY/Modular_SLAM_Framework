@@ -65,6 +65,17 @@
   `local_mapping.cull_map_points` about 3.2 ms. The larger remaining costs are still
   `local_mapping.local_BA` (~713 ms/keyframe) and `local_mapping.create_new_map_points`
   (~245 ms/keyframe) in this short threaded profile.
+- **Latest triangulation milestone:** `bac801e` (`F4b: vectorize local mapping triangulation
+  mask`) vectorized `triangulate_normalized_points` after `cv2.triangulatePoints`, replacing the
+  Python per-match homogeneous normalization / finite / positive-depth loop with NumPy array
+  operations while preserving output shape and zero-filled invalid points. Validation passed:
+  targeted local-mapping tests (`30 passed`), full ORB-SLAM suite (`514 passed, 1 skipped`),
+  explicit parity check against the old loop formula, and a 600-frame threaded lab smoke
+  (`600/600 OK`, `0` lost, `final_state=OK`, `avg_fps=7.18`). In that smoke,
+  `local_mapping.create_new_map_points` averaged about 194 ms, `local_mapping.fuse_map_points`
+  about 140 ms, `local_mapping.local_BA` about 604 ms, and `frame.total` about 139 ms.
+  This is the best short-run threaded FPS seen in this F4b cleanup series, but a full lab run is
+  still needed before treating it as the new full-run reference.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
