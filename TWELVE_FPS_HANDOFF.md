@@ -86,6 +86,16 @@
   `visual_slam_outputs/lab_rgbd_run_2_B_loop_gba` is about 0.236 m, improved from checkpoint 2.38's
   about 0.294 m. Because loop closing/GBA were disabled, the loop+GBA baseline remains visually
   cleaner and is still the quality target.
+- **Latest focused implementation milestone:** checkpoint 2.40 (`local BA packing cache smoke`)
+  cached keyframe feature arrays / matched-point lists and reused a precomputed finite-position
+  mask in `pack_local_ba`, reducing repeated Python dispatch before the native local-BA solve.
+  Validation passed: optimizer-core parity (`11 passed`), focused local-mapping tests
+  (`30 passed`), full ORB-SLAM suite (`514 passed, 1 skipped`), and a threaded 600-frame lab smoke
+  saved under `visual_slam/reference_audit/checkpoint_2_40_local_ba_pack_cache_smoke_20260608/`
+  (`600/600 OK`, `0` lost, `final_state=OK`, `avg_fps=6.86`). Smoke runtime highlights:
+  `local_mapping.local_BA` mean 376.7 ms over 30 calls, `slam.track` mean 96.6 ms, and
+  `frame.total` mean 144.9 ms. This is a narrow packing cleanup and does **not** replace checkpoint
+  2.39 as the current full-run reference.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
