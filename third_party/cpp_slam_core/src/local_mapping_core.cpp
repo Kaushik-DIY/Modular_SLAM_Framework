@@ -6,6 +6,58 @@
 
 namespace slam {
 
+namespace {
+
+KeyFrame *as_keyframe(const py::object &o) {
+    if (o.is_none()) return nullptr;
+    try { return o.cast<KeyFrame *>(); } catch (...) { return nullptr; }
+}
+
+MapPoint *as_mappoint(const py::object &o) {
+    if (o.is_none()) return nullptr;
+    try { return o.cast<MapPoint *>(); } catch (...) { return nullptr; }
+}
+
+bool has_python_local_map_neighbors(const py::object &map_obj) {
+    try {
+        if (!py::hasattr(map_obj, "local_map")) return false;
+        py::object lm = map_obj.attr("local_map");
+        return py::hasattr(lm, "get_best_neighbors");
+    } catch (...) {
+        return false;
+    }
+}
+
+bool is_bad_keyframe(const py::object &kf_obj) {
+    KeyFrame *kf = as_keyframe(kf_obj);
+    if (kf != nullptr) return kf->is_bad();
+    try { return kf_obj.attr("is_bad")().cast<bool>(); } catch (...) { return true; }
+}
+
+bool is_bad_mappoint(const py::object &mp_obj) {
+    MapPoint *mp = as_mappoint(mp_obj);
+    if (mp != nullptr) return mp->is_bad();
+    try { return mp_obj.attr("is_bad")().cast<bool>(); } catch (...) { return true; }
+}
+
+std::vector<py::object> matched_good_points_native(const KeyFrame &kf) {
+    std::vector<py::object> result;
+    result.reserve(kf.points.size());
+    for (const auto &p : kf.points) {
+        MapPoint *mp = as_mappoint(p);
+        if (mp != nullptr && !mp->is_bad()) result.push_back(p);
+    }
+    return result;
+}
+
+py::list to_py_list(const std::vector<py::object> &items) {
+    py::list out;
+    for (const auto &item : items) out.append(item);
+    return out;
+}
+
+}  // namespace
+
 // ---- Construction ----------------------------------------------------------
 LocalMappingCore::LocalMappingCore(py::object map_obj, int stype)
     : map(map_obj),
@@ -151,18 +203,18 @@ std::vector<py::object> LocalMappingCore::_get_neighbor_keyframes(int num_neighb
     std::vector<py::object> result;
     try {
         // Prefer local_map.get_best_neighbors if available.
-        if (py::hasattr(map, "local_map")) {
+        if (has_python_local_map_neighbors(map)) {
             py::object lm = map.attr("local_map");
-            if (py::hasattr(lm, "get_best_neighbors")) {
-                auto raw = lm.attr("get_best_neighbors")(kf_cur, py::arg("N") = num_neighbors);
-                for (auto item : raw) result.push_back(py::reinterpret_borrow<py::object>(item));
+            auto raw = lm.attr("get_best_neighbors")(kf_cur, py::arg("N") = num_neighbors);
+            for (auto item : raw) result.push_back(py::reinterpret_borrow<py::object>(item));
+        } else {
+            KeyFrame *kf = as_keyframe(kf_cur);
+            if (kf != nullptr) {
+                result = kf->get_best_covisible_keyframes(num_neighbors);
             } else {
                 auto raw = kf_cur.attr("get_best_covisible_keyframes")(num_neighbors);
                 for (auto item : raw) result.push_back(py::reinterpret_borrow<py::object>(item));
             }
-        } else {
-            auto raw = kf_cur.attr("get_best_covisible_keyframes")(num_neighbors);
-            for (auto item : raw) result.push_back(py::reinterpret_borrow<py::object>(item));
         }
     } catch (...) {}
 
@@ -172,7 +224,7 @@ std::vector<py::object> LocalMappingCore::_get_neighbor_keyframes(int num_neighb
         try {
             if (kf.is_none()) continue;
             bool same = (kf.ptr() == kf_cur.ptr());
-            bool bad  = kf.attr("is_bad")().cast<bool>();
+            bool bad  = is_bad_keyframe(kf);
             if (!same && !bad) filtered.push_back(kf);
         } catch (...) {}
     }
@@ -219,7 +271,8 @@ int LocalMappingCore::fuse_map_points(float desc_dist_sigma, py::object pm_cls) 
     int num_levels = 0;
     float min_depth = 1.0e-2f;
     float chi2_mono = 5.991f;
-    bool native_ready = py::isinstance<KeyFrame>(kf_cur);
+    KeyFrame *kf_cur_native = as_keyframe(kf_cur);
+    bool native_ready = (kf_cur_native != nullptr);
     if (native_ready) {
         try {
             py::object shared = py::module_::import(
@@ -246,24 +299,29 @@ int LocalMappingCore::fuse_map_points(float desc_dist_sigma, py::object pm_cls) 
     }
 
     // 1. Fuse current KF points into each neighbor.
-    auto cur_pts = kf_cur.attr("get_matched_good_points")();
+    py::object cur_pts = py::none();
     py::list cur_pts_list;
     if (native_ready) {
         try {
-            for (auto item : cur_pts) cur_pts_list.append(py::reinterpret_borrow<py::object>(item));
+            cur_pts_list = to_py_list(matched_good_points_native(*kf_cur_native));
         } catch (...) {
             native_ready = false;
         }
+    } else {
+        try {
+            cur_pts = kf_cur.attr("get_matched_good_points")();
+        } catch (...) {}
     }
     for (const auto &kf : local_kfs) {
         try {
             int n = 0;
-            if (native_ready && py::isinstance<KeyFrame>(kf)) {
+            if (native_ready && as_keyframe(kf) != nullptr) {
                 n = cppcore::search_and_fuse(
                     cur_pts_list, kf, scale_factors, inv_level_sigmas2,
                     max_reproj_dist, desc_dist_sigma, log_scale_factor, num_levels,
                     min_depth, chi2_mono);
             } else {
+                if (cur_pts.is_none()) cur_pts = kf_cur.attr("get_matched_good_points")();
                 n = pm_cls.attr("search_and_fuse")(
                     cur_pts, kf,
                     py::arg("max_reproj_distance") = max_reproj_dist,
@@ -281,15 +339,38 @@ int LocalMappingCore::fuse_map_points(float desc_dist_sigma, py::object pm_cls) 
 
     for (const auto &kf : local_kfs) {
         try {
-            auto pts = kf.attr("get_matched_good_points")();
-            for (auto item : pts) {
-                py::object p = py::reinterpret_borrow<py::object>(item);
-                if (p.is_none()) continue;
-                if (p.attr("is_bad")().cast<bool>()) continue;
-                if (seen.count(p)) continue;
-                if (p.attr("is_in_keyframe")(kf_cur).cast<bool>()) continue;
+            std::vector<py::object> pts_native;
+            py::object pts_py = py::none();
+            KeyFrame *kf_native = as_keyframe(kf);
+            if (native_ready && kf_native != nullptr) {
+                pts_native = matched_good_points_native(*kf_native);
+            } else {
+                pts_py = kf.attr("get_matched_good_points")();
+            }
+
+            auto handle_point = [&](const py::object &p) {
+                if (p.is_none()) return;
+                if (is_bad_mappoint(p)) return;
+                if (seen.count(p)) return;
+                MapPoint *mp = as_mappoint(p);
+                bool in_cur = false;
+                if (mp != nullptr) {
+                    in_cur = mp->is_in_keyframe(kf_cur);
+                } else {
+                    in_cur = p.attr("is_in_keyframe")(kf_cur).cast<bool>();
+                }
+                if (in_cur) return;
                 seen.insert(p);
                 fuse_candidates.push_back(p);
+            };
+
+            if (native_ready && kf_native != nullptr) {
+                for (const auto &p : pts_native) handle_point(p);
+            } else {
+                for (auto item : pts_py) {
+                    py::object p = py::reinterpret_borrow<py::object>(item);
+                    handle_point(p);
+                }
             }
         } catch (...) {}
     }
@@ -316,16 +397,27 @@ int LocalMappingCore::fuse_map_points(float desc_dist_sigma, py::object pm_cls) 
 
     // 3. Update info for all current KF points after fusion.
     try {
-        auto pts = kf_cur.attr("get_matched_good_points")();
-        for (auto item : pts) {
-            py::object p = py::reinterpret_borrow<py::object>(item);
-            if (!p.is_none() && !p.attr("is_bad")().cast<bool>()) {
-                p.attr("update_info")();
+        if (native_ready && kf_cur_native != nullptr) {
+            for (const auto &p : matched_good_points_native(*kf_cur_native)) {
+                MapPoint *mp = as_mappoint(p);
+                if (mp != nullptr && !mp->is_bad()) mp->update_info();
+            }
+        } else {
+            auto pts = kf_cur.attr("get_matched_good_points")();
+            for (auto item : pts) {
+                py::object p = py::reinterpret_borrow<py::object>(item);
+                if (!p.is_none() && !p.attr("is_bad")().cast<bool>()) {
+                    p.attr("update_info")();
+                }
             }
         }
     } catch (...) {}
 
-    kf_cur.attr("update_connections")();
+    if (native_ready && kf_cur_native != nullptr) {
+        kf_cur_native->update_connections();
+    } else {
+        kf_cur.attr("update_connections")();
+    }
     return total;
 }
 
