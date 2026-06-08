@@ -27,12 +27,22 @@
   keeping tracking loss in the same monitored range. Tracking loss remains a `MONITOR` flag:
   raise it to high priority only if later full lab runs grow materially above this range;
   otherwise revisit after the remaining runtime-efficiency porting.
-- **Latest implementation step:** native combined tracking local-map path:
+- **Latest full-run implementation step:** native combined tracking local-map path:
   `build_local_map -> mark_current_frame_matched_points_seen -> search_map_by_projection` in one
   C++ binding call, with the no-vote reference-keyframe fallback preserved in Python. Short
   validation: targeted tests passed, full suite passed, sequential 600-frame profiled lab run had
   0 lost / 6.04 FPS, threaded 600-frame profiled lab run had 0 lost / 7.68 FPS, and the full
   threaded lab run reached 6.03 FPS with `tracking.track_local_map` averaging 24.0 ms.
+- **Latest code milestone after that:** `a0299bc` (`F4b: reduce local mapping fuse Python dispatch`)
+  tightened `LocalMappingCore::fuse_map_points` around the existing native `search_and_fuse`
+  kernel. C++ keyframes now use native covisibility lookup when no Python `local_map` neighbor
+  provider is present, native matched-point collection, native bad-state checks, native observation
+  membership checks, and native `update_info` / `update_connections` calls. Validation passed:
+  focused LocalMappingCore tests, F1/F2 wiring tests, F4 invariant audit, full ORB-SLAM suite
+  (`514 passed, 1 skipped`), and a 600-frame threaded lab smoke (`600/600 OK`, `0` lost,
+  `final_state=OK`, `avg_fps=6.29`). This is a stability-preserving cleanup, not the main FPS
+  unlock; `local_mapping.fuse_map_points` still averages about 164 ms in the 600-frame threaded
+  smoke.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
