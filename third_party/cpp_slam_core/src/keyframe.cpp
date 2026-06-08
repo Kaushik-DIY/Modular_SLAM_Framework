@@ -1,10 +1,40 @@
 #include "keyframe.h"
 
+#include "map_point.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <sstream>
 
 namespace slam {
+
+namespace {
+
+KeyFrame *as_keyframe(const py::object &o) {
+    if (o.is_none()) return nullptr;
+    try { return o.cast<KeyFrame *>(); } catch (...) { return nullptr; }
+}
+
+MapPoint *as_mappoint(const py::object &o) {
+    if (o.is_none()) return nullptr;
+    try { return o.cast<MapPoint *>(); } catch (...) { return nullptr; }
+}
+
+bool keyframe_is_bad(const py::object &kf_obj) {
+    KeyFrame *kf = as_keyframe(kf_obj);
+    if (kf != nullptr) return kf->is_bad();
+    try { return kf_obj.attr("is_bad")().cast<bool>(); } catch (...) { return true; }
+}
+
+long keyframe_kid_or_id(const py::object &kf_obj, long fallback) {
+    KeyFrame *kf = as_keyframe(kf_obj);
+    if (kf != nullptr) return static_cast<long>(kf->kid);
+    try { return kf_obj.attr("kid").cast<long>(); } catch (...) {}
+    try { return kf_obj.attr("id").cast<long>(); } catch (...) {}
+    return fallback;
+}
+
+}  // namespace
 
 // Stable sort key for a keyframe py::object: kid (then id, then pointer address as
 // last resort). Covisibility is stored in an unordered_map keyed by pointer
@@ -12,9 +42,7 @@ namespace slam {
 // get_best/connected covisibles deterministic (M0/M1 reproducibility parity with
 // the Python KeyFrameGraph fix). GIL is held by all callers (py::object attr access).
 static long _kf_sort_key(const py::object &kf) {
-    try { return kf.attr("kid").cast<long>(); } catch (...) {}
-    try { return kf.attr("id").cast<long>(); } catch (...) {}
-    return static_cast<long>(reinterpret_cast<std::uintptr_t>(kf.ptr()));
+    return keyframe_kid_or_id(kf, static_cast<long>(reinterpret_cast<std::uintptr_t>(kf.ptr())));
 }
 
 // ---- Construction ----------------------------------------------------------
@@ -201,7 +229,8 @@ void KeyFrame::reset_covisibility() {
 
 void KeyFrame::update_connections() {
     // Build counter of co-visibility from shared map points.
-    // Points can be C++ MapPoint or Python MapPoint — both respond to keyframes().
+    // Points can be C++ MapPoint or Python MapPoint. Prefer native C++ access;
+    // keep Python dispatch as the compatibility fallback.
     std::vector<py::object> pts_copy;
     {
         for (const auto &p : points) {
@@ -216,33 +245,35 @@ void KeyFrame::update_connections() {
     py::object self_obj = py::cast(shared_from_this());
 
     for (const auto &mp_obj : pts_copy) {
-        // Skip bad points
-        try {
-            if (mp_obj.attr("is_bad")().cast<bool>()) continue;
-        } catch (...) {}
+        MapPoint *mp = as_mappoint(mp_obj);
+        if (mp != nullptr && mp->is_bad()) continue;
+        if (mp == nullptr) {
+            try {
+                if (mp_obj.attr("is_bad")().cast<bool>()) continue;
+            } catch (...) {}
+        }
 
         // Get observing KFs for this map point
         std::vector<py::object> obs_kfs;
-        try {
-            auto kfs_list = mp_obj.attr("keyframes")();
-            for (auto kf_item : kfs_list.cast<py::list>()) {
-                obs_kfs.push_back(py::reinterpret_borrow<py::object>(kf_item));
-            }
-        } catch (...) { continue; }
+        if (mp != nullptr) {
+            obs_kfs = mp->keyframes();
+        } else {
+            try {
+                auto kfs_list = mp_obj.attr("keyframes")();
+                for (auto kf_item : kfs_list.cast<py::list>()) {
+                    obs_kfs.push_back(py::reinterpret_borrow<py::object>(kf_item));
+                }
+            } catch (...) { continue; }
+        }
 
         for (const auto &kf_obj : obs_kfs) {
             if (kf_obj.ptr() == self_obj.ptr()) continue;
 
             // Skip KFs with same kid (self by another wrapper)
-            try {
-                int other_kid = kf_obj.attr("kid").cast<int>();
-                if (other_kid == kid) continue;
-            } catch (...) {}
+            if (keyframe_kid_or_id(kf_obj, -1) == kid) continue;
 
             // Skip bad KFs
-            try {
-                if (kf_obj.attr("is_bad")().cast<bool>()) continue;
-            } catch (...) {}
+            if (keyframe_is_bad(kf_obj)) continue;
 
             counter[kf_obj]++;
         }
@@ -281,7 +312,7 @@ void KeyFrame::update_connections() {
     // The parent candidate's is_bad gate is a callout -> evaluate outside the lock.
     bool kf_max_ok = false;
     if (_is_first_connection && kid != 0 && !kf_max.is_none()) {
-        try { kf_max_ok = !kf_max.attr("is_bad")().cast<bool>(); } catch (...) { kf_max_ok = false; }
+        kf_max_ok = !keyframe_is_bad(kf_max);
     }
 
     {
@@ -390,8 +421,14 @@ std::vector<py::object> KeyFrame::get_loop_edges() const {
 // ---- Helpers ---------------------------------------------------------------
 std::vector<py::object> KeyFrame::get_matched_good_points() const {
     std::vector<py::object> result;
+    result.reserve(points.size());
     for (const auto &p : points) {
         if (p.is_none()) continue;
+        MapPoint *mp = as_mappoint(p);
+        if (mp != nullptr) {
+            if (!mp->is_bad()) result.push_back(p);
+            continue;
+        }
         try {
             if (!p.attr("is_bad")().cast<bool>()) result.push_back(p);
         } catch (...) {}
@@ -404,6 +441,11 @@ std::vector<std::pair<py::object, int>> KeyFrame::get_matched_good_points_and_id
     for (int i = 0; i < (int)points.size(); i++) {
         const auto &p = points[i];
         if (p.is_none()) continue;
+        MapPoint *mp = as_mappoint(p);
+        if (mp != nullptr) {
+            if (!mp->is_bad()) result.emplace_back(p, i);
+            continue;
+        }
         try {
             if (!p.attr("is_bad")().cast<bool>()) result.emplace_back(p, i);
         } catch (...) {}
@@ -419,6 +461,13 @@ int KeyFrame::num_tracked_points(int min_obs) const {
     int count = 0;
     for (const auto &p : points) {
         if (p.is_none()) continue;
+        MapPoint *mp = as_mappoint(p);
+        if (mp != nullptr) {
+            if (mp->is_bad()) continue;
+            if (min_obs > 0 && mp->num_observations() < min_obs) continue;
+            ++count;
+            continue;
+        }
         try {
             if (p.attr("is_bad")().cast<bool>()) continue;
             if (min_obs > 0) {
