@@ -96,4 +96,16 @@ int search_and_fuse(
 std::pair<py::list, py::list> build_local_map(
     py::object f_cur, int num_best, int max_kfs, int frame_id);
 
+// F3: common tracking local-map path in one C++ boundary crossing:
+// build_local_map(f_cur) -> mark_current_frame_matched_points_seen(f_cur) ->
+// search_map_by_projection(local_points, frame_obj). `frame_obj` is usually the
+// C++ frame mirror used by the projection matcher. Returns
+// (local_keyframes, local_points, found_count, found_fidxs,
+//  build_sec, mark_sec, search_sec).
+std::tuple<py::list, py::list, int, std::vector<int>, double, double, double>
+build_mark_search_local_map(
+    py::object f_cur, py::object frame_obj, int num_best, int max_kfs, int frame_id,
+    py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+    const MatchParams &p);
+
 }  // namespace cppcore

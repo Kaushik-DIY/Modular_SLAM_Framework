@@ -153,8 +153,40 @@ def test_mark_current_frame_matched_points_seen():
     assert bad.last_frame_id_seen != f_cur.id
 
 
+def test_build_mark_search_local_map_empty_frame():
+    """Combined F3 helper preserves the empty-local-map case and exports timings."""
+    f_cur = _make_kf(400, n_kps=8)
+    scale_factors = np.ones(8, dtype=np.float32)
+    result = cpp_slam_core.build_mark_search_local_map(
+        f_cur,
+        f_cur,
+        3,
+        80,
+        f_cur.id,
+        scale_factors,
+        10.0,
+        100.0,
+        0.8,
+        0.5,
+        0.0,
+        float("inf"),
+        float(np.log(1.2)),
+        8,
+    )
+
+    local_keyframes, local_points, found_count, found_fidxs, build_sec, mark_sec, search_sec = result
+    assert list(local_keyframes) == []
+    assert list(local_points) == []
+    assert found_count == 0
+    assert list(found_fidxs) == []
+    assert build_sec >= 0.0
+    assert mark_sec >= 0.0
+    assert search_sec >= 0.0
+
+
 if __name__ == "__main__":
     test_build_local_map_parity()
     test_build_local_map_empty_frame()
     test_mark_current_frame_matched_points_seen()
+    test_build_mark_search_local_map_empty_frame()
     print("F2_LOCAL_MAP_PARITY_OK")

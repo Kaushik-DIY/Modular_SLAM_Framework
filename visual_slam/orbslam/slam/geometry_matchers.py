@@ -92,6 +92,67 @@ def _search_map_by_projection_cpp(points, f_cur, max_reproj_distance,
     return found_count, found_fidxs
 
 
+def build_mark_search_local_map_cpp(
+    f_cur,
+    *,
+    num_best,
+    max_kfs,
+    frame_id,
+    max_reproj_distance,
+    max_descriptor_distance,
+    ratio_test,
+    far_points_threshold,
+):
+    """Run the common tracking local-map build -> mark -> projection-search path in C++.
+
+    The C++ matcher writes accepted matches to the C++ frame mirror first; this
+    wrapper mirrors the existing projection dispatcher by registering the same
+    frame views on the Python frame so downstream tracking and keyframe creation
+    see identical state.
+    """
+    fn = getattr(_cpp_slam_core, "build_mark_search_local_map", None) if _cpp_slam_core is not None else None
+    if fn is None:
+        raise RuntimeError("cpp_slam_core.build_mark_search_local_map is unavailable")
+
+    cpp_frame = _ensure_cpp_frame_mirror(f_cur)
+    fm = FeatureTrackerShared.feature_manager
+    scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
+    mdd = float(_max_descriptor_distance(max_descriptor_distance))
+    far = float(far_points_threshold) if far_points_threshold is not None else float("inf")
+    local_keyframes, local_points, found_count, found_fidxs, build_sec, mark_sec, search_sec = fn(
+        f_cur,
+        cpp_frame,
+        int(num_best),
+        int(max_kfs),
+        int(frame_id),
+        scale_factors,
+        float(max_reproj_distance),
+        mdd,
+        float(ratio_test),
+        float(Parameters.kViewingCosLimitForPoint),
+        float(Parameters.kMinDepth),
+        far,
+        float(fm.log_scale_factor),
+        int(fm.num_levels),
+    )
+
+    if cpp_frame is not f_cur:
+        for fidx in found_fidxs:
+            mp = cpp_frame.points[int(fidx)]
+            if mp is not None:
+                mp.add_frame_view(f_cur, int(fidx))
+
+    return (
+        local_keyframes,
+        local_points,
+        int(found_count),
+        [int(i) for i in found_fidxs],
+        float(build_sec),
+        float(mark_sec),
+        float(search_sec),
+    )
+
+
 def _search_frame_by_projection_cpp(f_ref, f_cur, matched_ref_idxs, matched_ref_points,
                                     max_reproj_distance, max_descriptor_distance):
     """Dispatch to the C++ search_frame_by_projection kernel via an embedded C++

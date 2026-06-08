@@ -26,10 +26,12 @@
   `final_state=OK`, and `avg_fps=2.86`. Tracking loss is now a `MONITOR` flag: raise it to
   high priority only if later full lab runs grow materially above this range; otherwise revisit
   after the remaining runtime-efficiency porting.
-- **Latest implementation step:** native `mark_current_frame_matched_points_seen` plus removal
-  of redundant local-map/projection list copies in the C++ tracking path. Short validation:
-  targeted tests passed, sequential 600-frame lab run had 0 lost / 3.84 FPS, threaded 600-frame
-  lab run had 0 lost / 5.09 FPS.
+- **Latest implementation step:** native combined tracking local-map path:
+  `build_local_map -> mark_current_frame_matched_points_seen -> search_map_by_projection` in one
+  C++ binding call, with the no-vote reference-keyframe fallback preserved in Python. Short
+  validation: targeted tests passed, full suite passed, sequential 600-frame profiled lab run had
+  0 lost / 6.04 FPS, threaded 600-frame profiled lab run had 0 lost / 7.68 FPS, and
+  `tracking.track_local_map` averaged about 20.7 ms on those 600-frame slices.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt

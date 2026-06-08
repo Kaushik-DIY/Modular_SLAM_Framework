@@ -5,6 +5,7 @@
 #include "map_point.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <unordered_map>
@@ -787,6 +788,37 @@ std::pair<py::list, py::list> build_local_map(
     }
 
     return {local_keyframes_out, local_points_out};
+}
+
+std::tuple<py::list, py::list, int, std::vector<int>, double, double, double>
+build_mark_search_local_map(
+    py::object f_cur, py::object frame_obj, int num_best, int max_kfs, int frame_id,
+    py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+    const MatchParams &p) {
+
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    auto local = build_local_map(f_cur, num_best, max_kfs, frame_id);
+    const auto t1 = clock::now();
+
+    mark_current_frame_matched_points_seen(f_cur);
+    const auto t2 = clock::now();
+
+    int found_count = 0;
+    std::vector<int> found_fidxs;
+    if (local.second.size() > 0) {
+        auto search = search_map_by_projection(local.second, frame_obj, scale_factors, p);
+        found_count = search.first;
+        found_fidxs = std::move(search.second);
+    }
+    const auto t3 = clock::now();
+
+    const double build_sec = std::chrono::duration<double>(t1 - t0).count();
+    const double mark_sec = std::chrono::duration<double>(t2 - t1).count();
+    const double search_sec = std::chrono::duration<double>(t3 - t2).count();
+    return std::make_tuple(
+        local.first, local.second, found_count, found_fidxs,
+        build_sec, mark_sec, search_sec);
 }
 
 }  // namespace cppcore

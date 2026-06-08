@@ -16,7 +16,7 @@ import numpy as np
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
 from visual_slam.orbslam.slam.frame import Frame, ensure_frame_feature_arrays
-from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher
+from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher, build_mark_search_local_map_cpp
 from visual_slam.orbslam.slam.keyframe import KeyFrame
 from visual_slam.orbslam.slam.map import Map
 
@@ -25,10 +25,13 @@ try:
     import cpp_slam_core as _cpp_core
     _cpp_build_local_map = getattr(_cpp_core, "build_local_map", None)
     _cpp_mark_current_frame_matched_points_seen = getattr(_cpp_core, "mark_current_frame_matched_points_seen", None)
+    _cpp_build_mark_search_local_map = getattr(_cpp_core, "build_mark_search_local_map", None)
 except Exception:
     _cpp_build_local_map = None
     _cpp_mark_current_frame_matched_points_seen = None
+    _cpp_build_mark_search_local_map = None
 _USE_CPP_LOCAL_MAP = bool(getattr(Parameters, "USE_CPP_KEYFRAME", False)) and (_cpp_build_local_map is not None)
+_USE_CPP_LOCAL_MAP_SEARCH = _USE_CPP_LOCAL_MAP and (_cpp_build_mark_search_local_map is not None)
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.motion_model import MotionModel
 from visual_slam.orbslam.slam.optimizer_g2o import pose_optimization as g2o_pose_optimization
@@ -774,6 +777,107 @@ class Tracking:
             self.local_keyframes = []
             self.local_points = []
 
+    def _update_and_search_local_map_cpp(self, projection_diagnostics=None):
+        self.f_cur.clean_bad_map_points()
+
+        keyframe_votes = self._collect_local_keyframe_votes_from_current_frame(self.f_cur)
+        fallback_reference = self._fallback_reference_keyframe()
+        reference = self._select_reference_keyframe_from_votes(
+            keyframe_votes,
+            fallback_reference=fallback_reference,
+        )
+
+        local_map_build_sec = 0.0
+        search_map_by_projection_sec = 0.0
+
+        if keyframe_votes:
+            self.kf_ref = reference
+            self.f_cur.kf_ref = reference
+            (
+                lk,
+                lp,
+                found_pts_count,
+                found_pts_fidxs,
+                local_map_build_sec,
+                _mark_seen_sec,
+                search_map_by_projection_sec,
+            ) = build_mark_search_local_map_cpp(
+                self.f_cur,
+                num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
+                max_kfs=Parameters.kMaxNumOfKeyframesInLocalMap,
+                frame_id=getattr(self.f_cur, "id", -1),
+                max_reproj_distance=self.reproj_err_frame_map_sigma,
+                max_descriptor_distance=self.descriptor_distance_sigma,
+                ratio_test=Parameters.kMatchRatioTestMap,
+                far_points_threshold=self.far_points_threshold,
+            )
+            self.local_keyframes = lk if isinstance(lk, list) else list(lk)
+            self.local_points = lp if isinstance(lp, list) else list(lp)
+            if projection_diagnostics is not None:
+                projection_diagnostics.clear()
+                projection_diagnostics.update(
+                    {
+                        "input_local_points": len(self.local_points),
+                        "rejected_bad": -1,
+                        "rejected_already_seen": -1,
+                        "rejected_not_visible": -1,
+                        "visible_projected_points": -1,
+                        "kd_candidate_count": -1,
+                        "descriptor_comparisons": -1,
+                        "matches": int(found_pts_count),
+                    }
+                )
+            return (
+                int(found_pts_count),
+                found_pts_fidxs,
+                float(local_map_build_sec),
+                float(search_map_by_projection_sec),
+                keyframe_votes,
+            )
+
+        local_map_build_start = time.perf_counter()
+        if reference is not None:
+            self.map.update_local_map(
+                reference,
+                num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
+            )
+            self.local_keyframes = self.map.get_local_keyframes().to_list()
+            self.local_points = self.map.get_local_points().to_list()
+            self.kf_ref = reference
+            self.f_cur.kf_ref = reference
+        else:
+            self.local_keyframes = []
+            self.local_points = []
+        local_map_build_sec = time.perf_counter() - local_map_build_start
+
+        if len(self.local_points) > 0:
+            if _cpp_mark_current_frame_matched_points_seen is not None:
+                _cpp_mark_current_frame_matched_points_seen(self.f_cur)
+            else:
+                self._mark_current_frame_matched_points_seen(self.f_cur)
+            search_start = time.perf_counter()
+            found_pts_count, found_pts_fidxs = ProjectionMatcher.search_map_by_projection(
+                self.local_points,
+                self.f_cur,
+                max_reproj_distance=self.reproj_err_frame_map_sigma,
+                max_descriptor_distance=self.descriptor_distance_sigma,
+                ratio_test=Parameters.kMatchRatioTestMap,
+                far_points_threshold=self.far_points_threshold,
+                diagnostics=projection_diagnostics,
+            )
+            search_map_by_projection_sec = time.perf_counter() - search_start
+        else:
+            found_pts_count = 0
+            found_pts_fidxs = []
+
+        return (
+            int(found_pts_count),
+            found_pts_fidxs,
+            float(local_map_build_sec),
+            float(search_map_by_projection_sec),
+            keyframe_votes,
+        )
+
     def track_local_map(self):
         with self._profile_section("tracking.track_local_map"):
             track_local_map_start = time.perf_counter()
@@ -797,30 +901,42 @@ class Tracking:
                 num_current_matched_points = sum(1 for p in getattr(self.f_cur, "points", []) if p is not None)
                 current_good_points = self.f_cur.get_matched_good_points()
                 num_current_good_matched_points = len(current_good_points)
-                keyframe_votes = self._collect_local_keyframe_votes_from_current_frame(self.f_cur)
 
-            local_map_build_start = time.perf_counter()
-            self.update_local_map()
-            local_map_build_sec = time.perf_counter() - local_map_build_start
-
-            if len(self.local_points) > 0:
-                if _cpp_mark_current_frame_matched_points_seen is not None:
-                    _cpp_mark_current_frame_matched_points_seen(self.f_cur)
-                else:
-                    self._mark_current_frame_matched_points_seen(self.f_cur)
-                search_start = time.perf_counter()
-                found_pts_count, found_pts_fidxs = ProjectionMatcher.search_map_by_projection(
-                    self.local_points,
-                    self.f_cur,
-                    max_reproj_distance=self.reproj_err_frame_map_sigma,
-                    max_descriptor_distance=self.descriptor_distance_sigma,
-                    ratio_test=Parameters.kMatchRatioTestMap,
-                    far_points_threshold=self.far_points_threshold,
-                    diagnostics=projection_diagnostics,
-                )
-                search_map_by_projection_sec = time.perf_counter() - search_start
+            if _USE_CPP_LOCAL_MAP_SEARCH:
+                (
+                    found_pts_count,
+                    found_pts_fidxs,
+                    local_map_build_sec,
+                    search_map_by_projection_sec,
+                    keyframe_votes,
+                ) = self._update_and_search_local_map_cpp(projection_diagnostics)
             else:
-                found_pts_count = 0
+                local_map_build_start = time.perf_counter()
+                self.update_local_map()
+                local_map_build_sec = time.perf_counter() - local_map_build_start
+
+                if self.profile_local_map:
+                    keyframe_votes = self._collect_local_keyframe_votes_from_current_frame(self.f_cur)
+
+                if len(self.local_points) > 0:
+                    if _cpp_mark_current_frame_matched_points_seen is not None:
+                        _cpp_mark_current_frame_matched_points_seen(self.f_cur)
+                    else:
+                        self._mark_current_frame_matched_points_seen(self.f_cur)
+                    search_start = time.perf_counter()
+                    found_pts_count, found_pts_fidxs = ProjectionMatcher.search_map_by_projection(
+                        self.local_points,
+                        self.f_cur,
+                        max_reproj_distance=self.reproj_err_frame_map_sigma,
+                        max_descriptor_distance=self.descriptor_distance_sigma,
+                        ratio_test=Parameters.kMatchRatioTestMap,
+                        far_points_threshold=self.far_points_threshold,
+                        diagnostics=projection_diagnostics,
+                    )
+                    search_map_by_projection_sec = time.perf_counter() - search_start
+                else:
+                    found_pts_count = 0
+                    found_pts_fidxs = []
 
             pose_before_pos_opt = self.f_cur.pose()
             pose_optimization_start = time.perf_counter()

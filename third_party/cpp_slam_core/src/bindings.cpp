@@ -626,6 +626,26 @@ PYBIND11_MODULE(cpp_slam_core, m) {
           py::arg("f_cur"), py::arg("num_best"), py::arg("max_kfs"), py::arg("frame_id"),
           "F2 C++ expanding tracking local-map build -> (local_keyframes, local_points).");
 
+    m.def("build_mark_search_local_map",
+          [](py::object f_cur, py::object frame,
+             int num_best, int max_kfs, int frame_id,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             float max_reproj_distance, float max_descriptor_distance, float ratio_test,
+             float viewing_cos_limit, float min_depth, float far_points_threshold,
+             double log_scale_factor, int num_levels) {
+              cppcore::MatchParams p{max_reproj_distance, max_descriptor_distance, ratio_test,
+                                     viewing_cos_limit, min_depth, far_points_threshold,
+                                     log_scale_factor, num_levels};
+              return cppcore::build_mark_search_local_map(
+                  f_cur, frame, num_best, max_kfs, frame_id, scale_factors, p);
+          },
+          py::arg("f_cur"), py::arg("frame"), py::arg("num_best"), py::arg("max_kfs"),
+          py::arg("frame_id"), py::arg("scale_factors"), py::arg("max_reproj_distance"),
+          py::arg("max_descriptor_distance"), py::arg("ratio_test"),
+          py::arg("viewing_cos_limit"), py::arg("min_depth"), py::arg("far_points_threshold"),
+          py::arg("log_scale_factor"), py::arg("num_levels"),
+          "F3 C++ build+mark+search local-map path -> lists, matches, section timings.");
+
     // Python 3.11 adaptive interpreter specialization bug: calling a pybind11
     // instancemethod exactly 8 times in a tight for loop triggers a segfault
     // (CALL opcode quickening selects the C-extension fast path which crashes).
