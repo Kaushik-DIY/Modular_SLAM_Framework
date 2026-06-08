@@ -10,6 +10,9 @@
 #include "local_mapping_core.h"
 #include "geometry_matchers.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace py = pybind11;
 using namespace slam;
 
@@ -19,6 +22,127 @@ using namespace slam;
 static Eigen::Vector3d np_to_vec3(py::array_t<double, py::array::c_style> arr) {
     auto r = arr.unchecked<1>();
     return Eigen::Vector3d(r(0), r(1), r(2));
+}
+
+// ---------------------------------------------------------------------------
+// Local BA write-back helpers
+// ---------------------------------------------------------------------------
+static int update_local_ba_poses_batch(
+    const py::list &keyframes,
+    py::array_t<double, py::array::c_style | py::array::forcecast> poses,
+    py::array_t<bool, py::array::c_style | py::array::forcecast> update_mask)
+{
+    auto pose_view = poses.unchecked<2>();
+    auto mask_view = update_mask.unchecked<1>();
+    const ssize_t n = std::min<ssize_t>(
+        static_cast<ssize_t>(py::len(keyframes)),
+        std::min<ssize_t>(pose_view.shape(0), mask_view.shape(0)));
+
+    int updated = 0;
+    for (ssize_t i = 0; i < n; ++i) {
+        if (!mask_view(i)) continue;
+
+        py::object obj = py::reinterpret_borrow<py::object>(keyframes[i]);
+        if (obj.is_none()) continue;
+
+        bool is_bad = false;
+        try {
+            if (py::isinstance<KeyFrame>(obj)) {
+                is_bad = obj.cast<KeyFrame &>().is_bad();
+            } else {
+                auto is_bad_attr = obj.attr("is_bad");
+                is_bad = py::cast<bool>(is_bad_attr());
+            }
+        } catch (...) {
+            try { is_bad = py::cast<bool>(obj.attr("_is_bad")); } catch (...) {}
+        }
+        if (is_bad) continue;
+
+        bool finite = true;
+        Eigen::Matrix4d T;
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                const double v = pose_view(i, r * 4 + c);
+                if (!std::isfinite(v)) finite = false;
+                T(r, c) = v;
+            }
+        }
+        if (!finite) continue;
+
+        if (py::isinstance<KeyFrame>(obj)) {
+            auto &kf = obj.cast<KeyFrame &>();
+            kf.update_pose(T);
+        } else {
+            py::array_t<double> T_arr({4, 4});
+            auto T_view = T_arr.mutable_unchecked<2>();
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    T_view(r, c) = T(r, c);
+            obj.attr("update_pose")(T_arr);
+        }
+        try {
+            if (py::hasattr(obj, "lba_count")) {
+                obj.attr("lba_count") = obj.attr("lba_count").cast<int>() + 1;
+            }
+        } catch (...) {
+        }
+        ++updated;
+    }
+    return updated;
+}
+
+static int update_local_ba_points_batch(
+    const py::list &points,
+    py::array_t<double, py::array::c_style | py::array::forcecast> positions,
+    py::array_t<bool, py::array::c_style | py::array::forcecast> update_mask)
+{
+    auto pos_view = positions.unchecked<2>();
+    auto mask_view = update_mask.unchecked<1>();
+    const ssize_t n = std::min<ssize_t>(
+        static_cast<ssize_t>(py::len(points)),
+        std::min<ssize_t>(pos_view.shape(0), mask_view.shape(0)));
+
+    int updated = 0;
+    for (ssize_t i = 0; i < n; ++i) {
+        if (!mask_view(i)) continue;
+
+        py::object obj = py::reinterpret_borrow<py::object>(points[i]);
+        if (obj.is_none()) continue;
+
+        bool is_bad = false;
+        try {
+            if (py::isinstance<MapPoint>(obj)) {
+                is_bad = obj.cast<MapPoint &>().is_bad();
+            } else {
+                auto is_bad_attr = obj.attr("is_bad");
+                is_bad = py::cast<bool>(is_bad_attr());
+            }
+        } catch (...) {
+            try { is_bad = py::cast<bool>(obj.attr("_is_bad")); } catch (...) {}
+        }
+        if (is_bad) continue;
+
+        const double x = pos_view(i, 0);
+        const double y = pos_view(i, 1);
+        const double z = pos_view(i, 2);
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+
+        if (py::isinstance<MapPoint>(obj)) {
+            auto &mp = obj.cast<MapPoint &>();
+            mp.update_position(Eigen::Vector3d(x, y, z));
+            mp.update_normal_and_depth();
+        } else {
+            py::array_t<double> p_arr({3});
+            auto p_view = p_arr.mutable_unchecked<1>();
+            p_view(0) = x;
+            p_view(1) = y;
+            p_view(2) = z;
+            obj.attr("update_position")(p_arr);
+            obj.attr("update_normal_and_depth")();
+        }
+        ++updated;
+    }
+    return updated;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +673,13 @@ PYBIND11_MODULE(cpp_slam_core, m) {
     bind_frame(m);
     bind_keyframe(m);
     bind_local_mapping_core(m);
+
+    m.def("update_local_ba_poses_batch", &update_local_ba_poses_batch,
+          py::arg("keyframes"), py::arg("poses"), py::arg("update_mask"),
+          "Batch write-back of local BA keyframe poses.");
+    m.def("update_local_ba_points_batch", &update_local_ba_points_batch,
+          py::arg("points"), py::arg("positions"), py::arg("update_mask"),
+          "Batch write-back of local BA map-point positions and normal/depth info.");
 
     // ---- Phase 5: C++ projection matcher (params passed from Python) -------
     m.def("search_map_by_projection",

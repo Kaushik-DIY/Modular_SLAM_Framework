@@ -96,6 +96,18 @@
   `local_mapping.local_BA` mean 376.7 ms over 30 calls, `slam.track` mean 96.6 ms, and
   `frame.total` mean 144.9 ms. This is a narrow packing cleanup and does **not** replace checkpoint
   2.39 as the current full-run reference.
+- **Latest implementation milestone:** checkpoint 2.41 (`local BA batch write-back smoke`) added
+  native `cpp_slam_core` batch helpers for local-BA keyframe pose and map-point position /
+  normal-depth write-back, with the old Python path retained as fallback. `unpack_local_ba` now
+  uses those helpers when available and also caches point lists while pruning outlier observations.
+  Validation passed: C++ rebuild/install sanity, optimizer-core parity (`11 passed`), focused
+  local-mapping tests (`30 passed`), full ORB-SLAM suite (`514 passed, 1 skipped`), and a threaded
+  600-frame lab smoke saved under
+  `visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/`
+  (`600/600 OK`, `0` lost, `final_state=OK`, `avg_fps=8.11`). Compared with the 2.40 smoke,
+  `local_mapping.local_BA` mean improved from 376.7 ms to 299.9 ms and `frame.total` mean improved
+  from 144.9 ms to 122.6 ms. This is still GIL-held and does **not** replace checkpoint 2.39 as the
+  current full-run reference.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt

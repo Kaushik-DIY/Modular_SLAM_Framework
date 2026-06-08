@@ -14,6 +14,11 @@ from typing import Iterable
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.keyframe import KeyFrame
 
+try:
+    import cpp_slam_core as _CPP_SLAM_CORE
+except ImportError:
+    _CPP_SLAM_CORE = None
+
 
 def _get_inv_sigma2(kf: KeyFrame, idx: int, feature_manager) -> float:
     """inv_sigma2 for octave level at idx — matches get_inv_level_sigma2 in optimizer_g2o.py."""
@@ -301,16 +306,14 @@ def unpack_local_ba(
     Write optimized poses and positions back to the live map.
     Mirrors the write-back block in _bundle_adjustment_core().
     """
-    import g2o
-
     updated_poses = result["updated_poses"]   # (N, 16)
     updated_points = result["updated_points"] # (M, 3)
     outlier_mask = result["outlier_mask"]     # (K,)
 
     local_ids = {id(kf) for kf in local_keyframes}
-    fixed_ids = {id(kf) for kf in fixed_keyframes}
 
     # Collect updates before acquiring map lock
+    pose_update_mask = np.zeros(len(kf_list), dtype=bool)
     pose_updates: dict = {}
     for i, kf in enumerate(kf_list):
         if id(kf) not in local_ids:
@@ -320,8 +323,10 @@ def unpack_local_ba(
         T = updated_poses[i].reshape(4, 4)
         if not np.all(np.isfinite(T)):
             continue
+        pose_update_mask[i] = True
         pose_updates[kf] = T
 
+    point_update_mask = np.zeros(len(pt_list), dtype=bool)
     point_updates: list[tuple] = []
     if not fixed_points:
         for j, p in enumerate(pt_list):
@@ -330,25 +335,61 @@ def unpack_local_ba(
             pos = updated_points[j]
             if not np.all(np.isfinite(pos)):
                 continue
+            point_update_mask[j] = True
             point_updates.append((p, pos))
 
     outlier_obs: list[tuple] = []
     if prune_outliers:
-        for k, (p, kf, idx) in enumerate(obs_triples):
-            if k < len(outlier_mask) and outlier_mask[k]:
-                outlier_obs.append((p, kf, idx))
+        outlier_mask_arr = np.asarray(outlier_mask, dtype=bool).reshape(-1)
+        for k in np.flatnonzero(outlier_mask_arr[:len(obs_triples)]):
+            outlier_obs.append(obs_triples[int(k)])
+
+    batch_writeback = (
+        _CPP_SLAM_CORE is not None
+        and hasattr(_CPP_SLAM_CORE, "update_local_ba_poses_batch")
+        and hasattr(_CPP_SLAM_CORE, "update_local_ba_points_batch")
+    )
 
     # Write back under map lock
     lock_ctx = map_lock if map_lock is not None else nullcontext()
     with lock_ctx:
         if prune_outliers:
+            kf_points_cache = {}
             for p, kf, idx in outlier_obs:
                 if _is_bad_pt(p) or _is_bad_kf(kf):
                     continue
-                if idx < 0 or idx >= len(getattr(kf, "points", [])):
+                kid = id(kf)
+                points_list = kf_points_cache.get(kid)
+                if points_list is None:
+                    points_list = list(getattr(kf, "points", []))
+                    kf_points_cache[kid] = points_list
+                if idx < 0 or idx >= len(points_list):
                     continue
-                if kf.get_point_match(idx) is p:
+                if points_list[idx] is p:
                     p.remove_observation(kf, idx, map_no_lock=True)
+
+        if batch_writeback:
+            try:
+                _CPP_SLAM_CORE.update_local_ba_poses_batch(
+                    list(kf_list), np.asarray(updated_poses, dtype=np.float64), pose_update_mask
+                )
+                pose_updates = {}
+            except Exception:
+                pass
+
+            if not fixed_points:
+                try:
+                    _CPP_SLAM_CORE.update_local_ba_points_batch(
+                        list(pt_list), np.asarray(updated_points, dtype=np.float64), point_update_mask
+                    )
+                    point_updates = []
+                except Exception:
+                    pass
+
+            if not pose_updates and (fixed_points or not point_updates):
+                return
+
+        import g2o
 
         for kf, T in pose_updates.items():
             if not _is_bad_kf(kf):

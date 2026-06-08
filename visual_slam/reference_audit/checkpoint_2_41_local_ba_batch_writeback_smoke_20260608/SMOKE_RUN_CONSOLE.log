@@ -1,0 +1,143 @@
+[run_lab_cpp] USE_CPP_CORE = True  (SIGUSR1 -> thread dump armed)
+LocalMapping: background thread started
+================================================================================
+Final RGB-D ORB-SLAM run
+================================================================================
+Dataset:             /home/kaushik/slam_ws/datasets/lab_rgbd_run_2
+Dataset type:        lab_rgbd
+Output:              /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run
+Frames loaded:       600
+Camera source:       /home/kaushik/slam_ws/datasets/lab_rgbd_run_2/camera.yaml
+Camera intrinsics:   fx=609.883, fy=609.177, cx=324.921, cy=229.748
+Image size:          640x480
+Depth map factor:    1000.0
+Depth factor:        0.001
+Baseline (m):        0.08 [default_rgbd_virtual_baseline_0p08m]
+Depth threshold:     40.0 [default_th_depth_40]
+bf:                  48.790664062480005
+Feature backend:     auto
+Loop closing:        disabled
+Loop cand source:    auto
+Global BA:           disabled
+LM threading:        enabled (wait=0.5s)
+Memory profile:      disabled (cheap)
+Runtime profile:     enabled
+Local map profile:   enabled
+Keyframe profile:    enabled
+================================================================================
+[0001/0600] idx=00000 state=OK ok=True kf=1 mp=427 tracked=427 ba_mse=NA frame_sec=0.369
+local mapping: starting...
+local mapping elapsed time: 0.38451099395751953
+local mapping: starting...
+local mapping elapsed time: 0.40287280082702637
+local mapping: starting...
+local mapping elapsed time: 0.5039207935333252
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.7234230041503906
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.7056679725646973
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.8883376121520996
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.9645342826843262
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.920849084854126
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.9138054847717285
+[0201/0600] idx=00200 state=OK ok=True kf=3 mp=1575 tracked=516 ba_mse=0.18086856196330997 frame_sec=0.123
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.9073467254638672
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 1.0385115146636963
+local mapping: starting...
+local mapping elapsed time: 0.5241293907165527
+local mapping: starting...
+local mapping elapsed time: 0.4677116870880127
+local mapping: starting...
+local mapping elapsed time: 0.5001482963562012
+local mapping: starting...
+local mapping elapsed time: 0.6066219806671143
+local mapping: starting...
+local mapping elapsed time: 0.4730224609375
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.8566977977752686
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.7060298919677734
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.6928324699401855
+[0401/0600] idx=00400 state=OK ok=True kf=4 mp=1814 tracked=453 ba_mse=1.033614276370937 frame_sec=0.131
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.8723940849304199
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.6932432651519775
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.8659820556640625
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.8154675960540771
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.7466049194335938
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.8641071319580078
+local mapping: starting...
+local mapping elapsed time: 0.36755943298339844
+local mapping: starting...
+local mapping elapsed time: 0.5023581981658936
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.6175193786621094
+local mapping: starting...
+local mapping elapsed time: 0.5532243251800537
+local mapping: starting...
+LocalMapping: timeout 0.5s reached
+local mapping elapsed time: 0.935553789138794
+[0600/0600] idx=00599 state=OK ok=True kf=11 mp=3791 tracked=146 ba_mse=2.2373046692606495 frame_sec=0.081
+LocalMapping: background thread stopped
+final map compaction:  purged 38 ghost points
+================================================================================
+RUN SUMMARY
+================================================================================
+frames_attempted:     600
+tracking_ok_count:    600
+tracking_lost_count:  0
+errors:               0
+final_state:          OK
+keyframes:            11
+map_points:           3753
+trajectory_poses:     600
+elapsed_sec:          73.950
+avg_fps:              8.11
+trajectory_file:      /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/trajectory_lab_rgbd_run_2.txt
+frame_log_file:       /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/frame_log_lab_rgbd_run_2.csv
+frame_timing_file:    /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/frame_timing.csv
+map_points_ply:       /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/map_points.ply
+keyframes_json:       /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/keyframes.json
+keyframe_graph_json:  /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/keyframe_graph.json
+effective_config:     /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/effective_run_config.json
+completed_timestamp:  20260608_223603
+standardized_stem:    lab_rgbd__lab_rgbd_run_2__completed_20260608_223603
+standardized_summary: /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/run_summary__lab_rgbd__lab_rgbd_run_2__completed_20260608_223603.json
+local_map_profile:    /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/local_map_profile.csv
+keyframe_log:         /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/keyframe_decision_log.csv
+lm_schedule_log:      /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/local_mapping_schedule_log.csv
+runtime_profile_csv:  /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/runtime_profile.csv
+runtime_profile_json: /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_41_local_ba_batch_writeback_smoke_20260608/run/runtime_profile.json
+kf_traj_consistency:  n=11 max=0.0000m median=0.0000m
+================================================================================
+LocalMapping: background thread stopped
