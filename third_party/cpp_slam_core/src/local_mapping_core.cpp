@@ -40,6 +40,14 @@ bool is_bad_mappoint(const py::object &mp_obj) {
     try { return mp_obj.attr("is_bad")().cast<bool>(); } catch (...) { return true; }
 }
 
+int keyframe_kid_or_id(const py::object &kf_obj, int fallback) {
+    KeyFrame *kf = as_keyframe(kf_obj);
+    if (kf != nullptr) return kf->kid;
+    try { return kf_obj.attr("kid").cast<int>(); } catch (...) {}
+    try { return kf_obj.attr("id").cast<int>(); } catch (...) {}
+    return fallback;
+}
+
 std::vector<py::object> matched_good_points_native(const KeyFrame &kf) {
     std::vector<py::object> result;
     result.reserve(kf.points.size());
@@ -101,13 +109,21 @@ void LocalMappingCore::set_opt_abort_flag(bool value) {
 // ---- process_new_keyframe ---------------------------------------------------
 void LocalMappingCore::process_new_keyframe() {
     // Fast path: if kf_cur is a C++ KeyFrame, use typed access.
-    if (py::isinstance<KeyFrame>(kf_cur)) {
-        KeyFrame &kf = kf_cur.cast<KeyFrame &>();
+    KeyFrame *kf_native = as_keyframe(kf_cur);
+    if (kf_native != nullptr) {
+        KeyFrame &kf = *kf_native;
         auto pts_idxs = kf.get_matched_good_points_and_idxs();
         for (auto &[p, idx] : pts_idxs) {
-            bool added = p.attr("add_observation")(kf_cur, idx).cast<bool>();
+            bool added = false;
+            MapPoint *mp = as_mappoint(p);
+            if (mp != nullptr) {
+                added = mp->add_observation(kf_cur, idx);
+            } else {
+                added = p.attr("add_observation")(kf_cur, idx).cast<bool>();
+            }
             if (added) {
-                p.attr("update_info")();
+                if (mp != nullptr) mp->update_info();
+                else p.attr("update_info")();
             } else {
                 recently_added.insert(p);
             }
@@ -138,6 +154,16 @@ int LocalMappingCore::_point_first_kid(py::object p, int fallback_kid) const {
         try { return p.attr("first_kid").cast<int>(); } catch (...) {}
     }
     // Compute from observations.
+    MapPoint *mp = as_mappoint(p);
+    if (mp != nullptr) {
+        int min_kid = fallback_kid;
+        bool found_any = false;
+        for (auto &obs : mp->observations()) {
+            int kid = keyframe_kid_or_id(obs.first, fallback_kid);
+            if (!found_any || kid < min_kid) { min_kid = kid; found_any = true; }
+        }
+        return min_kid;
+    }
     try {
         auto obs = p.attr("observations")();
         int min_kid = fallback_kid;
@@ -157,28 +183,34 @@ int LocalMappingCore::_point_first_kid(py::object p, int fallback_kid) const {
 int LocalMappingCore::cull_map_points() {
     int th_obs = (sensor_type != static_cast<int>(SensorTypeEnum::MONOCULAR)) ? 3 : 2;
     constexpr float kMinFoundRatio = 0.25f;
-    int current_kid = kf_cur.attr("kid").cast<int>();
+    int current_kid = keyframe_kid_or_id(kf_cur, 0);
 
     std::vector<py::object> to_keep;
     int n_removed = 0;
 
     for (const auto &p : recently_added) {
         try {
-            if (p.attr("is_bad")().cast<bool>()) {
+            MapPoint *mp = as_mappoint(p);
+            if ((mp != nullptr && mp->is_bad()) ||
+                (mp == nullptr && p.attr("is_bad")().cast<bool>())) {
                 ++n_removed;
                 continue;
             }
-            float fr = p.attr("get_found_ratio")().cast<float>();
+            float fr = (mp != nullptr) ? mp->get_found_ratio()
+                                       : p.attr("get_found_ratio")().cast<float>();
             if (fr < kMinFoundRatio) {
-                p.attr("set_bad")();
+                if (mp != nullptr) mp->set_bad();
+                else p.attr("set_bad")();
                 map.attr("remove_point")(p);
                 ++n_removed;
                 continue;
             }
             int first_kid = _point_first_kid(p, current_kid);
-            int n_obs = p.attr("num_observations")().cast<int>();
+            int n_obs = (mp != nullptr) ? mp->num_observations()
+                                        : p.attr("num_observations")().cast<int>();
             if (current_kid - first_kid >= 2 && n_obs <= th_obs) {
-                p.attr("set_bad")();
+                if (mp != nullptr) mp->set_bad();
+                else p.attr("set_bad")();
                 map.attr("remove_point")(p);
                 ++n_removed;
                 continue;
