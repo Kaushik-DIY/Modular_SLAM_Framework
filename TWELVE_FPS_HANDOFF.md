@@ -108,6 +108,15 @@
   `local_mapping.local_BA` mean improved from 376.7 ms to 299.9 ms and `frame.total` mean improved
   from 144.9 ms to 122.6 ms. This is still GIL-held and does **not** replace checkpoint 2.39 as the
   current full-run reference.
+- **Latest full-run validation after 2.41:** checkpoint
+  `visual_slam/reference_audit/checkpoint_2_41_full_lab_batch_writeback_threaded_20260608/`
+  completed all 4494 lab frames at commit `dddc17e4` with `final_state=OK`, `errors=0`,
+  `avg_fps=7.29`, `elapsed_sec=616.43`, `keyframes=202`, and `map_points=36277`. Runtime improved
+  materially over 2.39 (`avg_fps` 6.18 -> 7.29, `frame.total` mean 160.8 ms -> 136.2 ms,
+  `local_mapping.local_BA` mean 606.5 ms -> 315.7 ms). **Tracking loss increased** from 60 to 83,
+  so keep checkpoint 2.39 as the quality/reference checkpoint and treat 2.41 as the current
+  performance reference with a tracking-stability flag. If later full runs increase lost frames
+  further, make tracking stability high priority before more runtime work.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
