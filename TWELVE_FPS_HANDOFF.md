@@ -150,6 +150,16 @@
   FPS remained near-flat/noisy (`5.96 -> 5.91`). A no-wait policy probe improved from 6.13 to
   6.21 FPS and reduced `local_mapping.local_BA` from 732.4 ms to 521.5 ms, still with `0` lost.
   Treat this as an accepted local-BA section improvement, not a new full-run reference.
+- **Latest full-run validation after 2.43:** checkpoint
+  `visual_slam/reference_audit/checkpoint_2_43_full_lab_native_local_ba_pack_threaded_20260608/`
+  completed all 4494 lab frames at commit `77c3ca82` with `final_state=OK`, `errors=0`,
+  `avg_fps=5.73`, `tracking_lost_count=60`, `keyframes=221`, and `map_points=36277`. This restores
+  the monitored lost-frame count to the 2.39 quality-reference range (`60`) and improves over 2.41
+  (`83`) / 2.42 (`76`) on stability. It is **not** a new performance reference: throughput regressed
+  versus 2.41 (`7.29 FPS`) and 2.42 (`7.10 FPS`) because the run produced more keyframes and higher
+  tracking/load/fuse/cull timing. Keep 2.41 as the fastest full-run performance reference, 2.42 as
+  the validated native point-creation reference, and 2.43 as a saved stability/quality checkpoint
+  confirming native local-BA packing did not degrade tracking quality.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
