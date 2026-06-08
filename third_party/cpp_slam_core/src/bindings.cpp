@@ -11,7 +11,12 @@
 #include "geometry_matchers.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace py = pybind11;
 using namespace slam;
@@ -143,6 +148,178 @@ static int update_local_ba_points_batch(
         ++updated;
     }
     return updated;
+}
+
+static py::object pack_local_ba_native(
+    const py::list &local_keyframes,
+    const py::list &fixed_keyframes,
+    const py::list &points,
+    py::array_t<double, py::array::c_style | py::array::forcecast> inv_level_sigmas2)
+{
+    struct KfEntry {
+        py::object obj;
+        KeyFrame *kf;
+        bool fixed;
+    };
+    struct PtEntry {
+        py::object obj;
+        MapPoint *mp;
+    };
+
+    std::unordered_set<KeyFrame *> fixed_set;
+    for (auto item : fixed_keyframes) {
+        py::object obj = py::reinterpret_borrow<py::object>(item);
+        if (obj.is_none()) continue;
+        KeyFrame *kf = nullptr;
+        try { kf = obj.cast<KeyFrame *>(); } catch (...) { return py::none(); }
+        if (kf == nullptr) return py::none();
+        if (!kf->is_bad()) fixed_set.insert(kf);
+    }
+
+    std::vector<KfEntry> kf_entries;
+    std::unordered_set<KeyFrame *> seen_kfs;
+    auto append_kfs = [&](const py::list &items) -> bool {
+        for (auto item : items) {
+            py::object obj = py::reinterpret_borrow<py::object>(item);
+            if (obj.is_none()) continue;
+            KeyFrame *kf = nullptr;
+            try { kf = obj.cast<KeyFrame *>(); } catch (...) { return false; }
+            if (kf == nullptr) return false;
+            if (kf->is_bad()) continue;
+            if (!seen_kfs.insert(kf).second) continue;
+            kf_entries.push_back({obj, kf, fixed_set.count(kf) > 0});
+        }
+        return true;
+    };
+    if (!append_kfs(local_keyframes) || !append_kfs(fixed_keyframes)) return py::none();
+
+    std::unordered_map<KeyFrame *, ssize_t> kf_index;
+    for (ssize_t i = 0; i < static_cast<ssize_t>(kf_entries.size()); ++i) {
+        kf_index[kf_entries[i].kf] = i;
+    }
+
+    std::vector<PtEntry> pt_entries;
+    pt_entries.reserve(py::len(points));
+    for (auto item : points) {
+        py::object obj = py::reinterpret_borrow<py::object>(item);
+        if (obj.is_none()) continue;
+        MapPoint *mp = nullptr;
+        try { mp = obj.cast<MapPoint *>(); } catch (...) { return py::none(); }
+        if (mp == nullptr) return py::none();
+        if (mp->is_bad()) continue;
+        pt_entries.push_back({obj, mp});
+    }
+
+    std::unordered_map<MapPoint *, ssize_t> pt_index;
+    for (ssize_t i = 0; i < static_cast<ssize_t>(pt_entries.size()); ++i) {
+        pt_index[pt_entries[i].mp] = i;
+    }
+
+    const ssize_t N = static_cast<ssize_t>(kf_entries.size());
+    const ssize_t M = static_cast<ssize_t>(pt_entries.size());
+
+    py::array_t<double> kf_poses({N, static_cast<ssize_t>(16)});
+    py::array_t<int64_t> kf_ids({N});
+    py::array_t<uint8_t> kf_fixed({N});
+    py::array_t<double> point_pos({M, static_cast<ssize_t>(3)});
+
+    auto poses = kf_poses.mutable_unchecked<2>();
+    auto ids = kf_ids.mutable_unchecked<1>();
+    auto fixed = kf_fixed.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < N; ++i) {
+        const Eigen::Matrix4d T = kf_entries[i].kf->Tcw();
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                poses(i, r * 4 + c) = T(r, c);
+            }
+        }
+        ids(i) = static_cast<int64_t>(kf_entries[i].kf->kid);
+        fixed(i) = (kf_entries[i].fixed || kf_entries[i].kf->kid == 0) ? 1 : 0;
+    }
+
+    auto pos = point_pos.mutable_unchecked<2>();
+    std::vector<bool> point_valid(M, false);
+    for (ssize_t i = 0; i < M; ++i) {
+        const Eigen::Vector3d p = pt_entries[i].mp->get_position();
+        point_valid[i] = p.allFinite();
+        pos(i, 0) = p(0);
+        pos(i, 1) = p(1);
+        pos(i, 2) = p(2);
+    }
+
+    py::list kf_list;
+    for (const auto &entry : kf_entries) kf_list.append(entry.obj);
+    py::list pt_list;
+    for (const auto &entry : pt_entries) pt_list.append(entry.obj);
+
+    py::array_t<double> camera({static_cast<ssize_t>(5)});
+    auto cam = camera.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < 5; ++i) cam(i) = 0.0;
+    if (!kf_entries.empty()) {
+        py::object cam_obj = kf_entries[0].kf->camera;
+        try {
+            cam(0) = cam_obj.attr("fx").cast<double>();
+            cam(1) = cam_obj.attr("fy").cast<double>();
+            cam(2) = cam_obj.attr("cx").cast<double>();
+            cam(3) = cam_obj.attr("cy").cast<double>();
+            cam(4) = cam_obj.attr("bf").cast<double>();
+        } catch (...) {}
+    }
+
+    auto inv_sigmas = inv_level_sigmas2.unchecked<1>();
+    const ssize_t n_sigmas = inv_sigmas.shape(0);
+
+    std::vector<std::array<double, 8>> obs_rows;
+    py::list obs_triples;
+    for (const auto &pt_entry : pt_entries) {
+        const auto pt_it = pt_index.find(pt_entry.mp);
+        if (pt_it == pt_index.end()) continue;
+        const ssize_t pt_row = pt_it->second;
+        if (pt_row < 0 || pt_row >= M || !point_valid[pt_row]) continue;
+
+        for (const auto &obs : pt_entry.mp->observations()) {
+            KeyFrame *kf = nullptr;
+            try { kf = obs.first.cast<KeyFrame *>(); } catch (...) { continue; }
+            if (kf == nullptr || kf->is_bad()) continue;
+            auto kf_it = kf_index.find(kf);
+            if (kf_it == kf_index.end()) continue;
+            const int idx = obs.second;
+            if (idx < 0 || idx >= static_cast<int>(kf->points.size())) continue;
+            if (kf->points[idx].ptr() != pt_entry.obj.ptr()) continue;
+            if (idx >= kf->kpsu.rows()) continue;
+
+            const int octave = (idx < kf->octaves.size()) ? kf->octaves(idx) : 0;
+            const int oct_level = std::max(0, std::min<int>(octave, static_cast<int>(n_sigmas) - 1));
+            const double inv_s2 = (n_sigmas > 0) ? inv_sigmas(oct_level) : 1.0;
+            const double ur = (idx < kf->kps_ur.size()) ? static_cast<double>(kf->kps_ur(idx)) : -1.0;
+
+            obs_rows.push_back({
+                static_cast<double>(kf_it->second),
+                static_cast<double>(pt_row),
+                static_cast<double>(kf->kpsu(idx, 0)),
+                static_cast<double>(kf->kpsu(idx, 1)),
+                ur,
+                static_cast<double>(octave),
+                inv_s2,
+                ur >= 0.0 ? 1.0 : 0.0,
+            });
+            obs_triples.append(py::make_tuple(pt_entry.obj, obs.first, idx));
+        }
+    }
+
+    py::array_t<double> observations({
+        static_cast<ssize_t>(obs_rows.size()),
+        static_cast<ssize_t>(8)
+    });
+    auto obs_view = observations.mutable_unchecked<2>();
+    for (ssize_t r = 0; r < static_cast<ssize_t>(obs_rows.size()); ++r) {
+        for (ssize_t c = 0; c < 8; ++c) obs_view(r, c) = obs_rows[r][c];
+    }
+
+    return py::make_tuple(
+        kf_poses, kf_ids, kf_fixed,
+        point_pos, observations, camera,
+        kf_list, pt_list, obs_triples);
 }
 
 static py::tuple add_triangulated_map_points_batch(
@@ -767,6 +944,10 @@ PYBIND11_MODULE(cpp_slam_core, m) {
     m.def("update_local_ba_points_batch", &update_local_ba_points_batch,
           py::arg("points"), py::arg("positions"), py::arg("update_mask"),
           "Batch write-back of local BA map-point positions and normal/depth info.");
+    m.def("pack_local_ba_native", &pack_local_ba_native,
+          py::arg("local_keyframes"), py::arg("fixed_keyframes"), py::arg("points"),
+          py::arg("inv_level_sigmas2"),
+          "Pack native C++ keyframes/map points for slam_optimizer_core local BA.");
     m.def("add_triangulated_map_points_batch", &add_triangulated_map_points_batch,
           py::arg("map_obj"), py::arg("pts3d"), py::arg("pts3d_mask"),
           py::arg("kf1"), py::arg("kf2"), py::arg("idxs1"), py::arg("idxs2"),

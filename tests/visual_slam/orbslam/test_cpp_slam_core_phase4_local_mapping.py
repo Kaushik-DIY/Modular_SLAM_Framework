@@ -297,6 +297,42 @@ class TestLocalBA:
         assert tracked == expected
 
 
+class TestNativeLocalBAPack:
+    def test_matches_python_pack_fallback(self, monkeypatch):
+        """Native C++ BA packing must produce the same arrays as the Python packer."""
+        import cpp_slam_core
+        from visual_slam.orbslam.slam import slam_optimizer_bridge as bridge
+
+        kfs, mps = _build_scenario(n_kfs=3, n_shared=6)
+
+        class FeatureManager:
+            inv_level_sigmas2 = np.asarray([1.0, 0.7, 0.5, 0.35], dtype=np.float64)
+
+        fm = FeatureManager()
+        local_kfs = [kfs[1], kfs[2]]
+        fixed_kfs = [kfs[0]]
+
+        native = cpp_slam_core.pack_local_ba_native(
+            local_kfs,
+            fixed_kfs,
+            mps,
+            fm.inv_level_sigmas2,
+        )
+        assert native is not None
+
+        monkeypatch.setattr(bridge, "_CPP_SLAM_CORE", None)
+        fallback = bridge.pack_local_ba(local_kfs, fixed_kfs, mps, fm)
+
+        for native_arr, fallback_arr in zip(native[:6], fallback[:6]):
+            np.testing.assert_allclose(np.asarray(native_arr), np.asarray(fallback_arr))
+
+        assert [id(kf) for kf in native[6]] == [id(kf) for kf in fallback[6]]
+        assert [id(mp) for mp in native[7]] == [id(mp) for mp in fallback[7]]
+        assert [(id(p), id(kf), idx) for p, kf, idx in native[8]] == [
+            (id(p), id(kf), idx) for p, kf, idx in fallback[8]
+        ]
+
+
 class TestFuseMapPoints:
     def test_native_search_and_fuse_adds_observation(self):
         """Native fuse matcher projects a C++ MapPoint into a C++ KeyFrame."""

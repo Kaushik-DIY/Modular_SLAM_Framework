@@ -139,10 +139,23 @@
   KFs/points and slightly higher tracking/fuse/BA means. Tracking loss improved vs 2.41 (`83 -> 76`)
   but remains above 2.39 (`60`). Keep 2.41 as the fastest full-run performance reference, 2.42 as
   the validated native point-creation reference, and 2.39 as the quality/reference checkpoint.
+- **Latest local-BA packing milestone:** checkpoint 2.43 (`native local BA pack smoke`) added
+  `cpp_slam_core.pack_local_ba_native` and routes `pack_local_ba()` through it for native C++
+  keyframes/map points, with the existing Python packer retained as fallback. The helper packs
+  keyframe poses/fixed flags, point positions, observation rows, camera intrinsics, and outlier
+  write-back triples for the existing `slam_optimizer_core` solver. Validation passed: focused
+  optimizer/local-mapping tests (`47 passed`), full ORB-SLAM suite (`515 passed, 1 skipped`), and
+  two 600-frame threaded lab smokes with `0` lost / `final_state=OK`. Under same-condition
+  standard-wait reruns, `local_mapping.local_BA` mean improved from 434.1 ms to 293.3 ms, but total
+  FPS remained near-flat/noisy (`5.96 -> 5.91`). A no-wait policy probe improved from 6.13 to
+  6.21 FPS and reduced `local_mapping.local_BA` from 732.4 ms to 521.5 ms, still with `0` lost.
+  Treat this as an accepted local-BA section improvement, not a new full-run reference.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
-  orchestration) and by further reducing Python/GIL work in local mapping/BA write-back.
+  orchestration) and by further reducing Python/GIL work in local mapping/fuse/BA write-back. The
+  2.43 no-wait probe suggests runner wait policy can help slightly, but the larger remaining unlock
+  is still reducing the actual local-mapping work so overlap does not starve tracking.
 
 ---
 

@@ -1,0 +1,383 @@
+[run_lab_cpp] USE_CPP_CORE = True  (SIGUSR1 -> thread dump armed)
+LocalMapping: background thread started
+================================================================================
+Final RGB-D ORB-SLAM run
+================================================================================
+Dataset:             /home/kaushik/slam_ws/datasets/lab_rgbd_run_2
+Dataset type:        lab_rgbd
+Output:              /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run
+Frames loaded:       600
+Camera source:       /home/kaushik/slam_ws/datasets/lab_rgbd_run_2/camera.yaml
+Camera intrinsics:   fx=609.883, fy=609.177, cx=324.921, cy=229.748
+Image size:          640x480
+Depth map factor:    1000.0
+Depth factor:        0.001
+Baseline (m):        0.08 [default_rgbd_virtual_baseline_0p08m]
+Depth threshold:     40.0 [default_th_depth_40]
+bf:                  48.790664062480005
+Feature backend:     auto
+Loop closing:        disabled
+Loop cand source:    auto
+Global BA:           disabled
+LM threading:        enabled (wait=0.0s)
+Memory profile:      disabled (cheap)
+Runtime profile:     enabled
+Local map profile:   enabled
+Keyframe profile:    enabled
+================================================================================
+[0001/0600] idx=00000 state=OK ok=True kf=1 mp=427 tracked=427 ba_mse=NA frame_sec=0.383
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 0.6309051513671875
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.358426570892334
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.921907901763916
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.5860698223114014
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.6717844009399414
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.8629398345947266
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 2.0021510124206543
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.9583172798156738
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 2.265937328338623
+[0201/0600] idx=00200 state=OK ok=True kf=3 mp=1399 tracked=429 ba_mse=0.1718109979353673 frame_sec=0.130
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 2.1357970237731934
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.8895485401153564
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.9029521942138672
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.8134212493896484
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.925673484802246
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.948883295059204
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.6309421062469482
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.7404999732971191
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.5707299709320068
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.4717910289764404
+[0401/0600] idx=00400 state=OK ok=True kf=4 mp=1811 tracked=452 ba_mse=1.0242139336669327 frame_sec=0.166
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.8037896156311035
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.4228711128234863
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.7456176280975342
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.4603214263916016
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.3531920909881592
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.4836344718933105
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.5566129684448242
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.427248239517212
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.582841396331787
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+LocalMapping: timeout 0.0s reached
+local mapping elapsed time: 1.9426817893981934
+local mapping: starting...
+LocalMapping: timeout 0.0s reached
+[0600/0600] idx=00599 state=OK ok=True kf=12 mp=4247 tracked=306 ba_mse=1.6313264318190661 frame_sec=0.165
+local mapping elapsed time: 0.8515305519104004
+LocalMapping: background thread stopped
+final map compaction:  purged 11 ghost points
+================================================================================
+RUN SUMMARY
+================================================================================
+frames_attempted:     600
+tracking_ok_count:    600
+tracking_lost_count:  0
+errors:               0
+final_state:          OK
+keyframes:            12
+map_points:           4080
+trajectory_poses:     600
+elapsed_sec:          96.578
+avg_fps:              6.21
+trajectory_file:      /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/trajectory_lab_rgbd_run_2.txt
+frame_log_file:       /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/frame_log_lab_rgbd_run_2.csv
+frame_timing_file:    /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/frame_timing.csv
+map_points_ply:       /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/map_points.ply
+keyframes_json:       /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/keyframes.json
+keyframe_graph_json:  /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/keyframe_graph.json
+effective_config:     /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/effective_run_config.json
+completed_timestamp:  20260609_002853
+standardized_stem:    lab_rgbd__lab_rgbd_run_2__completed_20260609_002853
+standardized_summary: /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/run_summary__lab_rgbd__lab_rgbd_run_2__completed_20260609_002853.json
+local_map_profile:    /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/local_map_profile.csv
+keyframe_log:         /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/keyframe_decision_log.csv
+lm_schedule_log:      /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/local_mapping_schedule_log.csv
+runtime_profile_csv:  /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/runtime_profile.csv
+runtime_profile_json: /home/kaushik/slam_ws/visual_slam/reference_audit/checkpoint_2_43_native_local_ba_pack_no_wait_smoke_20260608/run/runtime_profile.json
+kf_traj_consistency:  n=12 max=0.0000m median=0.0000m
+================================================================================
+LocalMapping: background thread stopped

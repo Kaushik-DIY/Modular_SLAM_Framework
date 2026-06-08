@@ -69,6 +69,25 @@ def pack_local_ba(
         pt_list       list[MapPoint]   ordered point list (index = row in point_pos)
         obs_triples   list[(point, kf, idx)]   one per observation row, for unpack
     """
+    native_pack = getattr(_CPP_SLAM_CORE, "pack_local_ba_native", None) if _CPP_SLAM_CORE is not None else None
+    if native_pack is not None:
+        try:
+            inv_level_sigmas2 = (
+                np.asarray(feature_manager.inv_level_sigmas2, dtype=np.float64)
+                if feature_manager is not None
+                else np.empty(0, dtype=np.float64)
+            )
+            packed = native_pack(
+                list(local_keyframes),
+                list(fixed_keyframes),
+                list(points),
+                inv_level_sigmas2,
+            )
+            if packed is not None:
+                return packed
+        except Exception:
+            pass
+
     # Deduplicated ordered KF list: local first, then fixed boundary
     kf_list: list[KeyFrame] = []
     seen_kf: set = set()
