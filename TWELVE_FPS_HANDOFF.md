@@ -21,12 +21,12 @@
   was first written, native local-mapping fuse (`550b6b3`) and native triangulation epipolar
   matching (`4b29341`) were also added and validated.
 - **Current full-run reference:** checkpoint
-  `visual_slam/reference_audit/checkpoint_2_38_full_lab_f3b_build_mark_search_threaded_20260608/`
-  completed all 4494 lab frames at commit `a5f6403` with `tracking_lost_count=76`,
-  `final_state=OK`, and `avg_fps=6.03`. This improves over checkpoint 2.37's 2.86 FPS while
-  keeping tracking loss in the same monitored range. Tracking loss remains a `MONITOR` flag:
-  raise it to high priority only if later full lab runs grow materially above this range;
-  otherwise revisit after the remaining runtime-efficiency porting.
+  `visual_slam/reference_audit/checkpoint_2_39_full_lab_vectorized_triang_threaded_20260608/`
+  completed all 4494 lab frames at commit `25448ed` with `tracking_lost_count=60`,
+  `final_state=OK`, and `avg_fps=6.18`. This improves over checkpoint 2.38's 6.03 FPS and
+  reduces the monitored tracking-loss count from 76 to 60 frames. Tracking loss remains a
+  `MONITOR` flag: raise it to high priority only if later full lab runs grow materially above this
+  range; otherwise revisit after the remaining runtime-efficiency porting.
 - **Latest full-run implementation step:** native combined tracking local-map path:
   `build_local_map -> mark_current_frame_matched_points_seen -> search_map_by_projection` in one
   C++ binding call, with the no-vote reference-keyframe fallback preserved in Python. Short
@@ -76,6 +76,16 @@
   about 140 ms, `local_mapping.local_BA` about 604 ms, and `frame.total` about 139 ms.
   This is the best short-run threaded FPS seen in this F4b cleanup series, but a full lab run is
   still needed before treating it as the new full-run reference.
+- **Latest full-run validation + visualization:** checkpoint 2.39 full lab generated
+  `VALIDATION_REPORT.md`, `VISUAL_COMPARISON_REPORT.md`, baseline comparison plots under
+  `plots_vs_baseline/`, per-run plots under `plots/`, and sparse/semi-dense map figures under
+  `map_figures/`. Full-run runtime profile: `tracking.track_local_map` mean 23.8 ms,
+  `slam.track` mean 83.8 ms, `frame.total` mean 160.8 ms,
+  `local_mapping.create_new_map_points` mean 110.4 ms, `local_mapping.fuse_map_points` mean
+  142.5 ms, and `local_mapping.local_BA` mean 606.5 ms. Baseline-aligned trajectory RMSE vs
+  `visual_slam_outputs/lab_rgbd_run_2_B_loop_gba` is about 0.236 m, improved from checkpoint 2.38's
+  about 0.294 m. Because loop closing/GBA were disabled, the loop+GBA baseline remains visually
+  cleaner and is still the quality target.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
