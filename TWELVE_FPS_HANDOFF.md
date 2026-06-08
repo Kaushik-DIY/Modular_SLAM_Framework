@@ -130,6 +130,15 @@
   `local_mapping.create_new_map_points` mean improved from 221.2 ms to 148.6 ms and `frame.total`
   mean improved from 122.6 ms to 118.0 ms. This is still partially GIL-held for Python map
   insertion / observation callbacks, and needs a full lab run before becoming a reference.
+- **Latest full-run validation after 2.42:** checkpoint
+  `visual_slam/reference_audit/checkpoint_2_42_full_lab_native_triangulated_point_batch_threaded_20260608/`
+  completed all 4494 lab frames at commit `d5ac5a75` with `final_state=OK`, `errors=0`,
+  `avg_fps=7.10`, `tracking_lost_count=76`, `keyframes=206`, and `map_points=36810`. It validates
+  the local target: `local_mapping.create_new_map_points` mean improved from 109.1 ms in 2.41 to
+  68.1 ms (-37.5%). Overall FPS did not beat 2.41 (`7.29 -> 7.10`) because this run produced more
+  KFs/points and slightly higher tracking/fuse/BA means. Tracking loss improved vs 2.41 (`83 -> 76`)
+  but remains above 2.39 (`60`). Keep 2.41 as the fastest full-run performance reference, 2.42 as
+  the validated native point-creation reference, and 2.39 as the quality/reference checkpoint.
 - **What is NOT done:** the full dataset is still well below the 10-12 FPS goal. The next high-value
   work is reducing `tracking.track_local_map` growth over the full run, most likely by continuing
   F3-style tracking-core porting (`build_local_map` -> mark seen -> projection search -> pose-opt
