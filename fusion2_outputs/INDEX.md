@@ -40,7 +40,7 @@ kept for the verifications.csv evidence trail).
 
 ## V4 final matrix (2026-06-12) — THE thesis baseline runs
 
-`final_matrix_20260612_022508/` — all 9 combinations on lab_hybrid (BIG), native
+`final_matrix_20260612_154851/` — all 9 combinations on lab_hybrid (BIG), native
 front-ends, IMU-assisted, fused occupancy maps. REPORT.md + maps_montage.png +
 trajectories_montage.png inside; per-combo subfolders carry trajectory.tum,
 occupancy.png, map.npy, verifications.csv, run_summary.json. Closures:

@@ -206,7 +206,17 @@ Plan: `~/.claude/plans/lazy-napping-snail.md` (approved). All 5 user-mandated ta
 | V4.5 final 9-combo matrix | DONE | Table below; 2 issues found by per-test analysis, root-caused, fixed, re-run (per acceptance mandate). |
 | V4.6 docs | DONE | This section; INDEX/README/memory updated. |
 
-### V4.5 final matrix (lab_hybrid BIG, all IMU-assisted, run folder `fusion2_outputs/final_matrix_20260612_022508`)
+### V4.7 — standard map orientation (all modes)
+
+The VO front-end starts at SE(2) heading 90° (the `BASE_T_CAM ∘ CAMERA_GROUND_TRANSFORM`
+projection of camera identity), which rotated the orb maps 90° vs the LiDAR maps. Fixed in
+`write_outputs::_anchor_poses`: every mode's trajectory + occupancy is re-framed into the
+robot-START frame (first keyframe at origin facing +x) before rendering — the standard SLAM
+convention. Pure rigid re-frame (loop results unchanged); all 9 maps now render identically
+oriented (robot starts bottom-left facing +x; corridor extends along +x). Canonical run:
+`fusion2_outputs/final_matrix_20260612_154851/`.
+
+### V4.5 final matrix (lab_hybrid BIG, all IMU-assisted, run folder `fusion2_outputs/final_matrix_20260612_154851`)
 
 | # | Combo | Front-end | Verifier | Loops (acc/prop) | End-start | Peak RSS | Wall |
 |---|---|---|---|---|---|---|---|
@@ -217,7 +227,7 @@ Plan: `~/.claude/plans/lazy-napping-snail.md` (approved). All 5 user-mandated ta
 | 5 | lidar_orb | native scan_to_submap | ORB+PnP | 26/110 | **0.47 m** | 0.37 GB | 1.0 min |
 | 6 | lidar_orb | native scan_to_map | ORB+PnP | 25/103 | **0.11 m** | 0.41 GB | 1.3 min |
 | 7 | orb_lidar | native VO | B&B | 42/53 | 1.16 m | 0.91 GB | 3.5 min (32 fps) |
-| 8 | orb_lidar | native VO | B&B-seeded GICP | 42/53 | 1.40 m | 0.95 GB | 3.4 min (32 fps) |
+| 8 | orb_lidar | native VO | B&B-seeded GICP | 42/53 | 1.43 m | 0.95 GB | 3.4 min (32 fps) |
 | 9 | orb | native VO | ORB+PnP (DBoW) | 38/53 | 1.81 m | 0.98 GB | 3.4 min (33 fps) |
 
 All 9: two-room maps (LiDAR-led crisp; vision-led correct topology), tiers bounded 30/200,
@@ -229,8 +239,9 @@ RSS < 1 GB, faster than sensor rate. Montages + REPORT.md in the run folder.
    poses that B&B rightly rejected) → added a **grid cross-check**: the ICP-corrected pose must
    also pass the candidate-local occupancy-grid score gate (same gate as B&B). (b) With the
    cross-check, orb-led ICP accepted ZERO loops — prediction-seeded GICP cannot converge when
-   VO drift exceeds `icp_max_corr_dist` (1 m) → **B&B-seeded GICP** for orb-led mode (coarse
-   correlative init + metric ICP refine). Result: 42 loops, 1.40 m closure.
+   VO drift exceeds `icp_max_corr_dist` (1 m) → **B&B-seeded GICP** for orb-led mode (B&B
+   global coarse init within a few cm, robust to drift → GICP metric refine within its basin
+   → grid cross-check gate). Result: 42 loops, 1.43 m closure.
 2. **lidar_s2s_icp at 1.30 m** (marginal) → same grid cross-check filtered its sloppy edges:
    34 clean loops, **0.31 m**.
 

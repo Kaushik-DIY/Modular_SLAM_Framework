@@ -223,11 +223,32 @@ def verify_candidate_icp(shared: SharedMap, cfg: FusionV2Config, query_id: int,
 # Outputs
 # ---------------------------------------------------------------------------
 
+def _anchor_poses(poses: np.ndarray) -> np.ndarray:
+    """Express every node pose in the robot-START frame so EVERY mode renders
+    in the same standard convention: the first keyframe sits at the origin
+    facing +x. Without this the VO front-end starts at heading 90° (the
+    BASE_T_CAM ∘ CAMERA_GROUND_TRANSFORM projection of identity), rotating the
+    orb maps 90° vs the LiDAR maps. A pure rigid re-frame — map/trajectory
+    geometry is unchanged, only the global orientation is normalized.
+    `poses` columns: [nid, x, y, theta], assumed nid-sorted (gauge = row 0)."""
+    if len(poses) == 0:
+        return poses
+    ax, ay, ath = float(poses[0, 1]), float(poses[0, 2]), float(poses[0, 3])
+    c, s = math.cos(ath), math.sin(ath)
+    out = poses.copy()
+    dx = poses[:, 1] - ax
+    dy = poses[:, 2] - ay
+    out[:, 1] = c * dx + s * dy          # R(-ath) @ (p - anchor)
+    out[:, 2] = -s * dx + c * dy
+    out[:, 3] = np.arctan2(np.sin(poses[:, 3] - ath), np.cos(poses[:, 3] - ath))
+    return out
+
+
 def write_outputs(shared: SharedMap, cfg: FusionV2Config, run_dir: Path,
                   kf_stamps: dict, stats: dict,
                   skip_scan_ids: Optional[set] = None) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
-    poses = np.asarray(shared.graph.poses())
+    poses = _anchor_poses(np.asarray(shared.graph.poses()))
 
     with open(run_dir / "trajectory.tum", "w") as f:
         for nid, x, y, th in poses:
