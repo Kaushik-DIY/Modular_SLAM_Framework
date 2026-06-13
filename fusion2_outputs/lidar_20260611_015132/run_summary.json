@@ -1,0 +1,18 @@
+{
+  "mode": "lidar",
+  "scans": 4147,
+  "keyframes": 382,
+  "proposals": 111,
+  "verified": 111,
+  "loops_accepted": 0,
+  "rehearsal_merges": 13,
+  "optimize_calls": 13,
+  "elapsed_sec": 1057.5,
+  "peak_rss_gb": 0.11,
+  "verify_ms_mean": 72.9,
+  "verify_ms_p95": 133.4,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 139,
+  "map_payload_mb": 0.6
+}

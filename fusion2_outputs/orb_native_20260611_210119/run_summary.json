@@ -1,0 +1,30 @@
+{
+  "mode": "orb",
+  "frontend": "native",
+  "frames": 6468,
+  "keyframes": 645,
+  "proposals": 53,
+  "verified": 53,
+  "loops_accepted": 38,
+  "rehearsal_merges": 0,
+  "optimize_calls": 49,
+  "reinits": 117,
+  "elapsed_sec": 198.4,
+  "fps": 32.6,
+  "peak_rss_gb": 0.72,
+  "track_ms_mean": 15.4,
+  "verify_ms_mean": 2.9,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 415,
+  "map_payload_mb": 11.3,
+  "blind_kfs": 117,
+  "imu_calibration": {
+    "yaw_sign": 1.0,
+    "up_axis": [
+      0.1398,
+      -0.9901,
+      0.0124
+    ]
+  }
+}

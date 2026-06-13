@@ -13,7 +13,62 @@ import numpy as np
 
 from visual_slam.orbslam.slam.camera_pose import CameraPose
 from visual_slam.orbslam.slam.config_parameters import Parameters
-from visual_slam.orbslam.slam.frame import Frame
+from visual_slam.orbslam.slam.frame import Frame, _as_points_array, kMinDepth
+
+# F1 (12fps plan): optional C++ KeyFrame base (covisibility graph / spanning tree /
+# loop edges / points in C++). Mirrors the MapPoint precedent in map_point.py.
+try:
+    import cpp_slam_core as _cpp_slam_core
+    _CppKeyFrameBase = getattr(_cpp_slam_core, "KeyFrame", None)
+except Exception:
+    _CppKeyFrameBase = None
+
+# Resolved at import (the base class is fixed at class-definition time). Toggle via
+# Parameters.USE_CPP_KEYFRAME, which defaults from $SLAM_USE_CPP_KEYFRAME so a run/test
+# can opt in before this module is imported.
+_USE_CPP_KF = bool(getattr(Parameters, "USE_CPP_KEYFRAME", False)) and (_CppKeyFrameBase is not None)
+
+
+def _make_keyframe_bases():
+    """Base class(es) for KeyFrame: the C++ KeyFrame when enabled, else the proven
+    pure-Python (Frame, KeyFrameGraph). One class either way, so isinstance() holds."""
+    if _USE_CPP_KF:
+        return (_CppKeyFrameBase,)
+    return (Frame, KeyFrameGraph)
+
+
+def build_cpp_keyframe_from_frame(frame, kid):
+    """Populate a fresh C++ KeyFrame base from a Python Frame (F1b construction).
+
+    Feature arrays (kpsu/octaves/des/kps_ur) are READONLY C++ properties, so they
+    must be set via ``init_feature_arrays`` — never assigned directly. Mirrors the
+    proven recipe in tests/.../test_cpp_slam_core_phase3_keyframe.py.
+    """
+    if _CppKeyFrameBase is None:
+        raise RuntimeError("cpp_slam_core.KeyFrame is unavailable")
+    kf = _CppKeyFrameBase(kid=int(kid), frame_id=int(frame.id), camera=frame.camera)
+    n = len(frame.kps)
+    # Canonical stereo right-coords live in uRs (matches the Python KeyFrame:
+    # self.kps_ur = frame.uRs). frame.kps_ur may be a stale all-(-1) placeholder,
+    # so prefer uRs — using kps_ur would zero the stereo weights and halve
+    # num_observations downstream (breaks num_tracked_points / KF insertion).
+    kps_ur = getattr(frame, "uRs", None)
+    if kps_ur is None:
+        kps_ur = getattr(frame, "kps_ur", None)
+    octaves = getattr(frame, "octaves", None)
+    des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
+    kf.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
+                           kps_ur, octaves, n)
+    kf.kps = list(frame.kps)  # init_feature_arrays keeps only kpsu; retain the kps list
+    kf.timestamp = float(frame.timestamp)   # ctor doesn't set it; gates KF culling
+    kf.img_id = int(getattr(frame, "img_id", -1) or -1)
+    kf.update_pose(np.ascontiguousarray(frame.Tcw(), dtype=np.float64))
+    if getattr(frame, "depths", None) is not None:
+        kf.depths = frame.depths
+    for idx, p in enumerate(frame.points):
+        if p is not None:
+            kf.set_point_match(p, idx)
+    return kf
 
 
 # Store the graph relationships attached to one keyframe.
@@ -106,11 +161,22 @@ class KeyFrameGraph:
         self.ordered_keyframes_weights = OrderedDict()
 
     def update_best_covisibles_no_lock_(self) -> None:
+        # Deterministic covisibility ordering: weight DESC, then keyframe id ASC as
+        # a STABLE tie-breaker (M0 reproducibility). Without the id tie-break,
+        # equal-weight keyframes inherit the insertion order of
+        # connected_keyframes_weights, which derives from MapPoint.observations()
+        # iteration (C++ std::map keyed by pointer ADDRESS, PyObjCompare) — stable
+        # within a run but run-to-run non-deterministic (heap/ASLR) — so the local
+        # map / trajectory diverged ~65 mm between identical runs. Sorting by a
+        # stable id makes get_best_covisible_keyframes() reproducible. Matches
+        # pySLAM's id-ordered covisibility intent.
         self.ordered_keyframes_weights = OrderedDict(
             sorted(
                 self.connected_keyframes_weights.items(),
-                key=lambda item: item[1],
-                reverse=True,
+                key=lambda item: (
+                    -int(item[1]),
+                    int(getattr(item[0], "kid", getattr(item[0], "id", 0))),
+                ),
             )
         )
 
@@ -174,7 +240,7 @@ class KeyFrameGraph:
 
 
 # Represent a selected map keyframe with graph and observation state.
-class KeyFrame(Frame, KeyFrameGraph):
+class KeyFrame(*_make_keyframe_bases()):
 
     def __init__(
         self,
@@ -184,6 +250,9 @@ class KeyFrame(Frame, KeyFrameGraph):
         depth=None,
         kid: Optional[int] = None,
     ):
+        if _USE_CPP_KF:
+            self._init_from_frame_cpp(frame, img, img_right, depth, kid)
+            return
         KeyFrameGraph.__init__(self)
 
         # Create a Frame shell without recomputing features.
@@ -256,6 +325,198 @@ class KeyFrame(Frame, KeyFrameGraph):
         self.points = list(frame.points)
         self.outliers = np.zeros(len(self.kps), dtype=bool)
 
+    def _init_from_frame_cpp(self, frame, img, img_right, depth, kid):
+        """C++ KeyFrame path: populate the C++ base from a Python Frame.
+
+        Feature arrays go through init_feature_arrays (kpsu/octaves/des/kps_ur are
+        READONLY C++ properties). _is_bad is a readonly C++ property (never assigned).
+        loop_query_id/reloc_query_id keep their C++ int(-1) default (consumers compare
+        with != / == only). Python-only state lives on the instance via dynamic_attr.
+        """
+        kid_val = int(kid) if kid is not None else int(frame.id)
+        _CppKeyFrameBase.__init__(self, kid=kid_val, frame_id=int(frame.id),
+                                  camera=frame.camera)
+        n = len(frame.kps)
+        # Stereo right-coords: prefer uRs (canonical; matches the Python KeyFrame).
+        # frame.kps_ur may be a stale all-(-1) placeholder -> would zero stereo
+        # weights and halve num_observations (breaks num_tracked_points/KF insertion).
+        kps_ur = getattr(frame, "uRs", None)
+        if kps_ur is None:
+            kps_ur = getattr(frame, "kps_ur", None)
+        des = frame.des if frame.des is not None else np.empty((0, 32), dtype=np.uint8)
+        self.init_feature_arrays(list(frame.kps), np.ascontiguousarray(des, dtype=np.uint8),
+                                 kps_ur, getattr(frame, "octaves", None), n)
+        # init_feature_arrays normalizes kps_in into kpsu but does NOT retain the
+        # cv2.KeyPoint list; consumers still read kf.kps, so store it (settable).
+        self.kps = list(frame.kps)
+        self.update_pose(np.ascontiguousarray(frame.Tcw(), dtype=np.float64))
+        if getattr(frame, "depths", None) is not None:
+            self.depths = frame.depths
+        for idx, p in enumerate(frame.points):
+            if p is not None:
+                self.set_point_match(p, idx)
+
+        # C++ fields (typed) — keep loop_query_id/reloc_query_id at their -1 default.
+        # The C++ ctor takes only (kid, frame_id, camera); timestamp/img_id are NOT
+        # set by it and must be copied — timestamp gates keyframe culling
+        # (kKeyframeMaxTimeDistanceInSecForCulling), so a 0 timestamp disables culling.
+        self.timestamp = float(frame.timestamp)
+        self.img_id = int(getattr(frame, "img_id", -1) or -1)
+        self.kid = kid_val
+        self.map = None
+        self.is_keyframe = True
+        self.to_be_erased = False
+        self.GBA_kf_id = 0
+        self.is_Tcw_GBA_valid = False
+        self.Tcw_GBA = None
+        self.Tcw_before_GBA = None
+        self.num_loop_words = 0
+        self.loop_score = 0.0
+        self.num_reloc_words = 0
+        self.reloc_score = 0.0
+
+        # Python-only state (held on the C++ instance via dynamic_attr).
+        self.img = frame.img if frame.img is not None else img
+        self.img_right = frame.img_right if frame.img_right is not None else img_right
+        self.depth_img = frame.depth_img if frame.depth_img is not None else depth
+        # NB: uRs / kps_ur are readonly C++ properties (aliases of kps_ur, already
+        # populated by init_feature_arrays) — readable, not assignable.
+        self.lba_count = 0
+        self.is_blurry = getattr(frame, "is_blurry", False)
+        self.laplacian_var = getattr(frame, "laplacian_var", None)
+        self._pose_Tcp = CameraPose()
+        self.kpsn = getattr(frame, "kpsn", None)
+        self.sizes = np.array([float(getattr(kp, "size", 0.0)) for kp in frame.kps], dtype=np.float32)
+        self.angles = np.array([float(getattr(kp, "angle", -1.0)) for kp in frame.kps], dtype=np.float32)
+        self.median_depth = frame.median_depth
+        self.fov_center_c = frame.fov_center_c
+        self.fov_center_w = frame.fov_center_w
+        self.g_des = None
+        self.f_des = None
+        self.bow_vector = None
+        self.feature_vector = None
+        self.outliers = np.zeros(n, dtype=bool)
+
+    if _USE_CPP_KF:
+        # ---- Frame-API compatibility for the C++ KeyFrame base -------------
+        # The fork's C++ Frame is a partial "mirror" (pySLAM's is complete), so
+        # these Python-Frame methods absent on the C++ base are provided here via
+        # the C++ pose accessors. Defined only on the C++ path (else they would
+        # shadow the proven Python Frame versions).
+        def pose(self):
+            return self.Tcw()
+
+        def Rcw(self):
+            return self.Tcw()[:3, :3].copy()
+
+        def Rwc(self):
+            return self.Twc()[:3, :3].copy()
+
+        def tcw(self):
+            return self.Tcw()[:3, 3].copy()
+
+        def position(self):
+            return self.Ow()
+
+        def isometry3d(self):
+            import g2o
+            return g2o.Isometry3d(np.ascontiguousarray(self.Tcw(), dtype=np.float64))
+
+        # Point-query family (operate on the C++ self.points / Python self.outliers;
+        # identical logic to the Python Frame versions).
+        def get_matched_points(self):
+            return [p for p in self.points if p is not None]
+
+        def get_matched_points_idxs(self):
+            return np.array([i for i, p in enumerate(self.points) if p is not None], dtype=np.int32)
+
+        def get_unmatched_points_idxs(self):
+            return np.array([i for i, p in enumerate(self.points) if p is None], dtype=np.int32)
+
+        def get_matched_inlier_points(self):
+            return self.get_matched_good_points()
+
+        def num_matched_inlier_map_points(self):
+            outliers = getattr(self, "outliers", None)
+            count = 0
+            for idx, p in enumerate(self.points):
+                if p is None:
+                    continue
+                if outliers is not None and idx < len(outliers) and bool(outliers[idx]):
+                    continue
+                if p.num_observations() > 0:
+                    count += 1
+            return count
+
+        # Projection family — the fork's C++ "mirror" Frame omits these, but
+        # fuse_map_points (search_and_fuse -> keyframe.are_visible) and
+        # triangulation need them. Their absence was SILENTLY swallowed by
+        # fuse's bare `except`, disabling map-point fusion on C++ keyframes
+        # (=> 2x duplicate points, sparser observations, under-culling). Reuse
+        # the exact Python Frame logic; transform via the C++ Tcw (the only
+        # _pose-private dependency). ~1 Hz path (not the tracking hot loop).
+        def transform_points(self, points):
+            Tcw = np.ascontiguousarray(self.Tcw(), dtype=np.float64)
+            points = np.ascontiguousarray(points, dtype=np.float64).reshape(-1, 3)
+            return (Tcw[:3, :3] @ points.T + Tcw[:3, 3].reshape(3, 1)).T
+
+        def transform_point(self, pw):
+            Tcw = np.ascontiguousarray(self.Tcw(), dtype=np.float64)
+            pw = np.asarray(pw, dtype=np.float64).reshape(3)
+            return (Tcw[:3, :3] @ pw) + Tcw[:3, 3]
+
+        def project_points(self, points, do_stereo_project: bool = False):
+            pcs = self.transform_points(points)
+            return (self.camera.project_stereo(pcs) if do_stereo_project
+                    else self.camera.project(pcs))
+
+        def project_point(self, pw, do_stereo_project: bool = False):
+            pc = self.transform_point(pw)
+            proj, zs = (self.camera.project_stereo(pc.reshape(1, 3)) if do_stereo_project
+                        else self.camera.project(pc.reshape(1, 3)))
+            return proj.reshape(-1), float(zs[0])
+
+        def project_map_points(self, map_points, do_stereo_project: bool = False):
+            points = _as_points_array(map_points)
+            if len(points) == 0:
+                w = 3 if do_stereo_project else 2
+                return np.empty((0, w), dtype=np.float64), np.empty((0,), dtype=np.float64)
+            return self.project_points(points, do_stereo_project=do_stereo_project)
+
+        def are_in_image(self, uvs, zs):
+            return self.camera.are_in_image(uvs, zs)
+
+        def are_visible(self, map_points, do_stereo_project: bool = False):
+            projs, depths = self.project_map_points(map_points, do_stereo_project=do_stereo_project)
+            pts = _as_points_array(map_points)
+            if len(pts) == 0:
+                return (np.empty((0,), dtype=bool), projs, depths,
+                        np.empty((0,), dtype=np.float64))
+            dists = np.linalg.norm(pts - self.Ow().reshape(1, 3), axis=1)
+            visible = self.are_in_image(projs[:, :2], depths) & (depths > kMinDepth)
+            return visible, projs, depths, dists
+
+        def unproject_points_3d(self, idxs, transform_in_world: bool = True):
+            idxs = np.asarray(idxs, dtype=np.int32).reshape(-1)
+            pts3d = np.zeros((len(idxs), 3), dtype=np.float64)
+            valid = np.zeros(len(idxs), dtype=bool)
+            if len(idxs) == 0:
+                return pts3d, valid
+            kpsu, depths = self.kpsu, self.depths
+            Rwc, Ow = self.Rwc(), self.Ow()
+            for out_i, idx in enumerate(idxs):
+                if idx < 0 or idx >= len(kpsu) or idx >= len(depths):
+                    continue
+                depth = float(depths[idx])
+                if not np.isfinite(depth) or depth <= kMinDepth:
+                    continue
+                _kp = kpsu[idx]
+                uv = np.array(_kp.pt if hasattr(_kp, "pt") else _kp, dtype=np.float64)
+                pc = self.camera.unproject_3d(uv, depth)
+                pts3d[out_i] = (Rwc @ pc.reshape(3) + Ow.reshape(3)) if transform_in_world else pc.reshape(3)
+                valid[out_i] = True
+            return pts3d, valid
+
     def init_observations(self) -> None:
         """Associate all currently matched map points as keyframe observations."""
         if not hasattr(self, "_lock_features"):
@@ -274,6 +535,8 @@ class KeyFrame(Frame, KeyFrameGraph):
     def update_connections(self) -> None:
         """
         """
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.update_connections(self)
         points = self.get_matched_good_points()
         if len(points) == 0:
             return
@@ -324,10 +587,14 @@ class KeyFrame(Frame, KeyFrameGraph):
                 self.is_first_connection = False
 
     def Tcp(self):
+        if _USE_CPP_KF:
+            return self._pose_Tcp.get_matrix()
         with self._lock_connections:
             return self._pose_Tcp.get_matrix()
 
     def is_bad(self) -> bool:
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.is_bad(self)
         with self._lock_connections:
             return self._is_bad
 
@@ -337,10 +604,14 @@ class KeyFrame(Frame, KeyFrameGraph):
         return compute_bow_for_frame(self, vocabulary)
 
     def set_not_erase(self) -> None:
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.set_not_erase(self)
         with self._lock_connections:
             self.not_to_erase = True
 
     def set_erase(self) -> None:
+        if _USE_CPP_KF:
+            return _CppKeyFrameBase.set_erase(self)
         should_set_bad = False
         with self._lock_connections:
             if len(self.loop_edges) == 0:
@@ -352,6 +623,18 @@ class KeyFrame(Frame, KeyFrameGraph):
 
     def set_bad(self) -> None:
         """Mark this keyframe bad and detach its graph and point links."""
+        if _USE_CPP_KF:
+            # The C++ set_bad stubs the Tcp computation; do it here (Python),
+            # faithful to pySLAM, BEFORE the C++ side erases the parent link.
+            # Guards mirror the C++ early-returns (kid==0 / not_to_erase).
+            if self.kid != 0 and not self.not_to_erase:
+                parent = self.get_parent()
+                if parent is not None:
+                    try:
+                        self._pose_Tcp.update(self.Tcw() @ parent.Twc())
+                    except Exception:
+                        pass
+            return _CppKeyFrameBase.set_bad(self)
         with self._lock_connections:
             if self.kid == 0:
                 return
@@ -495,4 +778,13 @@ class KeyFrame(Frame, KeyFrameGraph):
             self.kd = None
 
     def heavy_memory_bytes(self) -> int:
+        if _USE_CPP_KF:
+            # The C++ base has no Python heavy-data accounting; sum the
+            # Python-held image buffers (diagnostics only).
+            total = 0
+            for attr in ("img", "img_right", "depth_img"):
+                a = getattr(self, attr, None)
+                if a is not None and hasattr(a, "nbytes"):
+                    total += int(a.nbytes)
+            return total
         return super().heavy_memory_bytes()

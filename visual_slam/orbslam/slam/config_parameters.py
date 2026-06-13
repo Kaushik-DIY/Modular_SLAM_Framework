@@ -6,6 +6,7 @@ This module collects feature, tracking, mapping, loop-closing, and optimization 
 from __future__ import annotations
 
 import math
+import os as _os
 from dataclasses import dataclass
 
 
@@ -15,6 +16,15 @@ class Parameters:
     # C++ core / runtime selection
     # ================================================================
     USE_CPP_CORE = False
+
+    # F1 (12fps plan): wire the C++ KeyFrame (covisibility graph / spanning tree /
+    # loop edges / points in C++). Default False keeps the proven pure-Python
+    # KeyFrame(Frame, KeyFrameGraph). Enabled incrementally + A/B-validated.
+    # This selects the KeyFrame BASE class at import time (unlike USE_CPP_CORE,
+    # which is dispatched at runtime), so it is read from the environment so a
+    # run/test can opt in before the slam package is imported.
+    USE_CPP_KEYFRAME = _os.environ.get("SLAM_USE_CPP_KEYFRAME", "0").lower() in (
+        "1", "true", "yes", "on")
 
     # ================================================================
     # Sparse SLAM threading
@@ -77,7 +87,14 @@ class Parameters:
     kMinNumMatchedFeaturesSearchReferenceFrame = 15
     kMaxNumOfKeyframesInLocalMap = 80
     kNumBestCovisibilityKeyFrames = 10
-    kNumBestCovisibilityKeyFramesTracking = kNumBestCovisibilityKeyFrames
+    # Tracking local-map covisibility window. Reduced 10->3 (2026-06-05): the
+    # tracking local map is dominated by the current frame's voted covisible
+    # keyframes; the extra covisibility expansion beyond the top-3 projected many
+    # more local map points in search_map (the dominant tracking cost) WITHOUT
+    # improving matches. Cutting it to 3 reduced full-lab tracking 143->102 ms
+    # (-29%) with ZERO quality cost (lab: lost 60=60, ATE 275 vs 278 mm; fr1_desk:
+    # identical ATE 22.3 mm + KF 51). Loop closure / other uses keep the base (10).
+    kNumBestCovisibilityKeyFramesTracking = 3
     kExpandLocalMapWithParent = True
     kExpandLocalMapWithChildren = True
     kUseVisualOdometryPoints = True
@@ -98,13 +115,18 @@ class Parameters:
     kNumMinTrackedClosePointsForNewKfNonMonocular = 100
     kNumMaxNonTrackedClosePointsForNewKfNonMonocular = 70
     kThNewKfRefRatioMonocular = 0.9
-    kThNewKfRefRatioStereo = 0.85   # phase1_lab: was 0.90, eased slightly since c1a hard override disabled
+    kThNewKfRefRatioStereo = 0.75   # pySLAM-aligned (2026-06-01): was 0.85, restored to pySLAM's value
     kThNewKfRefRatioNonMonocular = 0.25
     kUseFeatureCoverageControlForNewKf = False
     kUseFovCentersBasedKfGeneration = False
     kMaxFovCentersDistanceForKfGeneration = 0.2
     kMinFramesBetweenKeyframesSequentialRgbd = 10   # phase1_lab: was 5, matches slow-rover lab dynamics
-    kMinFramesBetweenKeyframesThreadedRgbd = 0
+    kEmergencyKfMatchThreshold = 120  # matched inliers below this bypass the min-frame throttle
+    #   (genuine weak tracking -> densify the map before tracking is lost during exploration)
+    kMinFramesBetweenKeyframesThreadedRgbd = 20   # pragmatic KF-rate throttle (2026-06-01): was 0;
+    # strict (pySLAM-correct) matching yields a low matched/ref ratio on lab data, so c2/c1c fire
+    # almost every frame -> KF/map cascade under threaded LM. Hard min-frame gap caps the rate
+    # (c1a max-frame interval still forces a KF when stale). TODO(v2): full pySLAM threaded parity.
     kMaxFramesBetweenKeyframesRgbd = -1         # phase1_lab: disabled c1a hard override (was 10); -1 = use fps default = 30
     kUseFpsAwareKeyframeSpacing = True
     kMinKeyframeSpacingSeconds = 0.30   # phase1_lab: 0.30s floor (was 0.10) for slow-rover
@@ -170,6 +192,10 @@ class Parameters:
     # Bundle Adjustment
     # ================================================================
     kLocalBAWindowSize = 20
+    # Purge bad/fusion-replaced "ghost" points from the global map this often
+    # (in keyframes). Keeps Map.points ~= the live good-point count so RAM and
+    # whole-map passes (global BA, export) don't bloat. See Map.compact_points().
+    kMapCompactionEveryNKeyframes = 5
     kUseLargeWindowBA = False
     kEveryNumFramesLargeWindowBA = 10
     kLargeBAWindowSize = 20
@@ -208,8 +234,15 @@ class Parameters:
     kLoopClosingParallelKpsMatchingNumWorkers = 2
     kLoopClosingGeometryCheckerMinKpsMatches = 9
     kLoopClosingSE3GuidedMinSeedInliers = 4
-    kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3 = 0.0
-    kLoopClosingMaxEstimatedPoseRotationDegForGuidedSE3 = 0.0
+    # Pose-plausibility sanity gate on the accepted loop's relative transform.
+    # A genuine RGB-D loop revisits a place, so the estimated relative camera
+    # pose between the two co-located keyframes is small; an implausibly large
+    # estimate would warp the essential-graph PGO (observed: 15 m keyframe
+    # teleports on lab). Restored to the pre-rewrite reference values (0.75 m /
+    # 45 deg) after the rgbd_se3_ransac->sim3 loop-geometry rewrite dropped the
+    # gate (was zeroed = disabled in commit 47ff8d3). 0.0 disables a gate.
+    kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3 = 0.75
+    kLoopClosingMaxEstimatedPoseRotationDegForGuidedSE3 = 45.0
     kLoopClosingSE3RansacMaxError = 0.25
     kLoopClosingSE3RansacIterations = 300
     kLoopClosingTh2 = 20
@@ -271,6 +304,24 @@ class Parameters:
     kEssentialGraphCovisibilityWeightMin = 0.5
     kEssentialGraphCovisibilityWeightMax = 5.0
     kEssentialGraphLoopEdgeWeight = 10.0
+    # Min covisibility weight (co-observation count) for an edge to enter the
+    # loop-correction essential graph. ORB-SLAM's classic value is 100, which
+    # assumes a DENSE covisibility graph. Our post-alignment maps over-insert
+    # keyframes -> covisibility is ~half as dense (~29 vs the reference's ~57
+    # neighbours/KF), so at 100 only ~31% of edges qualify and the essential graph
+    # is under-constrained: the strong loop edge flexes the corrected span out of
+    # plane (observed: 17 m without GBA, 2 m Y-bulge with GBA). Lowered to 15 to
+    # admit more covisibility edges (~77% vs 31% at 100) and constrain the PGO.
+    # Validated on lab: fixed the out-of-plane flex (Y 15.9 m -> 0.28 m, planar).
+    # Edge information is clamped to [0.5,5] so admitting weaker edges adds
+    # constraint without letting them dominate. Best deployment config is loops ON
+    # + GBA ON at this theta: ATE-vs-reference 68 mm (vs loops-off 275 mm) -- the
+    # well-constrained PGO gives GBA a clean input and GBA then refines to a
+    # near-perfect map. (Earlier "GBA degrades" was a SYMPTOM of an under-constrained
+    # PGO: at theta=30 the PGO was only partially fixed (269 mm, residual flex) so
+    # GBA optimised a still-corrupt input -> 430 mm; at theta=15 the PGO is clean ->
+    # GBA -> 68 mm. So GBA is fine; the PGO constraint was the real fix.)
+    kEssentialGraphMinCovisibilityWeight = 15
 
     # ================================================================
     # Relocalization
@@ -283,6 +334,17 @@ class Parameters:
     kRelocalizationFeatureMatchRatioTestLarge = 0.9
     kRelocalizationPoseOpt1MinMatches = 10
     kRelocalizationDoPoseOpt2NumInliers = 50
+    # Robustness safety net: if tracking is LOST and relocalization fails for this
+    # many consecutive frames, re-initialize a fresh RGB-D submap from the current
+    # frame's depth (anchored at the last-known-good pose) so the system recovers
+    # instead of staying permanently dead. Only ever triggers in the already-LOST
+    # state, so it cannot affect normally-tracking runs. Set <=0 to disable.
+    kMaxRelocFailuresBeforeReinit = 30
+    # Loosely-coupled IMU-aided tracking only: recover faster (re-init from depth at
+    # the IMU-anchored pose) so feature-starved stretches don't stay LOST for ~30
+    # frames. Applies ONLY when an IMU predictor is attached; standalone runs keep
+    # the value above.
+    kImuAidedRelocFailuresBeforeReinit = 10
     kRelocalizationMaxReprojectionDistanceMapSearchCoarse = 10
     kRelocalizationMaxReprojectionDistanceMapSearchFine = 3
 

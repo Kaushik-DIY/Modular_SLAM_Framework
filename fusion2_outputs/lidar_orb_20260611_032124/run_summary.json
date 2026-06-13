@@ -1,0 +1,18 @@
+{
+  "mode": "lidar_orb",
+  "scans": 4147,
+  "keyframes": 382,
+  "proposals": 110,
+  "verified": 110,
+  "loops_accepted": 26,
+  "rehearsal_merges": 13,
+  "optimize_calls": 13,
+  "elapsed_sec": 999.1,
+  "peak_rss_gb": 0.29,
+  "verify_ms_mean": 7.5,
+  "verify_ms_p95": 14.0,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 139,
+  "map_payload_mb": 22.9
+}

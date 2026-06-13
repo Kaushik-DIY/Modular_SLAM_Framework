@@ -41,6 +41,7 @@ set(CPP_SLAM_CORE_SOURCES
     src/frame.cpp              # Phase 2
     src/keyframe.cpp           # Phase 3
     src/local_mapping_core.cpp # Phase 4
+    src/geometry_matchers.cpp  # Phase 5 (C++ projection matchers)
 )
 
 pybind11_add_module(cpp_slam_core ${CPP_SLAM_CORE_SOURCES})

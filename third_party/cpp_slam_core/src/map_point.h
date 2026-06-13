@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -95,6 +96,11 @@ class MapPoint : public std::enable_shared_from_this<MapPoint> {
 
     float min_distance() const;
     float max_distance() const;
+    // pySLAM-compatible: (position, normal, 0.8*_min_distance, 1.2*_max_distance).
+    // Presence of this method makes the Python matcher's _map_point_visibility_info
+    // apply the viewing-cos + distance-window filters (else it falls back to
+    // normal=None / [0,inf] and skips them — the degradation we found).
+    std::tuple<Eigen::Vector3d, Eigen::Vector3d, float, float> get_all_pos_info() const;
 
     // ---- Descriptor (GIL-free) ---------------------------------------------
     cv::Mat get_descriptor() const;

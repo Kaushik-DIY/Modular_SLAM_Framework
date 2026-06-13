@@ -6,7 +6,7 @@ from typing import Callable, Optional
 
 from slam_core.dataio.carmen import read_carmen_log
 from slam_core.dataio.intel_carmen import read_intel_carmen_log
-from slam_core.dataio.lab_carmen import read_lab_carmen_log
+from slam_core.dataio.lab_carmen import read_lab_carmen_log, read_lab_hybrid_lidar_csv
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -129,7 +129,30 @@ def _profile_lab_run_2(scan_variant: str = "360") -> DatasetProfile:
     )
 
 
-DATASET_NAMES = ("fr079", "intel", "lab_run_2")
+def _profile_lab_hybrid() -> DatasetProfile:
+    base = DATASETS_ROOT / "lab_hybrid"
+
+    return DatasetProfile(
+        name="lab_hybrid",
+        scan_path=base / "lidar" / "scans.csv",
+        reader=read_lab_hybrid_lidar_csv,
+        angle_min=-3.1415927410125732,
+        angle_max=3.1415927410125732,
+        angle_inc=0.006919807754456997,
+        range_min=0.10000000149011612,
+        range_max=16.0,
+        num_beams=909,
+        beam_stride=1,
+        imu_path=base / "imu.csv",
+        metadata_path=base / "metadata.json",
+        readme_path=base / "README_hybrid_format.txt",
+        raw_bag_path=None,
+        has_odom=False,
+        initial_pose=(0.0, 0.0, 0.0),
+    )
+
+
+DATASET_NAMES = ("fr079", "intel", "lab_run_2", "lab_hybrid")
 
 
 def get_dataset_profile(dataset_name: str, *, scan_variant: Optional[str] = None) -> DatasetProfile:
@@ -141,6 +164,8 @@ def get_dataset_profile(dataset_name: str, *, scan_variant: Optional[str] = None
         return _profile_intel()
     if dataset_name == "lab_run_2":
         return _profile_lab_run_2("360" if scan_variant is None else str(scan_variant))
+    if dataset_name == "lab_hybrid":
+        return _profile_lab_hybrid()
 
     raise ValueError(
         f"Unknown dataset_name={dataset_name!r}. Supported values: {', '.join(DATASET_NAMES)}"

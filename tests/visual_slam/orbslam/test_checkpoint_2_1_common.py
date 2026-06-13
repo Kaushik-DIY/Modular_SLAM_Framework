@@ -61,7 +61,7 @@ def test_parameters_match_pyslam_orb_rgbd_subset():
     assert Parameters.kNumMinPointsForNewKf == 15
     assert Parameters.kNumMinTrackedClosePointsForNewKfNonMonocular == 100
     assert Parameters.kNumMaxNonTrackedClosePointsForNewKfNonMonocular == 70
-    assert Parameters.kThNewKfRefRatioStereo == 0.90
+    assert Parameters.kThNewKfRefRatioStereo == 0.75  # pySLAM's value (was a stale 0.90 here)
 
     assert Parameters.kMaxReprojectionDistanceFrame == 7
     assert Parameters.kMaxReprojectionDistanceMapRgbd == 3

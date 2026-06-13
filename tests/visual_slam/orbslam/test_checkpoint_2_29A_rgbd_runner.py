@@ -11,6 +11,7 @@ from visual_slam.orbslam.io.rgbd_dataset import (
     DATASET_TYPE_TUM,
     detect_dataset_type,
     load_lab_camera_config,
+    load_rgbd_associations,
     make_rgbd_camera,
 )
 from visual_slam.orbslam.run_rgbd_slam import (
@@ -65,6 +66,28 @@ Camera.RGB: 1
 DepthMapFactor: 1000.0
 """.strip()
 
+HYBRID_SENSOR_CONFIG_YAML = """
+dataset_type: hybrid_rgbd_lidar_imu
+
+camera:
+  width: 640
+  height: 480
+  fx: 609.883300781
+  fy: 609.177246094
+  cx: 324.920776367
+  cy: 229.748153687
+  distortion_coefficients: [0, 0, 0, 0, 0]
+  depth_map_factor: 1000.0
+
+lidar:
+  angle_min: -3.14159274101
+  angle_max: 3.14159274101
+  angle_increment: 0.00691980775446
+
+imu:
+  orientation: quaternion_xyzw
+""".strip()
+
 
 def _make_lab_dataset(root: Path, *, with_camera: bool = True) -> Path:
     dataset = root / "lab_run_01"
@@ -75,6 +98,23 @@ def _make_lab_dataset(root: Path, *, with_camera: bool = True) -> Path:
     (dataset / "associations.txt").write_text("1.0 rgb/1.png 1.0 depth/1.png\n")
     if with_camera:
         (dataset / "camera.yaml").write_text(LAB_CAMERA_YAML + "\n")
+    return dataset
+
+
+def _make_hybrid_dataset(root: Path) -> Path:
+    dataset = root / "lab_hybrid"
+    (dataset / "rgb").mkdir(parents=True)
+    (dataset / "depth").mkdir()
+    (dataset / "lidar").mkdir()
+    (dataset / "rgb.txt").write_text("1.0 rgb/1.png\n")
+    (dataset / "depth.txt").write_text("1.0 depth/1.png\n")
+    (dataset / "associations_rgbd.txt").write_text(
+        "# rgb_timestamp rgb_file depth_timestamp depth_file time_diff\n"
+        "1.0 rgb/1.png 1.0 depth/1.png 0.0\n"
+    )
+    (dataset / "sensor_config.yaml").write_text(HYBRID_SENSOR_CONFIG_YAML + "\n")
+    (dataset / "lidar/scans.csv").write_text("timestamp,ranges\n")
+    (dataset / "imu.csv").write_text("timestamp,frame_id,qx,qy,qz,qw,wx,wy,wz,ax,ay,az\n")
     return dataset
 
 
@@ -89,9 +129,14 @@ def test_lab_rgbd_auto_detection_works(tmp_path):
     assert detect_dataset_type(dataset) == DATASET_TYPE_LAB
 
 
+def test_hybrid_lab_rgbd_auto_detection_works(tmp_path):
+    dataset = _make_hybrid_dataset(tmp_path)
+    assert detect_dataset_type(dataset) == DATASET_TYPE_LAB
+
+
 def test_lab_rgbd_without_camera_yaml_raises_clear_error(tmp_path):
     dataset = _make_lab_dataset(tmp_path, with_camera=False)
-    with pytest.raises(FileNotFoundError, match=r"camera\.yaml|--camera-config"):
+    with pytest.raises(FileNotFoundError, match=r"camera\.yaml|sensor_config\.yaml|--camera-config"):
         make_rgbd_camera(dataset, dataset_type=DATASET_TYPE_LAB)
 
 
@@ -119,6 +164,32 @@ def test_flat_orbslam2_style_camera_yaml_is_supported(tmp_path):
     assert config["baseline_source"] == "default_rgbd_virtual_baseline_0p08m"
     assert config["depth_threshold_source"] == "default_th_depth_40"
     assert camera.depth_factor == pytest.approx(0.001)
+
+
+def test_hybrid_sensor_config_yaml_is_supported(tmp_path):
+    dataset = _make_hybrid_dataset(tmp_path)
+    config = load_lab_camera_config(dataset / "sensor_config.yaml")
+    camera = make_rgbd_camera(dataset, dataset_type=DATASET_TYPE_LAB)
+
+    assert config["width"] == 640
+    assert config["height"] == 480
+    assert config["fx"] == pytest.approx(609.883300781)
+    assert config["fy"] == pytest.approx(609.177246094)
+    assert config["cx"] == pytest.approx(324.920776367)
+    assert config["cy"] == pytest.approx(229.748153687)
+    assert config["depth_factor"] == pytest.approx(0.001)
+    assert camera.fx == pytest.approx(609.883300781)
+    assert camera.depth_factor == pytest.approx(0.001)
+
+
+def test_hybrid_rgbd_associations_are_loaded_by_default(tmp_path):
+    dataset = _make_hybrid_dataset(tmp_path)
+    frames = load_rgbd_associations(dataset)
+
+    assert len(frames) == 1
+    assert frames[0].timestamp == pytest.approx(1.0)
+    assert frames[0].rgb_path == dataset / "rgb/1.png"
+    assert frames[0].depth_path == dataset / "depth/1.png"
 
 
 def test_tum_camera_creation_still_uses_existing_tum_logic():

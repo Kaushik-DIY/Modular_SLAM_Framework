@@ -172,7 +172,7 @@ def test_se3_seed_accepts_synthetic_true_geometry():
     np.testing.assert_allclose(estimate.t, np.array([-1.0, 0.0, 0.0]), atol=1e-6)
 
 
-def test_pose_distance_gate_does_not_reject_when_disabled_or_not_applicable():
+def test_pose_distance_gate_passes_a_valid_loop():
     vocab = load_default_vocabulary()
     assert vocab.available, vocab.error
     database = KeyFrameDatabase(vocab)
@@ -184,9 +184,14 @@ def test_pose_distance_gate_does_not_reject_when_disabled_or_not_applicable():
     assert checker.check_candidates(current_kf, [loop_kf])
     report = _last_report(checker, loop_kf)
 
+    # The pose-plausibility gate was restored (it was deliberately disabled at
+    # 0.0 during the sim3 loop-geometry rewrite; re-enabled to the pre-rewrite
+    # reference value). A valid, co-located loop has a small relative pose, so it
+    # passes the gate (does not get rejected by it).
     assert report["passed_pose_distance_gate"] is True
-    assert "pose distance" not in str(report.get("rejection_reason", "")).lower()
-    assert Parameters.kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3 == 0.0
+    assert "implausible loop pose" not in str(report.get("rejection_reason", "")).lower()
+    assert Parameters.kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3 > 0.0
+    assert report["estimated_pose_distance"] <= Parameters.kLoopClosingMaxEstimatedPoseDistanceForGuidedSE3
 
 
 def test_projection_expansion_uses_candidate_covisibility_group():

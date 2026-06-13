@@ -11,6 +11,8 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
+#include "kdtree2d.h"
+
 namespace py = pybind11;
 namespace slam {
 
@@ -89,6 +91,18 @@ class Frame : public std::enable_shared_from_this<Frame> {
     // ---- kpsu helpers (GIL-free after init) --------------------------------
     int num_kps() const { return static_cast<int>(kpsu.rows()); }
 
+    // ---- 2D kd-tree over kpsu (lazy; replaces the Python scipy cKDTree) -----
+    // query_ball_point matches scipy semantics (sorted indices within radius).
+    std::vector<int> kd_query_ball(float x, float y, float r) const;
+    bool kd_ready() const { return kd_built_; }
+
+    // ---- Native C++ projection (intrinsics cached from the Python camera) ---
+    // Pinhole, no redistortion (kpsu are undistorted) — matches CameraUtils.project.
+    // Returns (u, v, depth) for a world point; depth = Z in camera frame.
+    Eigen::Vector3d project_world(const Eigen::Vector3d &Xw) const;  // (u, v, z)
+    bool is_in_image(double u, double v, double z) const;
+    double stereo_ur(double u, double z) const { ensure_camera(); return u - cbf_ / z; }
+
     // ---- Pose access (GIL-free) --------------------------------------------
     Eigen::Matrix4d Tcw() const;
     Eigen::Matrix4d Twc() const;
@@ -113,6 +127,18 @@ class Frame : public std::enable_shared_from_this<Frame> {
     std::string __repr__() const;
 
   private:
+    // Lazily-built 2D kd-tree over kpsu (built on first kd_query_ball).
+    mutable cppcore::KdTree2D kd_;
+    mutable bool kd_built_ = false;
+    void ensure_kd() const;
+
+    // Camera intrinsics cached (once) from the Python camera object for GIL-free
+    // C++ projection. Extracted lazily on first projection call.
+    mutable double cfx_ = 0, cfy_ = 0, ccx_ = 0, ccy_ = 0, cbf_ = 0;
+    mutable int cwidth_ = 0, cheight_ = 0;
+    mutable bool cam_cached_ = false;
+    void ensure_camera() const;
+
     static MatNx2f _normalize_kpsu(py::object kps_in, int n);
     static Eigen::VectorXf _normalize_kps_ur(py::object kps_ur_in, int n);
     static Eigen::VectorXi _normalize_octaves(py::object octaves_in, int n);

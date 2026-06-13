@@ -52,6 +52,11 @@ class FakeFrame:
         self.points = [object()] * tracked_points + [None] * (total_points - tracked_points)
         self.outliers = np.zeros(total_points, dtype=bool)
         self.depths = np.full(total_points, 1.0, dtype=np.float32)
+        # pySLAM-aligned current-side count used by need_new_keyframe (set by make_tracking)
+        self._num_matched_inliers = tracked_points
+
+    def num_matched_inlier_map_points(self):
+        return self._num_matched_inliers
 
 
 class FakeLocalMapping:
@@ -108,6 +113,8 @@ def make_tracking(
     tracking.kf_ref = kf_last
     tracking.kf_last = kf_last
     tracking.f_cur = FakeFrame(frame_id=frame_id, tracked_points=tracked_close, total_points=total_points)
+    # need_new_keyframe now uses f_cur.num_matched_inlier_map_points() (pySLAM); set it to num_matched.
+    tracking.f_cur._num_matched_inliers = num_matched
     tracking.num_matched_map_points = num_matched
     tracking.max_frames_between_kfs = 30
     tracking.max_frames_between_kfs_after_reloc = 30
@@ -246,36 +253,63 @@ def test_sequential_mode_no_longer_forces_min_frames_three(monkeypatch):
 
 
 def test_emergency_close_point_condition_can_still_request_keyframe(monkeypatch):
+    # Close-point starvation is a valid trigger once the min-frame-spacing throttle
+    # is satisfied (frame_id 10 >= min_frames 9). The throttle now also gates
+    # close-starvation, since on dense RGB-D it can fire chronically and cascade.
     monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 9)
     lm = FakeLocalMapping(accepting=True, idle=True)
-    tracking = make_tracking(local_mapping=lm, frame_id=1, last_kf_id=0, num_matched=50, tracked_close=0, total_points=200)
+    tracking = make_tracking(local_mapping=lm, frame_id=10, last_kf_id=0, num_matched=50, tracked_close=0, total_points=200)
     assert tracking.need_new_keyframe() is True
     assert tracking.keyframe_decision_rows[-1]["need_to_insert_close"] is True
+
+
+def test_min_frame_spacing_throttle_blocks_early_insert(monkeypatch):
+    # New pragmatic throttle: within the min-frame gap, a CHRONIC trigger
+    # (close-starvation with healthy matched count) is rejected with reason
+    # 'min_keyframe_spacing_throttle'. num_matched=200 (> emergency threshold)
+    # so the emergency bypass does NOT apply.
+    monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 9)
+    lm = FakeLocalMapping(accepting=True, idle=True)
+    tracking = make_tracking(local_mapping=lm, frame_id=3, last_kf_id=0, num_matched=200, ref_tracked=400, tracked_close=0, total_points=400)
+    assert tracking.need_new_keyframe() is False
+    assert tracking.keyframe_decision_rows[-1]["reject_reason"] == "min_keyframe_spacing_throttle"
+
+
+def test_weak_tracking_emergency_bypasses_throttle(monkeypatch):
+    # A genuine weak-tracking emergency (matched < kEmergencyKfMatchThreshold)
+    # bypasses the min-frame throttle so the map can densify before tracking is lost.
+    monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 9)
+    lm = FakeLocalMapping(accepting=True, idle=True)
+    tracking = make_tracking(local_mapping=lm, frame_id=3, last_kf_id=0, num_matched=50, ref_tracked=400, tracked_close=0, total_points=400)
+    assert tracking.need_new_keyframe() is True
 
 
 def test_keyframe_inserted_when_mapper_accepts_and_conditions_true(monkeypatch):
     monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 0)
     tracking = make_tracking(local_mapping=FakeLocalMapping(accepting=True, idle=True))
     assert tracking.need_new_keyframe() is True
-    assert tracking.keyframe_decision_rows[-1]["insert_reason"] == "local_mapping_accepting"
+    # pySLAM-aligned: insert when local mapping is IDLE.
+    assert tracking.keyframe_decision_rows[-1]["insert_reason"] == "local_mapping_idle"
 
 
-def test_keyframe_rejected_when_mapper_busy_and_queue_too_large(monkeypatch):
+def test_keyframe_rejected_when_mapper_busy(monkeypatch):
+    # pySLAM-aligned: non-monocular, if conditions are met but LM is BUSY (not idle),
+    # do NOT insert (the throttle that prevents keyframe explosion).
     monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 0)
-    monkeypatch.setattr(Parameters, "kLocalMappingMaxQueueForForcedInsert", 3)
     lm = FakeLocalMapping(accepting=False, idle=False, queue_size=3)
     tracking = make_tracking(local_mapping=lm)
     assert tracking.need_new_keyframe() is False
-    assert tracking.keyframe_decision_rows[-1]["reject_reason"] == "local_mapping_busy_queue_pressure"
+    assert tracking.keyframe_decision_rows[-1]["reject_reason"] == "local_mapping_busy"
 
 
-def test_rgbd_forced_insert_allowed_when_queue_below_threshold(monkeypatch):
+def test_rgbd_busy_mapper_does_not_force_insert(monkeypatch):
+    # pySLAM-aligned: the previous fork "forced insert when queue < N" path is removed.
+    # A busy local mapper must NOT insert, even with a small queue (throttle).
     monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 0)
-    monkeypatch.setattr(Parameters, "kLocalMappingMaxQueueForForcedInsert", 3)
     lm = FakeLocalMapping(accepting=False, idle=False, queue_size=2)
     tracking = make_tracking(local_mapping=lm)
-    assert tracking.need_new_keyframe() is True
-    assert tracking.keyframe_decision_rows[-1]["insert_reason"] == "busy_rgbd_queue_below_threshold"
+    assert tracking.need_new_keyframe() is False
+    assert tracking.keyframe_decision_rows[-1]["reject_reason"] == "local_mapping_busy"
 
 
 def test_interrupt_optimization_called_when_mapper_busy(monkeypatch):
@@ -402,9 +436,11 @@ def test_need_new_keyframe_respects_mapper_backpressure(monkeypatch):
 
 
 def test_need_new_keyframe_allows_max_frame_interval(monkeypatch):
+    # pySLAM-aligned: c1a (max-frame interval) is a trigger gated by c2 AND the
+    # idle throttle (it is no longer a hard override that inserts while LM is busy).
     monkeypatch.setattr(Parameters, "kMinFramesBetweenKeyframesSequentialRgbd", 9)
     tracking = make_tracking(
-        local_mapping=FakeLocalMapping(accepting=True, idle=False),
+        local_mapping=FakeLocalMapping(accepting=True, idle=True),
         frame_id=31,
         last_kf_id=0,
     )

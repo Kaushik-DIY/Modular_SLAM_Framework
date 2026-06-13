@@ -16,9 +16,22 @@ import numpy as np
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
 from visual_slam.orbslam.slam.frame import Frame, ensure_frame_feature_arrays
-from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher
+from visual_slam.orbslam.slam.geometry_matchers import ProjectionMatcher, build_mark_search_local_map_cpp
 from visual_slam.orbslam.slam.keyframe import KeyFrame
 from visual_slam.orbslam.slam.map import Map
+
+# F2: C++ expanding local-map build (used when the C++ KeyFrame is active).
+try:
+    import cpp_slam_core as _cpp_core
+    _cpp_build_local_map = getattr(_cpp_core, "build_local_map", None)
+    _cpp_mark_current_frame_matched_points_seen = getattr(_cpp_core, "mark_current_frame_matched_points_seen", None)
+    _cpp_build_mark_search_local_map = getattr(_cpp_core, "build_mark_search_local_map", None)
+except Exception:
+    _cpp_build_local_map = None
+    _cpp_mark_current_frame_matched_points_seen = None
+    _cpp_build_mark_search_local_map = None
+_USE_CPP_LOCAL_MAP = bool(getattr(Parameters, "USE_CPP_KEYFRAME", False)) and (_cpp_build_local_map is not None)
+_USE_CPP_LOCAL_MAP_SEARCH = _USE_CPP_LOCAL_MAP and (_cpp_build_mark_search_local_map is not None)
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.motion_model import MotionModel
 from visual_slam.orbslam.slam.optimizer_g2o import pose_optimization as g2o_pose_optimization
@@ -108,6 +121,21 @@ class Tracking:
         self.total_num_static_stereo_map_points = 0
         self.last_reloc_frame_id = -float("inf")
 
+        # Robustness safety net (see Parameters.kMaxRelocFailuresBeforeReinit):
+        # track consecutive failed relocalizations and the last good pose so a
+        # permanently-LOST run can re-initialize from depth and continue.
+        self.consecutive_reloc_failures = 0
+        self.last_good_pose = None
+        self.total_reinit_from_depth = 0
+
+        # Loosely-coupled IMU aid (opt-in via run_rgbd_slam --imu-aided-tracking).
+        # When set, an ImuFallbackExtrapolator supplies a dead-reckoned pose prior
+        # while the visual motion model is weak, and carries the trajectory forward
+        # during unrecoverable loss. The map stays visual-only. Default None keeps
+        # standalone behaviour byte-for-byte unchanged.
+        self.imu_predictor = None
+        self.total_imu_propagated_frames = 0
+
         self.pose_is_ok = False
         self.mean_pose_opt_chi2_error = None
         self.predicted_pose = None
@@ -155,6 +183,28 @@ class Tracking:
     @property
     def local_mapping(self):
         return getattr(self.slam, "local_mapping", None)
+
+    def set_imu_predictor(self, predictor) -> None:
+        """Attach a loosely-coupled IMU pose predictor (opt-in).
+
+        ``predictor`` must expose ``predict(timestamp) -> Tcw (4x4) | None``
+        (see visual_slam.orbslam.imu_fallback.ImuFallbackExtrapolator). The
+        runner is responsible for feeding it visual poses each frame (via the
+        existing ``observe`` sidecar loop) so its anchor/velocity stay current.
+        """
+        self.imu_predictor = predictor
+
+    def _imu_prior_isometry(self, timestamp):
+        """Return the IMU-extrapolated pose as a g2o.Isometry3d, or None."""
+        if self.imu_predictor is None or timestamp is None:
+            return None
+        try:
+            Tcw = self.imu_predictor.predict(timestamp)
+        except Exception:
+            return None
+        if Tcw is None:
+            return None
+        return g2o.Isometry3d(np.asarray(Tcw, dtype=np.float64).reshape(4, 4))
 
     def _profile_section(self, name: str):
         profiler = getattr(self.slam, "runtime_profiler", None)
@@ -723,15 +773,27 @@ class Tracking:
         if keyframe_votes:
             self.kf_ref = reference
             self.f_cur.kf_ref = reference
-            self.local_keyframes = self._build_local_keyframes_from_votes(
-                keyframe_votes,
-                self.f_cur,
-                num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
-            )
-            self.local_points = self._collect_local_points_from_keyframes(
-                self.local_keyframes,
-                self.f_cur,
-            )
+            if _USE_CPP_LOCAL_MAP:
+                # F2: build the expanding local map in C++ (parity-faithful port of
+                # _build_local_keyframes_from_votes + _collect_local_points_from_keyframes).
+                lk, lp = _cpp_build_local_map(
+                    self.f_cur,
+                    int(Parameters.kNumBestCovisibilityKeyFramesTracking),
+                    int(Parameters.kMaxNumOfKeyframesInLocalMap),
+                    int(getattr(self.f_cur, "id", -1)),
+                )
+                self.local_keyframes = lk if isinstance(lk, list) else list(lk)
+                self.local_points = lp if isinstance(lp, list) else list(lp)
+            else:
+                self.local_keyframes = self._build_local_keyframes_from_votes(
+                    keyframe_votes,
+                    self.f_cur,
+                    num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
+                )
+                self.local_points = self._collect_local_points_from_keyframes(
+                    self.local_keyframes,
+                    self.f_cur,
+                )
         elif reference is not None:
             self.map.update_local_map(
                 reference,
@@ -744,6 +806,107 @@ class Tracking:
         else:
             self.local_keyframes = []
             self.local_points = []
+
+    def _update_and_search_local_map_cpp(self, projection_diagnostics=None):
+        self.f_cur.clean_bad_map_points()
+
+        keyframe_votes = self._collect_local_keyframe_votes_from_current_frame(self.f_cur)
+        fallback_reference = self._fallback_reference_keyframe()
+        reference = self._select_reference_keyframe_from_votes(
+            keyframe_votes,
+            fallback_reference=fallback_reference,
+        )
+
+        local_map_build_sec = 0.0
+        search_map_by_projection_sec = 0.0
+
+        if keyframe_votes:
+            self.kf_ref = reference
+            self.f_cur.kf_ref = reference
+            (
+                lk,
+                lp,
+                found_pts_count,
+                found_pts_fidxs,
+                local_map_build_sec,
+                _mark_seen_sec,
+                search_map_by_projection_sec,
+            ) = build_mark_search_local_map_cpp(
+                self.f_cur,
+                num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
+                max_kfs=Parameters.kMaxNumOfKeyframesInLocalMap,
+                frame_id=getattr(self.f_cur, "id", -1),
+                max_reproj_distance=self.reproj_err_frame_map_sigma,
+                max_descriptor_distance=self.descriptor_distance_sigma,
+                ratio_test=Parameters.kMatchRatioTestMap,
+                far_points_threshold=self.far_points_threshold,
+            )
+            self.local_keyframes = lk if isinstance(lk, list) else list(lk)
+            self.local_points = lp if isinstance(lp, list) else list(lp)
+            if projection_diagnostics is not None:
+                projection_diagnostics.clear()
+                projection_diagnostics.update(
+                    {
+                        "input_local_points": len(self.local_points),
+                        "rejected_bad": -1,
+                        "rejected_already_seen": -1,
+                        "rejected_not_visible": -1,
+                        "visible_projected_points": -1,
+                        "kd_candidate_count": -1,
+                        "descriptor_comparisons": -1,
+                        "matches": int(found_pts_count),
+                    }
+                )
+            return (
+                int(found_pts_count),
+                found_pts_fidxs,
+                float(local_map_build_sec),
+                float(search_map_by_projection_sec),
+                keyframe_votes,
+            )
+
+        local_map_build_start = time.perf_counter()
+        if reference is not None:
+            self.map.update_local_map(
+                reference,
+                num_best=Parameters.kNumBestCovisibilityKeyFramesTracking,
+            )
+            self.local_keyframes = self.map.get_local_keyframes().to_list()
+            self.local_points = self.map.get_local_points().to_list()
+            self.kf_ref = reference
+            self.f_cur.kf_ref = reference
+        else:
+            self.local_keyframes = []
+            self.local_points = []
+        local_map_build_sec = time.perf_counter() - local_map_build_start
+
+        if len(self.local_points) > 0:
+            if _cpp_mark_current_frame_matched_points_seen is not None:
+                _cpp_mark_current_frame_matched_points_seen(self.f_cur)
+            else:
+                self._mark_current_frame_matched_points_seen(self.f_cur)
+            search_start = time.perf_counter()
+            found_pts_count, found_pts_fidxs = ProjectionMatcher.search_map_by_projection(
+                self.local_points,
+                self.f_cur,
+                max_reproj_distance=self.reproj_err_frame_map_sigma,
+                max_descriptor_distance=self.descriptor_distance_sigma,
+                ratio_test=Parameters.kMatchRatioTestMap,
+                far_points_threshold=self.far_points_threshold,
+                diagnostics=projection_diagnostics,
+            )
+            search_map_by_projection_sec = time.perf_counter() - search_start
+        else:
+            found_pts_count = 0
+            found_pts_fidxs = []
+
+        return (
+            int(found_pts_count),
+            found_pts_fidxs,
+            float(local_map_build_sec),
+            float(search_map_by_projection_sec),
+            keyframe_votes,
+        )
 
     def track_local_map(self):
         with self._profile_section("tracking.track_local_map"):
@@ -768,33 +931,54 @@ class Tracking:
                 num_current_matched_points = sum(1 for p in getattr(self.f_cur, "points", []) if p is not None)
                 current_good_points = self.f_cur.get_matched_good_points()
                 num_current_good_matched_points = len(current_good_points)
-                keyframe_votes = self._collect_local_keyframe_votes_from_current_frame(self.f_cur)
 
-            local_map_build_start = time.perf_counter()
-            self.update_local_map()
-            local_map_build_sec = time.perf_counter() - local_map_build_start
-
-            if len(self.local_points) > 0:
-                self._mark_current_frame_matched_points_seen(self.f_cur)
-                search_start = time.perf_counter()
-                found_pts_count, found_pts_fidxs = ProjectionMatcher.search_map_by_projection(
-                    self.local_points,
-                    self.f_cur,
-                    max_reproj_distance=self.reproj_err_frame_map_sigma,
-                    max_descriptor_distance=self.descriptor_distance_sigma,
-                    ratio_test=Parameters.kMatchRatioTestMap,
-                    far_points_threshold=self.far_points_threshold,
-                    diagnostics=projection_diagnostics,
-                )
-                search_map_by_projection_sec = time.perf_counter() - search_start
+            if _USE_CPP_LOCAL_MAP_SEARCH:
+                (
+                    found_pts_count,
+                    found_pts_fidxs,
+                    local_map_build_sec,
+                    search_map_by_projection_sec,
+                    keyframe_votes,
+                ) = self._update_and_search_local_map_cpp(projection_diagnostics)
             else:
-                found_pts_count = 0
+                local_map_build_start = time.perf_counter()
+                self.update_local_map()
+                local_map_build_sec = time.perf_counter() - local_map_build_start
+
+                if self.profile_local_map:
+                    keyframe_votes = self._collect_local_keyframe_votes_from_current_frame(self.f_cur)
+
+                if len(self.local_points) > 0:
+                    if _cpp_mark_current_frame_matched_points_seen is not None:
+                        _cpp_mark_current_frame_matched_points_seen(self.f_cur)
+                    else:
+                        self._mark_current_frame_matched_points_seen(self.f_cur)
+                    search_start = time.perf_counter()
+                    found_pts_count, found_pts_fidxs = ProjectionMatcher.search_map_by_projection(
+                        self.local_points,
+                        self.f_cur,
+                        max_reproj_distance=self.reproj_err_frame_map_sigma,
+                        max_descriptor_distance=self.descriptor_distance_sigma,
+                        ratio_test=Parameters.kMatchRatioTestMap,
+                        far_points_threshold=self.far_points_threshold,
+                        diagnostics=projection_diagnostics,
+                    )
+                    search_map_by_projection_sec = time.perf_counter() - search_start
+                else:
+                    found_pts_count = 0
+                    found_pts_fidxs = []
 
             pose_before_pos_opt = self.f_cur.pose()
             pose_optimization_start = time.perf_counter()
             self.pose_optimization(self.f_cur, "local-map")
             pose_optimization_sec = time.perf_counter() - pose_optimization_start
 
+            # pySLAM (Tracking.track_local_map -> Frame.update_map_points_statistics):
+            # bump found-count for every inlier map point once per tracked frame, so
+            # get_found_ratio() (= found/visible) stays meaningful and map-point culling
+            # (found_ratio < 0.25) behaves correctly. increase_found() is intentionally
+            # NOT called inside search_map_by_projection (matches pySLAM).
+            self.f_cur.update_map_points_statistics()
             self.num_matched_map_points = self.f_cur.clean_outlier_map_points()
             track_local_map_sec = time.perf_counter() - track_local_map_start
 
@@ -942,8 +1126,13 @@ class Tracking:
             # Keep cache in sync for external readers (e.g., local_BA result update)
             self.num_kf_ref_tracked_points = num_ref_tracked
 
-            # Current frame matched inlier map points
-            num_matched_cur = self.num_matched_map_points if self.num_matched_map_points is not None else 0
+            # Current frame matched inlier map points.
+            # pySLAM (Tracking.need_new_keyframe): use Frame.num_matched_inlier_map_points()
+            # (points with obs>0, not outlier) — a metric CONSISTENT with the reference side
+            # (KeyFrame.num_tracked_points). pySLAM explicitly abandoned the matcher's raw
+            # found-count (self.num_matched_map_points) for this ratio; using it broke the
+            # proportionality once the matcher was corrected (ratio collapsed 0.90 -> 0.34).
+            num_matched_cur = self.f_cur.num_matched_inlier_map_points()
 
             # Close point starvation check (RGB-D specific)
             num_tracked_close, num_non_tracked_close, _ = (
@@ -996,20 +1185,49 @@ class Tracking:
                 }
             )
 
-            # c1a (max_frames elapsed) is a hard time-based override — insert unconditionally.
-            # c1b/c1c still require c2 (tracking quality gate).
-            if not (c1a or ((c1b or c1c) and c2)):
+            # Pragmatic keyframe-rate throttle (NOT pySLAM): enforce a hard minimum
+            # frame gap between keyframes. The pySLAM-correct strict matcher yields a
+            # persistently low matched/ref ratio on this dataset, so c2 (and c1c via
+            # close-point starvation) fire on nearly every frame; without a floor that
+            # cascades into keyframe/map bloat (OOM) under threaded local mapping. The
+            # max-frame interval (c1a) still forces a keyframe when genuinely stale, so
+            # this only caps the *rate*, it never blocks a needed keyframe indefinitely.
+            # TODO(v2): replace with full pySLAM threaded policy/culling parity.
+            # The floor gates only the CHRONIC triggers (relative ratio c2,
+            # close-point starvation). A genuine weak-tracking emergency — current
+            # matched inliers below an absolute floor — bypasses it so the map can
+            # densify before tracking is lost (otherwise sparse KFs starve the rover
+            # during exploration: tracked-points crash toward the loss threshold).
+            kf_emergency = num_matched_cur < int(Parameters.kEmergencyKfMatchThreshold)
+            if frames_since_last_kf < self.min_frames_between_kfs and not c1a and not kf_emergency:
+                self._append_keyframe_decision(
+                    **decision,
+                    reject_reason="min_keyframe_spacing_throttle",
+                )
+                return False
+
+            # pySLAM (Tracking.need_new_keyframe) decision combination:
+            #   ((c1a or c1b or c1c [or c1d]) and c2) [or c3]
+            # c1a is NOT a hard override — every trigger is gated by c2 (tracking
+            # quality). c1d (feature-coverage) and c3 (fov-center) are config-gated
+            # OFF in both forks, so they reduce to: (c1a or c1b or c1c) and c2.
+            if not ((c1a or c1b or c1c) and c2):
                 self._append_keyframe_decision(
                     **decision,
                     reject_reason="conditions_not_met",
                 )
                 return False
 
-            if local_mapping_accepting:
+            # Throttle (pySLAM, non-monocular): insert only if local mapping is IDLE.
+            # If it is busy, interrupt its current optimization but DO NOT insert —
+            # this is the keyframe-rate throttle that prevents map/keyframe explosion.
+            # (The previous fork "forced insert when queue < N" path is removed; it
+            # leaked the throttle and was the dominant cause of the KF explosion.)
+            if is_idle:
                 self._append_keyframe_decision(
                     **decision,
                     inserted=True,
-                    insert_reason="local_mapping_accepting",
+                    insert_reason="local_mapping_idle",
                 )
                 return True
 
@@ -1017,20 +1235,9 @@ class Tracking:
                 local_mapping.interrupt_optimization()
                 decision["local_mapping_abort_requested"] = True
 
-            if (
-                self.sensor_type != SensorType.MONOCULAR
-                and local_mapping_queue_size < int(Parameters.kLocalMappingMaxQueueForForcedInsert)
-            ):
-                self._append_keyframe_decision(
-                    **decision,
-                    inserted=True,
-                    insert_reason="busy_rgbd_queue_below_threshold",
-                )
-                return True
-
             self._append_keyframe_decision(
                 **decision,
-                reject_reason="local_mapping_busy_queue_pressure",
+                reject_reason="local_mapping_busy",
             )
             return False
 
@@ -1142,6 +1349,53 @@ class Tracking:
 
         return num_created >= Parameters.kInitializerNumMinTriangulatedPointsStereo
 
+    def _reinitialize_from_depth(self, f_cur: Frame, img=None) -> bool:
+        """Recover from prolonged tracking loss by seeding a fresh RGB-D keyframe
+        from the current frame's depth, anchored at the last-known-good pose.
+
+        This is the catastrophic-loss safety net: it only runs after many
+        consecutive failed relocalizations (system already dead), so it never
+        affects a normally-tracking run. The new keyframe is a disconnected map
+        component (no covisibility with the pre-loss map); the trajectory resumes
+        from the anchor pose. Imperfect (motion during the loss is unknown) but
+        far better than staying LOST for the rest of the run. Mirrors
+        _create_initial_rgbd_map but uses the anchor pose instead of identity.
+        """
+        anchor = self.last_good_pose
+        if anchor is None:
+            anchor = np.eye(4, dtype=np.float64)
+        f_cur.update_pose(g2o.Isometry3d(np.asarray(anchor, dtype=np.float64).reshape(4, 4)))
+
+        kf0 = KeyFrame(f_cur, img=img)
+        self.map.add_keyframe(kf0)
+        self._add_keyframe_to_database(kf0)
+
+        num_created = TrackingCore.create_and_add_stereo_map_points_on_new_kf(
+            f_cur, kf0, self.map, img=img,
+        )
+        if num_created < Parameters.kInitializerNumMinTriangulatedPointsStereo:
+            return False
+
+        if not Parameters.kStoreKeyFrameDepthImages:
+            kf0.release_heavy_data(release_rgb=not Parameters.kStoreKeyFrameImages,
+                                   release_depth=True, release_kd=False)
+        kf0.update_connections()
+
+        self.kf_ref = kf0
+        self.kf_last = kf0
+        self.f_ref = f_cur
+        self.f_cur = f_cur
+        f_cur.kf_ref = kf0
+        self.map.update_local_map(kf0)
+        self.motion_model.reset()
+        self.motion_model.update_pose_from_matrix(f_cur.timestamp, f_cur.pose())
+
+        self.state = SlamState.OK
+        self.pose_is_ok = True
+        self.num_matched_map_points = num_created
+        self.last_good_pose = np.asarray(anchor, dtype=np.float64).reshape(4, 4)
+        return True
+
     def _add_keyframe_to_database(self, keyframe: KeyFrame) -> None:
         keyframe_database = getattr(self.slam, "keyframe_database", None)
         if keyframe_database is None:
@@ -1187,6 +1441,10 @@ class Tracking:
         self.pose_is_ok = False
         self.num_matched_map_points = 0
         self.mean_pose_opt_chi2_error = float("inf")
+        # Set True when visual tracking failed but the IMU predictor carried the
+        # pose forward this frame (loosely-coupled fallback). Used below to record
+        # a continuous trajectory and tag the frame as IMU_PROPAGATED.
+        imu_carried = False
 
         # First frame: create initial RGB-D keyframe/map.
         if self.state in (SlamState.NO_IMAGES_YET, SlamState.NOT_INITIALIZED):
@@ -1208,10 +1466,19 @@ class Tracking:
             if self.motion_model.is_ok:
                 predicted_pose, _ = self.motion_model.predict_pose(timestamp)
                 f_cur.update_pose(predicted_pose)
-            elif self.f_ref is not None:
-                f_cur.update_pose(self.f_ref.pose())
-            elif self.kf_ref is not None:
-                f_cur.update_pose(self.kf_ref.pose())
+            else:
+                # Weak motion model (just lost lock / right after reloc) is exactly
+                # when featureless frames break tracking. Prefer an IMU dead-reckoned
+                # prior over a stale reference pose so search-by-projection starts
+                # near the true pose. Falls back to the original behaviour when no
+                # IMU predictor is attached.
+                imu_prior = self._imu_prior_isometry(timestamp)
+                if imu_prior is not None:
+                    f_cur.update_pose(imu_prior)
+                elif self.f_ref is not None:
+                    f_cur.update_pose(self.f_ref.pose())
+                elif self.kf_ref is not None:
+                    f_cur.update_pose(self.kf_ref.pose())
 
             if (not self.motion_model.is_ok) and self.kf_ref is not None:
                 self.track_keyframe(self.kf_ref, f_cur, "match-frame-keyframe")
@@ -1233,6 +1500,7 @@ class Tracking:
                 self.last_reloc_frame_id = f_cur.id
                 self.state = SlamState.OK
                 self.pose_is_ok = True
+                self.consecutive_reloc_failures = 0
                 self.kf_ref = f_cur.kf_ref
                 self.kf_last = self.kf_ref
                 self.map.update_local_map(self.kf_ref)
@@ -1243,10 +1511,51 @@ class Tracking:
                 )
             else:
                 self.pose_is_ok = False
+                self.consecutive_reloc_failures += 1
                 Printer.red("Relocalization failed")
+                # Loosely-coupled carry-through: dead-reckon the pose from the IMU
+                # so the MAIN trajectory stays continuous (no teleport gap) instead
+                # of leaving f_cur at a stale/failed pose. The map stays visual-only;
+                # this only fills the per-frame pose recorded in update_history().
+                imu_prior = self._imu_prior_isometry(timestamp)
+                if imu_prior is not None:
+                    f_cur.update_pose(imu_prior)
+                    imu_carried = True
+                    self.total_imu_propagated_frames += 1
+                    try:
+                        _ip = imu_prior.matrix()
+                        self.last_good_pose = np.array(_ip, dtype=np.float64).reshape(4, 4)
+                    except Exception:
+                        pass
+                # Safety net: after prolonged unrecoverable loss, re-initialize a
+                # fresh RGB-D submap from depth (anchored at the last good pose,
+                # which is now the IMU-carried pose when available) so the system
+                # continues instead of staying dead for the rest of the run.
+                if self.imu_predictor is not None:
+                    limit = int(getattr(Parameters, "kImuAidedRelocFailuresBeforeReinit",
+                                        getattr(Parameters, "kMaxRelocFailuresBeforeReinit", 0)))
+                else:
+                    limit = int(getattr(Parameters, "kMaxRelocFailuresBeforeReinit", 0))
+                if (limit > 0 and self.consecutive_reloc_failures >= limit
+                        and depth is not None):
+                    if self._reinitialize_from_depth(f_cur, img=img):
+                        Printer.orange(
+                            f"[recovery] re-initialized from depth at frame "
+                            f"{f_cur.id} after {self.consecutive_reloc_failures} "
+                            f"failed relocalizations"
+                        )
+                        self.consecutive_reloc_failures = 0
+                        self.total_reinit_from_depth += 1
 
         if self.pose_is_ok:
             self.state = SlamState.OK
+            self.consecutive_reloc_failures = 0
+            try:
+                _p = f_cur.pose()
+                _p = _p.matrix() if hasattr(_p, "matrix") else _p
+                self.last_good_pose = np.array(_p, dtype=np.float64).reshape(4, 4)
+            except Exception:
+                self.last_good_pose = None
             self.motion_model.update_pose_from_matrix(timestamp, f_cur.pose())
             if f_cur.id <= self.last_reloc_frame_id + 1:
                 self.motion_model.is_ok = False
@@ -1254,7 +1563,18 @@ class Tracking:
             if self.need_new_keyframe():
                 self.create_new_keyframe(img=img)
         else:
-            self.state = SlamState.LOST
+            # Carry-through for any loss path not already handled above (notably the
+            # OK->fail transition frame): dead-reckon from the IMU so the MAIN
+            # trajectory stays continuous instead of leaving a gap/teleport.
+            if not imu_carried:
+                imu_prior = self._imu_prior_isometry(timestamp)
+                if imu_prior is not None:
+                    f_cur.update_pose(imu_prior)
+                    imu_carried = True
+                    self.total_imu_propagated_frames += 1
+            # IMU_PROPAGATED marks frames where vision failed but the IMU carried
+            # the pose forward (continuous trajectory); plain LOST is a true gap.
+            self.state = SlamState.IMU_PROPAGATED if imu_carried else SlamState.LOST
             self.motion_model.is_ok = False
 
         # Important: do not assign self.f_ref = f_cur here.

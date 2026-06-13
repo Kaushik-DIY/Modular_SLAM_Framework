@@ -1,0 +1,22 @@
+{
+  "mode": "lidar",
+  "frontend": "native_s2s",
+  "verifier": "bnb",
+  "imu_active": true,
+  "scans": 4147,
+  "keyframes": 382,
+  "fallbacks": 1,
+  "proposals": 110,
+  "verified": 110,
+  "loops_accepted": 71,
+  "rehearsal_merges": 13,
+  "optimize_calls": 13,
+  "elapsed_sec": 53.3,
+  "peak_rss_gb": 0.16,
+  "verify_ms_mean": 47.5,
+  "verify_ms_p95": 87.3,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 139,
+  "map_payload_mb": 1.7
+}

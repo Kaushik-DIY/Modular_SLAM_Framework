@@ -2,11 +2,21 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <pybind11/eigen.h>
+#include <pybind11/eval.h>  // py::exec — explicit in pybind11 3.x (was transitive in 2.x)
 
 #include "map_point.h"
 #include "frame.h"
 #include "keyframe.h"
 #include "local_mapping_core.h"
+#include "geometry_matchers.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace py = pybind11;
 using namespace slam;
@@ -17,6 +27,386 @@ using namespace slam;
 static Eigen::Vector3d np_to_vec3(py::array_t<double, py::array::c_style> arr) {
     auto r = arr.unchecked<1>();
     return Eigen::Vector3d(r(0), r(1), r(2));
+}
+
+// ---------------------------------------------------------------------------
+// Local BA write-back helpers
+// ---------------------------------------------------------------------------
+static int update_local_ba_poses_batch(
+    const py::list &keyframes,
+    py::array_t<double, py::array::c_style | py::array::forcecast> poses,
+    py::array_t<bool, py::array::c_style | py::array::forcecast> update_mask)
+{
+    auto pose_view = poses.unchecked<2>();
+    auto mask_view = update_mask.unchecked<1>();
+    const ssize_t n = std::min<ssize_t>(
+        static_cast<ssize_t>(py::len(keyframes)),
+        std::min<ssize_t>(pose_view.shape(0), mask_view.shape(0)));
+
+    int updated = 0;
+    for (ssize_t i = 0; i < n; ++i) {
+        if (!mask_view(i)) continue;
+
+        py::object obj = py::reinterpret_borrow<py::object>(keyframes[i]);
+        if (obj.is_none()) continue;
+
+        bool is_bad = false;
+        try {
+            if (py::isinstance<KeyFrame>(obj)) {
+                is_bad = obj.cast<KeyFrame &>().is_bad();
+            } else {
+                auto is_bad_attr = obj.attr("is_bad");
+                is_bad = py::cast<bool>(is_bad_attr());
+            }
+        } catch (...) {
+            try { is_bad = py::cast<bool>(obj.attr("_is_bad")); } catch (...) {}
+        }
+        if (is_bad) continue;
+
+        bool finite = true;
+        Eigen::Matrix4d T;
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                const double v = pose_view(i, r * 4 + c);
+                if (!std::isfinite(v)) finite = false;
+                T(r, c) = v;
+            }
+        }
+        if (!finite) continue;
+
+        if (py::isinstance<KeyFrame>(obj)) {
+            auto &kf = obj.cast<KeyFrame &>();
+            kf.update_pose(T);
+        } else {
+            py::array_t<double> T_arr({4, 4});
+            auto T_view = T_arr.mutable_unchecked<2>();
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    T_view(r, c) = T(r, c);
+            obj.attr("update_pose")(T_arr);
+        }
+        try {
+            if (py::hasattr(obj, "lba_count")) {
+                obj.attr("lba_count") = obj.attr("lba_count").cast<int>() + 1;
+            }
+        } catch (...) {
+        }
+        ++updated;
+    }
+    return updated;
+}
+
+static int update_local_ba_points_batch(
+    const py::list &points,
+    py::array_t<double, py::array::c_style | py::array::forcecast> positions,
+    py::array_t<bool, py::array::c_style | py::array::forcecast> update_mask)
+{
+    auto pos_view = positions.unchecked<2>();
+    auto mask_view = update_mask.unchecked<1>();
+    const ssize_t n = std::min<ssize_t>(
+        static_cast<ssize_t>(py::len(points)),
+        std::min<ssize_t>(pos_view.shape(0), mask_view.shape(0)));
+
+    int updated = 0;
+    for (ssize_t i = 0; i < n; ++i) {
+        if (!mask_view(i)) continue;
+
+        py::object obj = py::reinterpret_borrow<py::object>(points[i]);
+        if (obj.is_none()) continue;
+
+        bool is_bad = false;
+        try {
+            if (py::isinstance<MapPoint>(obj)) {
+                is_bad = obj.cast<MapPoint &>().is_bad();
+            } else {
+                auto is_bad_attr = obj.attr("is_bad");
+                is_bad = py::cast<bool>(is_bad_attr());
+            }
+        } catch (...) {
+            try { is_bad = py::cast<bool>(obj.attr("_is_bad")); } catch (...) {}
+        }
+        if (is_bad) continue;
+
+        const double x = pos_view(i, 0);
+        const double y = pos_view(i, 1);
+        const double z = pos_view(i, 2);
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+
+        if (py::isinstance<MapPoint>(obj)) {
+            auto &mp = obj.cast<MapPoint &>();
+            mp.update_position(Eigen::Vector3d(x, y, z));
+            mp.update_normal_and_depth();
+        } else {
+            py::array_t<double> p_arr({3});
+            auto p_view = p_arr.mutable_unchecked<1>();
+            p_view(0) = x;
+            p_view(1) = y;
+            p_view(2) = z;
+            obj.attr("update_position")(p_arr);
+            obj.attr("update_normal_and_depth")();
+        }
+        ++updated;
+    }
+    return updated;
+}
+
+static py::object pack_local_ba_native(
+    const py::list &local_keyframes,
+    const py::list &fixed_keyframes,
+    const py::list &points,
+    py::array_t<double, py::array::c_style | py::array::forcecast> inv_level_sigmas2)
+{
+    struct KfEntry {
+        py::object obj;
+        KeyFrame *kf;
+        bool fixed;
+    };
+    struct PtEntry {
+        py::object obj;
+        MapPoint *mp;
+    };
+
+    std::unordered_set<KeyFrame *> fixed_set;
+    for (auto item : fixed_keyframes) {
+        py::object obj = py::reinterpret_borrow<py::object>(item);
+        if (obj.is_none()) continue;
+        KeyFrame *kf = nullptr;
+        try { kf = obj.cast<KeyFrame *>(); } catch (...) { return py::none(); }
+        if (kf == nullptr) return py::none();
+        if (!kf->is_bad()) fixed_set.insert(kf);
+    }
+
+    std::vector<KfEntry> kf_entries;
+    std::unordered_set<KeyFrame *> seen_kfs;
+    auto append_kfs = [&](const py::list &items) -> bool {
+        for (auto item : items) {
+            py::object obj = py::reinterpret_borrow<py::object>(item);
+            if (obj.is_none()) continue;
+            KeyFrame *kf = nullptr;
+            try { kf = obj.cast<KeyFrame *>(); } catch (...) { return false; }
+            if (kf == nullptr) return false;
+            if (kf->is_bad()) continue;
+            if (!seen_kfs.insert(kf).second) continue;
+            kf_entries.push_back({obj, kf, fixed_set.count(kf) > 0});
+        }
+        return true;
+    };
+    if (!append_kfs(local_keyframes) || !append_kfs(fixed_keyframes)) return py::none();
+
+    std::unordered_map<KeyFrame *, ssize_t> kf_index;
+    for (ssize_t i = 0; i < static_cast<ssize_t>(kf_entries.size()); ++i) {
+        kf_index[kf_entries[i].kf] = i;
+    }
+
+    std::vector<PtEntry> pt_entries;
+    pt_entries.reserve(py::len(points));
+    for (auto item : points) {
+        py::object obj = py::reinterpret_borrow<py::object>(item);
+        if (obj.is_none()) continue;
+        MapPoint *mp = nullptr;
+        try { mp = obj.cast<MapPoint *>(); } catch (...) { return py::none(); }
+        if (mp == nullptr) return py::none();
+        if (mp->is_bad()) continue;
+        pt_entries.push_back({obj, mp});
+    }
+
+    std::unordered_map<MapPoint *, ssize_t> pt_index;
+    for (ssize_t i = 0; i < static_cast<ssize_t>(pt_entries.size()); ++i) {
+        pt_index[pt_entries[i].mp] = i;
+    }
+
+    const ssize_t N = static_cast<ssize_t>(kf_entries.size());
+    const ssize_t M = static_cast<ssize_t>(pt_entries.size());
+
+    py::array_t<double> kf_poses({N, static_cast<ssize_t>(16)});
+    py::array_t<int64_t> kf_ids({N});
+    py::array_t<uint8_t> kf_fixed({N});
+    py::array_t<double> point_pos({M, static_cast<ssize_t>(3)});
+
+    auto poses = kf_poses.mutable_unchecked<2>();
+    auto ids = kf_ids.mutable_unchecked<1>();
+    auto fixed = kf_fixed.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < N; ++i) {
+        const Eigen::Matrix4d T = kf_entries[i].kf->Tcw();
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                poses(i, r * 4 + c) = T(r, c);
+            }
+        }
+        ids(i) = static_cast<int64_t>(kf_entries[i].kf->kid);
+        fixed(i) = (kf_entries[i].fixed || kf_entries[i].kf->kid == 0) ? 1 : 0;
+    }
+
+    auto pos = point_pos.mutable_unchecked<2>();
+    std::vector<bool> point_valid(M, false);
+    for (ssize_t i = 0; i < M; ++i) {
+        const Eigen::Vector3d p = pt_entries[i].mp->get_position();
+        point_valid[i] = p.allFinite();
+        pos(i, 0) = p(0);
+        pos(i, 1) = p(1);
+        pos(i, 2) = p(2);
+    }
+
+    py::list kf_list;
+    for (const auto &entry : kf_entries) kf_list.append(entry.obj);
+    py::list pt_list;
+    for (const auto &entry : pt_entries) pt_list.append(entry.obj);
+
+    py::array_t<double> camera({static_cast<ssize_t>(5)});
+    auto cam = camera.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < 5; ++i) cam(i) = 0.0;
+    if (!kf_entries.empty()) {
+        py::object cam_obj = kf_entries[0].kf->camera;
+        try {
+            cam(0) = cam_obj.attr("fx").cast<double>();
+            cam(1) = cam_obj.attr("fy").cast<double>();
+            cam(2) = cam_obj.attr("cx").cast<double>();
+            cam(3) = cam_obj.attr("cy").cast<double>();
+            cam(4) = cam_obj.attr("bf").cast<double>();
+        } catch (...) {}
+    }
+
+    auto inv_sigmas = inv_level_sigmas2.unchecked<1>();
+    const ssize_t n_sigmas = inv_sigmas.shape(0);
+
+    std::vector<std::array<double, 8>> obs_rows;
+    py::list obs_triples;
+    for (const auto &pt_entry : pt_entries) {
+        const auto pt_it = pt_index.find(pt_entry.mp);
+        if (pt_it == pt_index.end()) continue;
+        const ssize_t pt_row = pt_it->second;
+        if (pt_row < 0 || pt_row >= M || !point_valid[pt_row]) continue;
+
+        for (const auto &obs : pt_entry.mp->observations()) {
+            KeyFrame *kf = nullptr;
+            try { kf = obs.first.cast<KeyFrame *>(); } catch (...) { continue; }
+            if (kf == nullptr || kf->is_bad()) continue;
+            auto kf_it = kf_index.find(kf);
+            if (kf_it == kf_index.end()) continue;
+            const int idx = obs.second;
+            if (idx < 0 || idx >= static_cast<int>(kf->points.size())) continue;
+            if (kf->points[idx].ptr() != pt_entry.obj.ptr()) continue;
+            if (idx >= kf->kpsu.rows()) continue;
+
+            const int octave = (idx < kf->octaves.size()) ? kf->octaves(idx) : 0;
+            const int oct_level = std::max(0, std::min<int>(octave, static_cast<int>(n_sigmas) - 1));
+            const double inv_s2 = (n_sigmas > 0) ? inv_sigmas(oct_level) : 1.0;
+            const double ur = (idx < kf->kps_ur.size()) ? static_cast<double>(kf->kps_ur(idx)) : -1.0;
+
+            obs_rows.push_back({
+                static_cast<double>(kf_it->second),
+                static_cast<double>(pt_row),
+                static_cast<double>(kf->kpsu(idx, 0)),
+                static_cast<double>(kf->kpsu(idx, 1)),
+                ur,
+                static_cast<double>(octave),
+                inv_s2,
+                ur >= 0.0 ? 1.0 : 0.0,
+            });
+            obs_triples.append(py::make_tuple(pt_entry.obj, obs.first, idx));
+        }
+    }
+
+    py::array_t<double> observations({
+        static_cast<ssize_t>(obs_rows.size()),
+        static_cast<ssize_t>(8)
+    });
+    auto obs_view = observations.mutable_unchecked<2>();
+    for (ssize_t r = 0; r < static_cast<ssize_t>(obs_rows.size()); ++r) {
+        for (ssize_t c = 0; c < 8; ++c) obs_view(r, c) = obs_rows[r][c];
+    }
+
+    return py::make_tuple(
+        kf_poses, kf_ids, kf_fixed,
+        point_pos, observations, camera,
+        kf_list, pt_list, obs_triples);
+}
+
+static py::tuple add_triangulated_map_points_batch(
+    py::object map_obj,
+    py::array_t<double, py::array::c_style | py::array::forcecast> pts3d,
+    py::array_t<bool, py::array::c_style | py::array::forcecast> pts3d_mask,
+    py::object kf1_obj,
+    py::object kf2_obj,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> idxs1,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> idxs2,
+    double far_points_threshold)
+{
+    auto pts = pts3d.unchecked<2>();
+    auto valid = pts3d_mask.unchecked<1>();
+    auto i1s = idxs1.unchecked<1>();
+    auto i2s = idxs2.unchecked<1>();
+
+    const ssize_t n = std::min<ssize_t>(
+        pts.shape(0),
+        std::min<ssize_t>(valid.shape(0), std::min<ssize_t>(i1s.shape(0), i2s.shape(0))));
+
+    py::array_t<bool> added_mask({n});
+    auto added = added_mask.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < n; ++i) added(i) = false;
+
+    py::list added_points;
+
+    KeyFrame *kf1 = nullptr;
+    KeyFrame *kf2 = nullptr;
+    try {
+        kf1 = kf1_obj.cast<KeyFrame *>();
+        kf2 = kf2_obj.cast<KeyFrame *>();
+    } catch (...) {
+        return py::make_tuple(0, added_mask, added_points);
+    }
+    if (kf1 == nullptr || kf2 == nullptr || kf1->is_bad() || kf2->is_bad()) {
+        return py::make_tuple(0, added_mask, added_points);
+    }
+
+    const bool use_far_threshold = std::isfinite(far_points_threshold) && far_points_threshold > 0.0;
+    const Eigen::Vector3d Ow1 = use_far_threshold ? kf1->Ow() : Eigen::Vector3d::Zero();
+    const Eigen::Vector3d Ow2 = use_far_threshold ? kf2->Ow() : Eigen::Vector3d::Zero();
+
+    int count = 0;
+    for (ssize_t i = 0; i < n; ++i) {
+        if (!valid(i)) continue;
+
+        const int idx1 = i1s(i);
+        const int idx2 = i2s(i);
+        if (idx1 < 0 || idx1 >= static_cast<int>(kf1->points.size())) continue;
+        if (idx2 < 0 || idx2 >= static_cast<int>(kf2->points.size())) continue;
+        if (!kf1->points[idx1].is_none() || !kf2->points[idx2].is_none()) continue;
+
+        const Eigen::Vector3d pw(pts(i, 0), pts(i, 1), pts(i, 2));
+        if (!pw.allFinite()) continue;
+        if (use_far_threshold) {
+            if ((pw - Ow1).norm() > far_points_threshold ||
+                (pw - Ow2).norm() > far_points_threshold) {
+                continue;
+            }
+        }
+
+        auto mp = std::make_shared<MapPoint>(-1);
+        mp->update_position(pw);
+        mp->map = map_obj;
+        mp->kf_ref = kf1_obj;
+        mp->rgb = py::none();
+        mp->replacement = py::none();
+        py::object mp_obj = py::cast(mp);
+
+        mp->add_observation(kf1_obj, idx1);
+        mp->add_observation(kf2_obj, idx2);
+        try {
+            map_obj.attr("add_point")(mp_obj);
+        } catch (...) {
+            kf1->remove_point_match(idx1);
+            kf2->remove_point_match(idx2);
+            continue;
+        }
+        mp->update_info();
+
+        added(i) = true;
+        added_points.append(mp_obj);
+        ++count;
+    }
+
+    return py::make_tuple(count, added_mask, added_points);
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +461,9 @@ static void bind_map_point(py::module_ &m) {
         })
         .def_property_readonly("min_distance", &MapPoint::min_distance)
         .def_property_readonly("max_distance", &MapPoint::max_distance)
+        .def("get_all_pos_info", &MapPoint::get_all_pos_info,
+             "(position, normal, 0.8*min_dist, 1.2*max_dist) — enables the Python "
+             "matcher's viewing-cos + distance filters (pySLAM-compatible).")
         .def_property("normal",
             [](const MapPoint &mp) -> py::array_t<double> {
                 return py::array_t<double>({3}, {sizeof(double)}, mp.normal.data());
@@ -348,6 +741,14 @@ static void bind_frame(py::module_ &m) {
         .def("replace_point_match", &Frame::replace_point_match)
         .def("reset_points",        &Frame::reset_points)
         .def("num_kps",             &Frame::num_kps)
+        .def("kd_query_ball",       &Frame::kd_query_ball,
+             py::arg("x"), py::arg("y"), py::arg("r"),
+             "Indices of kpsu within radius r of (x,y), sorted (scipy-compatible).")
+        .def("kd_ready",            &Frame::kd_ready)
+        .def("project_world",       &Frame::project_world, py::arg("Xw"),
+             "Native C++ pinhole projection of a world point -> (u, v, depth).")
+        .def("is_in_image",         &Frame::is_in_image,
+             py::arg("u"), py::arg("v"), py::arg("z"))
 
         // ---- Depth array (RGBD/stereo — numpy array or None) ---------------
         .def_readwrite("depths",      &Frame::depths)
@@ -536,6 +937,127 @@ PYBIND11_MODULE(cpp_slam_core, m) {
     bind_frame(m);
     bind_keyframe(m);
     bind_local_mapping_core(m);
+
+    m.def("update_local_ba_poses_batch", &update_local_ba_poses_batch,
+          py::arg("keyframes"), py::arg("poses"), py::arg("update_mask"),
+          "Batch write-back of local BA keyframe poses.");
+    m.def("update_local_ba_points_batch", &update_local_ba_points_batch,
+          py::arg("points"), py::arg("positions"), py::arg("update_mask"),
+          "Batch write-back of local BA map-point positions and normal/depth info.");
+    m.def("pack_local_ba_native", &pack_local_ba_native,
+          py::arg("local_keyframes"), py::arg("fixed_keyframes"), py::arg("points"),
+          py::arg("inv_level_sigmas2"),
+          "Pack native C++ keyframes/map points for slam_optimizer_core local BA.");
+    m.def("add_triangulated_map_points_batch", &add_triangulated_map_points_batch,
+          py::arg("map_obj"), py::arg("pts3d"), py::arg("pts3d_mask"),
+          py::arg("kf1"), py::arg("kf2"), py::arg("idxs1"), py::arg("idxs2"),
+          py::arg("far_points_threshold"),
+          "Batch-create triangulated map points for native local mapping.");
+
+    // ---- Phase 5: C++ projection matcher (params passed from Python) -------
+    m.def("search_map_by_projection",
+          [](const py::list &points, py::object frame,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             float max_reproj_distance, float max_descriptor_distance, float ratio_test,
+             float viewing_cos_limit, float min_depth, float far_points_threshold,
+             double log_scale_factor, int num_levels) {
+              cppcore::MatchParams p{max_reproj_distance, max_descriptor_distance, ratio_test,
+                                     viewing_cos_limit, min_depth, far_points_threshold,
+                                     log_scale_factor, num_levels};
+              return cppcore::search_map_by_projection(points, frame, scale_factors, p);
+          },
+          py::arg("points"), py::arg("frame"), py::arg("scale_factors"),
+          py::arg("max_reproj_distance"), py::arg("max_descriptor_distance"),
+          py::arg("ratio_test"), py::arg("viewing_cos_limit"), py::arg("min_depth"),
+          py::arg("far_points_threshold"), py::arg("log_scale_factor"), py::arg("num_levels"),
+          "C++ search_map_by_projection -> (found_count, matched_feature_idxs).");
+
+    m.def("mark_current_frame_matched_points_seen", &cppcore::mark_current_frame_matched_points_seen,
+          py::arg("f_cur"),
+          "C++ tracking helper: mark current-frame matched good points visible/seen.");
+
+    m.def("search_frame_by_projection",
+          [](const py::list &ref_points, const std::vector<int> &ref_idxs,
+             const std::vector<int> &ref_octaves, py::object f_cur,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             float max_reproj_distance, float max_descriptor_distance,
+             float viewing_cos_limit, float min_depth, bool do_stereo_check) {
+              return cppcore::search_frame_by_projection(
+                  ref_points, ref_idxs, ref_octaves, f_cur, scale_factors,
+                  max_reproj_distance, max_descriptor_distance, viewing_cos_limit,
+                  min_depth, do_stereo_check);
+          },
+          py::arg("ref_points"), py::arg("ref_idxs"), py::arg("ref_octaves"),
+          py::arg("f_cur"), py::arg("scale_factors"), py::arg("max_reproj_distance"),
+          py::arg("max_descriptor_distance"), py::arg("viewing_cos_limit"),
+          py::arg("min_depth"), py::arg("do_stereo_check"),
+          "C++ search_frame_by_projection -> (idxs_ref, idxs_cur) pre-rotation-filter.");
+
+    m.def("search_frame_for_triangulation",
+          [](py::object f1, py::object f2,
+             const std::vector<int> &idxs1, const std::vector<int> &idxs2,
+             py::array_t<float, py::array::c_style | py::array::forcecast> level_sigmas2,
+             py::array_t<float, py::array::c_style | py::array::forcecast> angles1,
+             py::array_t<float, py::array::c_style | py::array::forcecast> angles2,
+             float max_descriptor_distance, float matcher_ratio_test, bool check_orientation) {
+              auto a1 = angles1.unchecked<1>();
+              auto a2 = angles2.unchecked<1>();
+              std::vector<float> angles1_vec;
+              std::vector<float> angles2_vec;
+              angles1_vec.reserve(static_cast<std::size_t>(a1.shape(0)));
+              angles2_vec.reserve(static_cast<std::size_t>(a2.shape(0)));
+              for (ssize_t i = 0; i < a1.shape(0); ++i) angles1_vec.push_back(a1(i));
+              for (ssize_t i = 0; i < a2.shape(0); ++i) angles2_vec.push_back(a2(i));
+              return cppcore::search_frame_for_triangulation(
+                  f1, f2, idxs1, idxs2, level_sigmas2, angles1_vec, angles2_vec,
+                  max_descriptor_distance, matcher_ratio_test, check_orientation);
+          },
+          py::arg("f1"), py::arg("f2"), py::arg("idxs1"), py::arg("idxs2"),
+          py::arg("level_sigmas2"), py::arg("angles1"), py::arg("angles2"),
+          py::arg("max_descriptor_distance"), py::arg("matcher_ratio_test"),
+          py::arg("check_orientation"),
+          "C++ EpipolarMatcher.search_frame_for_triangulation -> (idxs1, idxs2, count).");
+
+    m.def("search_and_fuse",
+          [](const py::list &points, py::object keyframe,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             py::array_t<float, py::array::c_style | py::array::forcecast> inv_level_sigmas2,
+             float max_reproj_distance, float max_descriptor_distance,
+             double log_scale_factor, int num_levels, float min_depth, float chi2_mono) {
+              return cppcore::search_and_fuse(
+                  points, keyframe, scale_factors, inv_level_sigmas2,
+                  max_reproj_distance, max_descriptor_distance,
+                  log_scale_factor, num_levels, min_depth, chi2_mono);
+          },
+          py::arg("points"), py::arg("keyframe"), py::arg("scale_factors"),
+          py::arg("inv_level_sigmas2"), py::arg("max_reproj_distance"),
+          py::arg("max_descriptor_distance"), py::arg("log_scale_factor"),
+          py::arg("num_levels"), py::arg("min_depth"), py::arg("chi2_mono"),
+          "C++ local-mapping search_and_fuse -> fused point count.");
+
+    m.def("build_local_map", &cppcore::build_local_map,
+          py::arg("f_cur"), py::arg("num_best"), py::arg("max_kfs"), py::arg("frame_id"),
+          "F2 C++ expanding tracking local-map build -> (local_keyframes, local_points).");
+
+    m.def("build_mark_search_local_map",
+          [](py::object f_cur, py::object frame,
+             int num_best, int max_kfs, int frame_id,
+             py::array_t<float, py::array::c_style | py::array::forcecast> scale_factors,
+             float max_reproj_distance, float max_descriptor_distance, float ratio_test,
+             float viewing_cos_limit, float min_depth, float far_points_threshold,
+             double log_scale_factor, int num_levels) {
+              cppcore::MatchParams p{max_reproj_distance, max_descriptor_distance, ratio_test,
+                                     viewing_cos_limit, min_depth, far_points_threshold,
+                                     log_scale_factor, num_levels};
+              return cppcore::build_mark_search_local_map(
+                  f_cur, frame, num_best, max_kfs, frame_id, scale_factors, p);
+          },
+          py::arg("f_cur"), py::arg("frame"), py::arg("num_best"), py::arg("max_kfs"),
+          py::arg("frame_id"), py::arg("scale_factors"), py::arg("max_reproj_distance"),
+          py::arg("max_descriptor_distance"), py::arg("ratio_test"),
+          py::arg("viewing_cos_limit"), py::arg("min_depth"), py::arg("far_points_threshold"),
+          py::arg("log_scale_factor"), py::arg("num_levels"),
+          "F3 C++ build+mark+search local-map path -> lists, matches, section timings.");
 
     // Python 3.11 adaptive interpreter specialization bug: calling a pybind11
     // instancemethod exactly 8 times in a tight for loop triggers a segfault

@@ -24,6 +24,187 @@ from visual_slam.orbslam.utilities.geom_2views import computeF12, check_dist_epi
 
 kCheckFeaturesOrientation = Parameters.kCheckFeaturesOrientation
 
+# Phase 5d: optional C++ projection matcher. The dispatch is gated on
+# Parameters.USE_CPP_CORE AND the current frame actually being a C++ Frame
+# (cpp_slam_core.Frame). Until tracking is wired to build C++ Frames this branch
+# stays dormant, so USE_CPP_CORE=False (default) is the unchanged Python path.
+try:
+    import cpp_slam_core as _cpp_slam_core
+    _CppFrame = getattr(_cpp_slam_core, "Frame", None)
+    _CppKeyFrame = getattr(_cpp_slam_core, "KeyFrame", None)
+except ImportError:
+    _cpp_slam_core = None
+    _CppFrame = None
+    _CppKeyFrame = None
+
+
+def _ensure_cpp_frame_mirror(f_cur):
+    """Return a cpp_slam_core.Frame view of a Python Frame, used by the C++ matcher.
+
+    If f_cur is already a C++ Frame it is returned as-is. Otherwise an embedded
+    mirror is built once (feature arrays + kd, which are static per frame) and
+    cached on f_cur; the pose and the points list (which change during tracking)
+    are re-synced on every call. The mirror shares f_cur.id so the matcher's
+    last_frame_id_seen gate behaves identically to the Python path.
+    """
+    if _CppFrame is not None and isinstance(f_cur, _CppFrame):
+        return f_cur
+    cpp = getattr(f_cur, "_cpp_frame_mirror", None)
+    if cpp is None:
+        kpsu = np.asarray([kp.pt for kp in f_cur.kpsu], dtype=np.float32).reshape(-1, 2)
+        des = np.ascontiguousarray(f_cur.des, dtype=np.uint8)
+        octaves = np.ascontiguousarray(f_cur.octaves, dtype=np.int32)
+        # kps_ur (right stereo coords) is static per frame and needed by the C++
+        # search_frame_by_projection stereo check; search_map ignores it.
+        uRs = getattr(f_cur, "uRs", None)
+        kps_ur = np.ascontiguousarray(uRs, dtype=np.float32) if uRs is not None and len(uRs) > 0 else None
+        cpp = _cpp_slam_core.Frame(f_cur.camera, int(f_cur.id))
+        cpp.init_feature_arrays(kpsu, des, kps_ur, octaves, int(len(kpsu)))
+        f_cur._cpp_frame_mirror = cpp
+    cpp.update_pose(np.ascontiguousarray(f_cur.pose(), dtype=np.float64))
+    cpp.points = list(f_cur.points)
+    return cpp
+
+
+def _search_map_by_projection_cpp(points, f_cur, max_reproj_distance,
+                                  max_descriptor_distance, ratio_test, far_points_threshold):
+    """Dispatch to the parity-validated C++ search_map_by_projection kernel via an
+    embedded C++ Frame mirror, then propagate the matches back onto the Python frame."""
+    cpp_frame = _ensure_cpp_frame_mirror(f_cur)
+    fm = FeatureTrackerShared.feature_manager
+    scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
+    mdd = float(_max_descriptor_distance(max_descriptor_distance))
+    far = float(far_points_threshold) if far_points_threshold is not None else float("inf")
+    points_arg = points if isinstance(points, list) else list(points)
+    found_count, found_fidxs = _cpp_slam_core.search_map_by_projection(
+        points_arg, cpp_frame, scale_factors,
+        float(max_reproj_distance), mdd, float(ratio_test),
+        float(Parameters.kViewingCosLimitForPoint), float(Parameters.kMinDepth), far,
+        float(fm.log_scale_factor), int(fm.num_levels),
+    )
+    # Propagate matches to the Python frame: register the frame-view keyed by f_cur
+    # (which also sets f_cur.points[idx]) so tracking + KF creation see the matches.
+    if cpp_frame is not f_cur:
+        for fidx in found_fidxs:
+            mp = cpp_frame.points[fidx]
+            if mp is not None:
+                mp.add_frame_view(f_cur, int(fidx))
+    return found_count, found_fidxs
+
+
+def build_mark_search_local_map_cpp(
+    f_cur,
+    *,
+    num_best,
+    max_kfs,
+    frame_id,
+    max_reproj_distance,
+    max_descriptor_distance,
+    ratio_test,
+    far_points_threshold,
+):
+    """Run the common tracking local-map build -> mark -> projection-search path in C++.
+
+    The C++ matcher writes accepted matches to the C++ frame mirror first; this
+    wrapper mirrors the existing projection dispatcher by registering the same
+    frame views on the Python frame so downstream tracking and keyframe creation
+    see identical state.
+    """
+    fn = getattr(_cpp_slam_core, "build_mark_search_local_map", None) if _cpp_slam_core is not None else None
+    if fn is None:
+        raise RuntimeError("cpp_slam_core.build_mark_search_local_map is unavailable")
+
+    cpp_frame = _ensure_cpp_frame_mirror(f_cur)
+    fm = FeatureTrackerShared.feature_manager
+    scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
+    mdd = float(_max_descriptor_distance(max_descriptor_distance))
+    far = float(far_points_threshold) if far_points_threshold is not None else float("inf")
+    local_keyframes, local_points, found_count, found_fidxs, build_sec, mark_sec, search_sec = fn(
+        f_cur,
+        cpp_frame,
+        int(num_best),
+        int(max_kfs),
+        int(frame_id),
+        scale_factors,
+        float(max_reproj_distance),
+        mdd,
+        float(ratio_test),
+        float(Parameters.kViewingCosLimitForPoint),
+        float(Parameters.kMinDepth),
+        far,
+        float(fm.log_scale_factor),
+        int(fm.num_levels),
+    )
+
+    if cpp_frame is not f_cur:
+        for fidx in found_fidxs:
+            mp = cpp_frame.points[int(fidx)]
+            if mp is not None:
+                mp.add_frame_view(f_cur, int(fidx))
+
+    return (
+        local_keyframes,
+        local_points,
+        int(found_count),
+        [int(i) for i in found_fidxs],
+        float(build_sec),
+        float(mark_sec),
+        float(search_sec),
+    )
+
+
+def _search_frame_by_projection_cpp(f_ref, f_cur, matched_ref_idxs, matched_ref_points,
+                                    max_reproj_distance, max_descriptor_distance):
+    """Dispatch to the C++ search_frame_by_projection kernel via an embedded C++
+    Frame mirror of f_cur, then reproduce the Python tail exactly: per-match
+    add_frame_view (bool-gated) in reference order, then the rotation-histogram
+    filter. The kernel only finds the best descriptor match per ref point (the
+    hot inner loop); add_frame_view's side effect + bool gate and the rotation
+    filter stay in Python so this path is bit-identical to _search_frame_by_projection.
+    """
+    cpp_frame = _ensure_cpp_frame_mirror(f_cur)
+    fm = FeatureTrackerShared.feature_manager
+    scale_factors = np.asarray(fm.scale_factors, dtype=np.float32)
+    mdd = float(_max_descriptor_distance(max_descriptor_distance))
+    ref_octaves = f_ref.octaves[matched_ref_idxs]
+    do_stereo_check = bool(f_cur.uRs is not None and len(f_cur.uRs) > 0)
+
+    cand_ref, cand_cur = _cpp_slam_core.search_frame_by_projection(
+        list(matched_ref_points),
+        [int(i) for i in matched_ref_idxs],
+        [int(o) for o in ref_octaves],
+        cpp_frame, scale_factors,
+        float(max_reproj_distance), mdd,
+        float(Parameters.kViewingCosLimitForPoint), float(Parameters.kMinDepth),
+        do_stereo_check,
+    )
+
+    # Tail (Python, matching _search_frame_by_projection): add_frame_view in
+    # reference order, keep only matches it accepts, then rotation-histogram filter.
+    idxs_ref = []
+    idxs_cur = []
+    for ref_idx, cur_idx, p_ref in zip(cand_ref, cand_cur,
+                                       (f_ref.points[i] for i in cand_ref)):
+        if p_ref is not None and p_ref.add_frame_view(f_cur, int(cur_idx)):
+            idxs_ref.append(int(ref_idx))
+            idxs_cur.append(int(cur_idx))
+
+    idxs_ref, idxs_cur = _valid_rotation_filter(idxs_ref, idxs_cur, f_ref.angles, f_cur.angles)
+    return idxs_ref, idxs_cur, len(idxs_cur)
+
+
+def _batch_des_distances(query_des, candidate_des):
+    """Hamming distances from one representative descriptor to many candidates.
+
+    Replaces per-candidate ``MapPoint.min_des_distance`` calls (one Python->C++
+    cv2.norm per pair) with a single vectorized popcount over the whole candidate
+    set. Numerically identical; ~100x faster and releases the GIL.
+    """
+    fn = FeatureTrackerShared.descriptor_distances
+    if fn is None:  # extractor not registered yet (e.g. unit tests)
+        from visual_slam.orbslam.local_features.feature_manager import hamming_distances as fn
+    return fn(np.atleast_2d(query_des), np.asarray(candidate_des, dtype=np.uint8))[0]
+
 
 # Group projection-based matching routines used across the pipeline.
 class ProjectionMatcher:
@@ -260,6 +441,45 @@ class EpipolarMatcher:
         It returns only matches where both keypoints currently have no assigned
         map point, which is the intended local-mapping triangulation input.
         """
+        if (
+            Parameters.USE_CPP_CORE
+            and _cpp_slam_core is not None
+            and hasattr(_cpp_slam_core, "search_frame_for_triangulation")
+            and _CppKeyFrame is not None
+            and isinstance(f1, _CppKeyFrame)
+            and isinstance(f2, _CppKeyFrame)
+        ):
+            try:
+                max_dist = float(_max_descriptor_distance(max_descriptor_distance))
+                fm = FeatureTrackerShared.feature_manager
+                matcher = FeatureTrackerShared.feature_matcher
+                level_sigmas2 = np.asarray(
+                    fm.level_sigmas2 if fm is not None else np.ones(8, dtype=np.float32),
+                    dtype=np.float32,
+                )
+                ratio = float(getattr(matcher, "ratio_test", 0.7))
+                idxs1_arg = [] if idxs1 is None else [int(i) for i in np.asarray(idxs1, dtype=np.int32).reshape(-1)]
+                idxs2_arg = [] if idxs2 is None else [int(i) for i in np.asarray(idxs2, dtype=np.int32).reshape(-1)]
+                out1, out2, n = _cpp_slam_core.search_frame_for_triangulation(
+                    f1,
+                    f2,
+                    idxs1_arg,
+                    idxs2_arg,
+                    level_sigmas2,
+                    np.ascontiguousarray(np.asarray(getattr(f1, "angles", []), dtype=np.float32).reshape(-1)),
+                    np.ascontiguousarray(np.asarray(getattr(f2, "angles", []), dtype=np.float32).reshape(-1)),
+                    max_dist,
+                    ratio,
+                    bool(FeatureTrackerShared.oriented_features),
+                )
+                return (
+                    np.asarray(out1, dtype=np.int32),
+                    np.asarray(out2, dtype=np.int32),
+                    int(n),
+                )
+            except Exception:
+                pass
+
         ensure_frame_feature_arrays(f1)
         ensure_frame_feature_arrays(f2)
 
@@ -328,7 +548,10 @@ class EpipolarMatcher:
             octave2 = max(0, min(int(f2.octaves[i2]), len(level_sigmas2) - 1))
             sigma2 = float(level_sigmas2[octave2])
 
-            if not check_dist_epipolar_line(f1.kpsu[i1].pt, f2.kpsu[i2].pt, F12, sigma2):
+            _k1, _k2 = f1.kpsu[i1], f2.kpsu[i2]
+            _pt1 = _k1.pt if hasattr(_k1, "pt") else _k1
+            _pt2 = _k2.pt if hasattr(_k2, "pt") else _k2
+            if not check_dist_epipolar_line(_pt1, _pt2, F12, sigma2):
                 continue
 
             out1.append(i1)
@@ -713,6 +936,19 @@ def _search_frame_by_projection(
 
     matched_ref_points = [f_ref.points[i] for i in matched_ref_idxs]
 
+    # Phase 5d dispatch: run the C++ kernel (find-best-match inner loop) via an
+    # embedded C++ Frame mirror of f_cur; the add_frame_view tail + rotation
+    # filter stay in Python (see _search_frame_by_projection_cpp).
+    if (
+        Parameters.USE_CPP_CORE
+        and _CppFrame is not None
+        and getattr(f_cur, "kpsu", None) is not None
+    ):
+        return _search_frame_by_projection_cpp(
+            f_ref, f_cur, matched_ref_idxs, matched_ref_points,
+            max_reproj_distance, max_descriptor_distance,
+        )
+
     matched_ref_idxs, matched_ref_points, projs, depths, dists = _prepare_visible_projection_candidates(
         f_cur,
         matched_ref_idxs,
@@ -743,41 +979,50 @@ def _search_frame_by_projection(
     cur_des = f_cur.des
     cur_points = f_cur.points
     cur_octaves = f_cur.octaves
+    scale_factors = FeatureTrackerShared.feature_manager.scale_factors
 
     do_stereo_check = f_cur.uRs is not None and len(f_cur.uRs) > 0
+
+    # Precompute occupancy once (was re-checked per candidate inside the inner
+    # loop): a current feature is unavailable if its map point already has >=1
+    # keyframe observation. num_observations() counts keyframe (not frame-view)
+    # observations, so this is stable across the loop below.
+    cur_occupied = np.zeros(len(cur_points), dtype=bool)
+    for _k, _pc in enumerate(cur_points):
+        if _pc is not None and _pc.num_observations() > 0:
+            cur_occupied[_k] = True
 
     for j, (ref_idx, p_ref) in enumerate(zip(matched_ref_idxs, matched_ref_points)):
         if not is_visible[j]:
             continue
 
+        candidate_idxs = np.asarray(kd_cur_idxs[j], dtype=np.intp)
+        if candidate_idxs.size == 0:
+            continue
+
         kp_ref_octave = f_ref.octaves[ref_idx]
-        best_dist = float("inf")
-        best_k_idx = -1
+        cand_oct = cur_octaves[candidate_idxs]
 
-        candidate_idxs = kd_cur_idxs[j]
+        # Vectorized candidate filters (same conditions as the old inner loop):
+        # available feature + octave within +/-1 + (stereo) right-coord error.
+        mask = ~cur_occupied[candidate_idxs]
+        mask &= (cand_oct >= kp_ref_octave - 1) & (cand_oct <= kp_ref_octave + 1)
+        if do_stereo_check:
+            ur = f_cur.uRs[candidate_idxs]
+            err_ur = np.abs(projs[j, 2] - ur)
+            stereo_bad = (ur >= 0) & (err_ur >= max_reproj_distance * scale_factors[cand_oct])
+            mask &= ~stereo_bad
 
-        for h, kd_idx in enumerate(candidate_idxs):
-            p_cur = cur_points[kd_idx]
-            if p_cur is not None and p_cur.num_observations() > 0:
-                continue
+        valid = candidate_idxs[mask]
+        if valid.size == 0:
+            continue
 
-            kp_cur_octave = cur_octaves[kd_idx]
-            if kp_cur_octave < (kp_ref_octave - 1) or kp_cur_octave > (kp_ref_octave + 1):
-                continue
+        dists = _batch_des_distances(p_ref.get_descriptor(), cur_des[valid])
+        bi = int(np.argmin(dists))
+        best_dist = float(dists[bi])
+        best_k_idx = int(valid[bi])
 
-            if do_stereo_check and f_cur.uRs[kd_idx] >= 0:
-                err_ur = abs(projs[j, 2] - f_cur.uRs[kd_idx])
-                scale = FeatureTrackerShared.feature_manager.scale_factors[kp_cur_octave]
-                if err_ur >= max_reproj_distance * scale:
-                    continue
-
-            descriptor_dist = p_ref.min_des_distance(cur_des[kd_idx])
-
-            if descriptor_dist < best_dist:
-                best_dist = descriptor_dist
-                best_k_idx = kd_idx
-
-        if best_k_idx > -1 and best_dist < max_descriptor_distance:
+        if best_dist < max_descriptor_distance:
             if p_ref.add_frame_view(f_cur, best_k_idx):
                 idxs_ref.append(int(ref_idx))
                 idxs_cur.append(int(best_k_idx))
@@ -896,6 +1141,20 @@ def _search_map_by_projection(
     far_points_threshold=None,
     diagnostics: dict | None = None,
 ):
+    # Phase 5d dispatch: when enabled, run the parity-validated C++ kernel (via an
+    # embedded C++ Frame mirror). The diagnostics path stays on Python (the C++
+    # kernel does not populate the diagnostics dict).
+    if (
+        Parameters.USE_CPP_CORE
+        and _CppFrame is not None
+        and getattr(f_cur, "kpsu", None) is not None
+        and diagnostics is None
+    ):
+        return _search_map_by_projection_cpp(
+            points, f_cur, max_reproj_distance, max_descriptor_distance,
+            ratio_test, far_points_threshold,
+        )
+
     max_descriptor_distance = _max_descriptor_distance(max_descriptor_distance)
     input_points = list(points)
 
@@ -995,9 +1254,41 @@ def _search_map_by_projection(
     found_pts_count = 0
     found_pts_fidxs = []
 
+    # Vectorize the per-candidate descriptor distances (one batched popcount call
+    # per point instead of one cv2.norm per candidate). The best/second-best
+    # streaming selection below is byte-for-byte the original logic, just fed
+    # precomputed distances. Occupancy is read LIVE (see below).
+    cur_des = f_cur.des
+    cur_octaves = f_cur.octaves
+    cur_points = f_cur.points
+
     for i, p in idxs_and_pts:
         p.increase_visible()
         predicted_level = predicted_levels[i]
+
+        candidate_idxs = np.asarray(kd_cur_idxs[i], dtype=np.intp)
+        if candidate_idxs.size == 0:
+            continue
+        cand_oct = cur_octaves[candidate_idxs]
+        # LIVE occupancy (matches pySLAM: f_cur.points is read at evaluation time,
+        # so a feature claimed by an earlier map point in THIS call is excluded for
+        # later ones — first-come wins). add_frame_view() mutates f_cur.points.
+        occ = np.fromiter(
+            ((cur_points[ci] is not None and cur_points[ci].num_observations() > 0)
+             for ci in candidate_idxs),
+            dtype=bool, count=candidate_idxs.size,
+        )
+        mask = ~occ
+        mask &= (cand_oct >= predicted_level - 1) & (cand_oct <= predicted_level)
+        valid = candidate_idxs[mask]
+        if valid.size == 0:
+            continue
+
+        if diagnostics is not None:
+            diagnostics["descriptor_comparisons"] = int(diagnostics["descriptor_comparisons"]) + int(valid.size)
+
+        cand_dists = _batch_des_distances(p.get_descriptor(), cur_des[valid])
+        cand_lvls = cur_octaves[valid]
 
         best_dist = float("inf")
         best_dist2 = float("inf")
@@ -1005,25 +1296,15 @@ def _search_map_by_projection(
         best_level2 = -1
         best_k_idx = -1
 
-        for kd_idx in kd_cur_idxs[i]:
-            p_f = f_cur.points[kd_idx]
-            if p_f is not None and p_f.num_observations() > 0:
-                continue
-
-            kp_level = f_cur.octaves[kd_idx]
-            if kp_level < predicted_level - 1 or kp_level > predicted_level:
-                continue
-
-            if diagnostics is not None:
-                diagnostics["descriptor_comparisons"] = int(diagnostics["descriptor_comparisons"]) + 1
-            descriptor_dist = p.min_des_distance(f_cur.des[kd_idx])
-
+        for t in range(valid.size):
+            descriptor_dist = float(cand_dists[t])
+            kp_level = int(cand_lvls[t])
             if descriptor_dist < best_dist:
                 best_dist2 = best_dist
                 best_level2 = best_level
                 best_dist = descriptor_dist
                 best_level = kp_level
-                best_k_idx = kd_idx
+                best_k_idx = int(valid[t])
             elif descriptor_dist < best_dist2:
                 best_dist2 = descriptor_dist
                 best_level2 = kp_level
@@ -1031,8 +1312,8 @@ def _search_map_by_projection(
         if best_k_idx > -1 and best_dist < max_descriptor_distance:
             if best_level == best_level2 and best_dist > best_dist2 * ratio_test:
                 continue
+            # pySLAM's search_map_by_projection does NOT call increase_found() here.
             if p.add_frame_view(f_cur, best_k_idx):
-                p.increase_found()
                 found_pts_count += 1
                 found_pts_fidxs.append(best_k_idx)
 
@@ -1109,7 +1390,8 @@ def _search_and_fuse(
             if kp_level < predicted_level - 1 or kp_level > predicted_level:
                 continue
 
-            err = projs[j, :2] - np.array(keyframe.kpsu[kd_idx].pt, dtype=np.float64)
+            _kp = keyframe.kpsu[kd_idx]
+            err = projs[j, :2] - np.array(_kp.pt if hasattr(_kp, "pt") else _kp, dtype=np.float64)
             chi2 = float(np.dot(err, err) * inv_level_sigmas2[kp_level])
 
             if chi2 > Parameters.kChi2Mono:

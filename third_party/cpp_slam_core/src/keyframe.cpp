@@ -1,9 +1,49 @@
 #include "keyframe.h"
 
+#include "map_point.h"
+
 #include <algorithm>
+#include <cstdint>
 #include <sstream>
 
 namespace slam {
+
+namespace {
+
+KeyFrame *as_keyframe(const py::object &o) {
+    if (o.is_none()) return nullptr;
+    try { return o.cast<KeyFrame *>(); } catch (...) { return nullptr; }
+}
+
+MapPoint *as_mappoint(const py::object &o) {
+    if (o.is_none()) return nullptr;
+    try { return o.cast<MapPoint *>(); } catch (...) { return nullptr; }
+}
+
+bool keyframe_is_bad(const py::object &kf_obj) {
+    KeyFrame *kf = as_keyframe(kf_obj);
+    if (kf != nullptr) return kf->is_bad();
+    try { return kf_obj.attr("is_bad")().cast<bool>(); } catch (...) { return true; }
+}
+
+long keyframe_kid_or_id(const py::object &kf_obj, long fallback) {
+    KeyFrame *kf = as_keyframe(kf_obj);
+    if (kf != nullptr) return static_cast<long>(kf->kid);
+    try { return kf_obj.attr("kid").cast<long>(); } catch (...) {}
+    try { return kf_obj.attr("id").cast<long>(); } catch (...) {}
+    return fallback;
+}
+
+}  // namespace
+
+// Stable sort key for a keyframe py::object: kid (then id, then pointer address as
+// last resort). Covisibility is stored in an unordered_map keyed by pointer
+// (PyObjHash) -> run-to-run varying order; ordering output by this stable key keeps
+// get_best/connected covisibles deterministic (M0/M1 reproducibility parity with
+// the Python KeyFrameGraph fix). GIL is held by all callers (py::object attr access).
+static long _kf_sort_key(const py::object &kf) {
+    return keyframe_kid_or_id(kf, static_cast<long>(reinterpret_cast<std::uintptr_t>(kf.ptr())));
+}
 
 // ---- Construction ----------------------------------------------------------
 KeyFrame::KeyFrame(int given_kid, int given_frame_id)
@@ -72,23 +112,27 @@ void KeyFrame::set_bad() {
         points[idx] = py::none();
     }
 
+    py::object parent_snapshot;
     {
         std::lock_guard<std::mutex> lk(_lock_connections);
         reset_covisibility();
-
-        // Compute Tcp relative to parent
-        if (!_parent.is_none()) {
-            try {
-                // Tcp = Tcw * parent.Twc()
-                auto parent_Twc = _parent.attr("Twc")();
-                // Store Tcp as pose attribute — simplified for now
-            } catch (...) {}
-            try {
-                _parent.attr("erase_child")(py::cast(shared_from_this()));
-            } catch (...) {}
-        }
+        parent_snapshot = _parent;   // snapshot; the parent callouts run outside the lock
         _children.clear();
         _kf_is_bad.store(true);
+    }
+
+    // Detach from parent OUTSIDE _lock_connections: erase_child acquires the PARENT's
+    // _lock_connections -> a KF<->KF nesting if done under our own (F4 invariant).
+    // bool(py::object) guards against a default-constructed (NULL) _parent.
+    if (parent_snapshot && !parent_snapshot.is_none()) {
+        try {
+            // Tcp = Tcw * parent.Twc() (stored as pose attribute — simplified for now)
+            auto parent_Twc = parent_snapshot.attr("Twc")();
+            (void)parent_Twc;
+        } catch (...) {}
+        try {
+            parent_snapshot.attr("erase_child")(py::cast(shared_from_this()));
+        } catch (...) {}
     }
 
     // Remove from map
@@ -100,8 +144,14 @@ void KeyFrame::set_bad() {
 // ---- Covisibility graph ----------------------------------------------------
 void KeyFrame::_rebuild_ordered_covis_no_lock_() {
     _ordered_covis.assign(_covis_weights.begin(), _covis_weights.end());
+    // weight DESC, then stable keyframe id ASC (std::sort is not stable and
+    // _covis_weights iterates in pointer order, so the id tie-break is required
+    // for run-to-run deterministic covisibility — M1 parity with the Python fix).
     std::sort(_ordered_covis.begin(), _ordered_covis.end(),
-              [](const auto &a, const auto &b) { return a.second > b.second; });
+              [](const auto &a, const auto &b) {
+                  if (a.second != b.second) return a.second > b.second;
+                  return _kf_sort_key(a.first) < _kf_sort_key(b.first);
+              });
 }
 
 void KeyFrame::add_connection_no_lock_(py::object other_kf, int weight) {
@@ -133,6 +183,9 @@ std::vector<py::object> KeyFrame::get_connected_keyframes() const {
     std::vector<py::object> result;
     result.reserve(_covis_weights.size());
     for (const auto &[kf, _w] : _covis_weights) result.push_back(kf);
+    // Deterministic order (the unordered_map iterates in pointer order).
+    std::sort(result.begin(), result.end(),
+              [](const py::object &a, const py::object &b) { return _kf_sort_key(a) < _kf_sort_key(b); });
     return result;
 }
 
@@ -176,7 +229,8 @@ void KeyFrame::reset_covisibility() {
 
 void KeyFrame::update_connections() {
     // Build counter of co-visibility from shared map points.
-    // Points can be C++ MapPoint or Python MapPoint — both respond to keyframes().
+    // Points can be C++ MapPoint or Python MapPoint. Prefer native C++ access;
+    // keep Python dispatch as the compatibility fallback.
     std::vector<py::object> pts_copy;
     {
         for (const auto &p : points) {
@@ -191,33 +245,35 @@ void KeyFrame::update_connections() {
     py::object self_obj = py::cast(shared_from_this());
 
     for (const auto &mp_obj : pts_copy) {
-        // Skip bad points
-        try {
-            if (mp_obj.attr("is_bad")().cast<bool>()) continue;
-        } catch (...) {}
+        MapPoint *mp = as_mappoint(mp_obj);
+        if (mp != nullptr && mp->is_bad()) continue;
+        if (mp == nullptr) {
+            try {
+                if (mp_obj.attr("is_bad")().cast<bool>()) continue;
+            } catch (...) {}
+        }
 
         // Get observing KFs for this map point
         std::vector<py::object> obs_kfs;
-        try {
-            auto kfs_list = mp_obj.attr("keyframes")();
-            for (auto kf_item : kfs_list.cast<py::list>()) {
-                obs_kfs.push_back(py::reinterpret_borrow<py::object>(kf_item));
-            }
-        } catch (...) { continue; }
+        if (mp != nullptr) {
+            obs_kfs = mp->keyframes();
+        } else {
+            try {
+                auto kfs_list = mp_obj.attr("keyframes")();
+                for (auto kf_item : kfs_list.cast<py::list>()) {
+                    obs_kfs.push_back(py::reinterpret_borrow<py::object>(kf_item));
+                }
+            } catch (...) { continue; }
+        }
 
         for (const auto &kf_obj : obs_kfs) {
             if (kf_obj.ptr() == self_obj.ptr()) continue;
 
             // Skip KFs with same kid (self by another wrapper)
-            try {
-                int other_kid = kf_obj.attr("kid").cast<int>();
-                if (other_kid == kid) continue;
-            } catch (...) {}
+            if (keyframe_kid_or_id(kf_obj, -1) == kid) continue;
 
             // Skip bad KFs
-            try {
-                if (kf_obj.attr("is_bad")().cast<bool>()) continue;
-            } catch (...) {}
+            if (keyframe_is_bad(kf_obj)) continue;
 
             counter[kf_obj]++;
         }
@@ -245,6 +301,20 @@ void KeyFrame::update_connections() {
     std::sort(sorted_counter.begin(), sorted_counter.end(),
               [](const auto &a, const auto &b) { return a.second > b.second; });
 
+    // F4 invariant: write only pure-C++ state under _lock_connections; collect the
+    // cross-KF notifications (each calls into ANOTHER keyframe's locked methods via
+    // Python — a GIL op) and perform them OUTSIDE the lock. Holding our own
+    // _lock_connections while calling kf.add_connection_no_lock_/add_child would be a
+    // KF<->KF lock + GIL<->mutex inversion once the LM matcher runs GIL-released.
+    std::vector<std::pair<py::object, int>> notify;   // (kf, w) to add_connection_no_lock_
+    py::object parent_to_set;                          // kf_max if first connection set here
+
+    // The parent candidate's is_bad gate is a callout -> evaluate outside the lock.
+    bool kf_max_ok = false;
+    if (_is_first_connection && kid != 0 && !kf_max.is_none()) {
+        kf_max_ok = !keyframe_is_bad(kf_max);
+    }
+
     {
         std::lock_guard<std::mutex> lk(_lock_connections);
         _covis_weights = counter;
@@ -253,31 +323,35 @@ void KeyFrame::update_connections() {
         if (w_max >= min_covis) {
             for (const auto &[kf, w] : sorted_counter) {
                 if (w >= min_covis) {
-                    // Notify other KF of connection (needs GIL — calling Python method)
-                    try {
-                        kf.attr("add_connection_no_lock_")(self_obj, py::int_(w));
-                    } catch (...) {}
+                    notify.push_back({kf, w});
                     _ordered_covis.push_back({kf, w});
                 } else {
                     break;
                 }
             }
         } else {
-            try {
-                kf_max.attr("add_connection_no_lock_")(self_obj, py::int_(w_max));
-            } catch (...) {}
+            notify.push_back({kf_max, w_max});
             _ordered_covis.push_back({kf_max, w_max});
         }
 
-        // Set spanning tree parent on first connection
-        if (_is_first_connection && kid != 0 && !kf_max.is_none()) {
-            try {
-                if (!kf_max.attr("is_bad")().cast<bool>()) {
-                    set_parent_no_lock_(kf_max);
-                    _is_first_connection = false;
-                }
-            } catch (...) {}
+        // Spanning-tree parent on first connection: pure-C++ state write here; the
+        // parent.add_child(self) notification is performed outside the lock below
+        // (mirrors set_parent_no_lock_, whose only callout is add_child).
+        if (_is_first_connection && kid != 0 && !kf_max.is_none() && kf_max_ok) {
+            _parent = kf_max;
+            _init_parent = true;
+            _is_first_connection = false;
+            parent_to_set = kf_max;
         }
+    }
+
+    // Cross-KF notifications OUTSIDE the lock.
+    for (auto &[kf, w] : notify) {
+        try { kf.attr("add_connection_no_lock_")(self_obj, py::int_(w)); } catch (...) {}
+    }
+    if (parent_to_set) {   // bool(py::object) is a NULL-ptr check (a default-constructed
+                           // py::object is NULL, not None — is_none() would be false on it)
+        try { parent_to_set.attr("add_child")(self_obj); } catch (...) {}
     }
 }
 
@@ -347,8 +421,14 @@ std::vector<py::object> KeyFrame::get_loop_edges() const {
 // ---- Helpers ---------------------------------------------------------------
 std::vector<py::object> KeyFrame::get_matched_good_points() const {
     std::vector<py::object> result;
+    result.reserve(points.size());
     for (const auto &p : points) {
         if (p.is_none()) continue;
+        MapPoint *mp = as_mappoint(p);
+        if (mp != nullptr) {
+            if (!mp->is_bad()) result.push_back(p);
+            continue;
+        }
         try {
             if (!p.attr("is_bad")().cast<bool>()) result.push_back(p);
         } catch (...) {}
@@ -361,6 +441,11 @@ std::vector<std::pair<py::object, int>> KeyFrame::get_matched_good_points_and_id
     for (int i = 0; i < (int)points.size(); i++) {
         const auto &p = points[i];
         if (p.is_none()) continue;
+        MapPoint *mp = as_mappoint(p);
+        if (mp != nullptr) {
+            if (!mp->is_bad()) result.emplace_back(p, i);
+            continue;
+        }
         try {
             if (!p.attr("is_bad")().cast<bool>()) result.emplace_back(p, i);
         } catch (...) {}
@@ -376,6 +461,13 @@ int KeyFrame::num_tracked_points(int min_obs) const {
     int count = 0;
     for (const auto &p : points) {
         if (p.is_none()) continue;
+        MapPoint *mp = as_mappoint(p);
+        if (mp != nullptr) {
+            if (mp->is_bad()) continue;
+            if (min_obs > 0 && mp->num_observations() < min_obs) continue;
+            ++count;
+            continue;
+        }
         try {
             if (p.attr("is_bad")().cast<bool>()) continue;
             if (min_obs > 0) {

@@ -204,19 +204,41 @@ def test_dbow_detector_does_not_apply_accumulation_filter():
     assert _candidate_ids(result) == [3, 1, 2]
 
 
-def test_dbow_detector_filters_connected_temporal_and_min_score():
+def test_dbow_detector_filters_temporal_and_min_score_keeps_far_connected():
+    # Phase-2 connected-temporal-window (kLoopConnectedFilterTemporalWindowKf=30,
+    # kMinDeltaFrameForMeaningfulLoopClosure=10): a connected KF that is temporally
+    # FAR is a genuine spatial revisit / long-range loop and is intentionally KEPT;
+    # only connected KFs within the temporal window (trivially adjacent) are dropped.
+    # (See KeyFrameDatabase._select_connected_keyframes_for_filter — this replaced the
+    # legacy "exclude every covisibility neighbor", which silently dropped real loops.)
     query = DummyKeyFrame(100, {1: 1.0})
-    connected = DummyKeyFrame(1, {1: 1.0})
-    temporal_near = DummyKeyFrame(95, {1: 1.0})
-    low_score = DummyKeyFrame(2, {1: 1.0})
+    far_connected = DummyKeyFrame(1, {1: 1.0})    # |1-100|=99 > window -> KEPT (genuine loop)
+    temporal_near = DummyKeyFrame(95, {1: 1.0})   # |95-100|=5 <= min_delta(10) -> filtered (temporal)
+    low_score = DummyKeyFrame(2, {1: 1.0})        # score 0.10 < min_score(0.5) -> filtered
     valid = DummyKeyFrame(3, {1: 1.0})
-    query.set_connected(connected)
-    database = _make_database_with_candidates(connected, temporal_near, low_score, valid)
-    _set_raw_query_results(database, [(connected, 0.99), (temporal_near, 0.98), (low_score, 0.10), (valid, 0.80)])
+    query.set_connected(far_connected)
+    database = _make_database_with_candidates(far_connected, temporal_near, low_score, valid)
+    _set_raw_query_results(database, [(far_connected, 0.99), (temporal_near, 0.98), (low_score, 0.10), (valid, 0.80)])
 
     result = database.detect_loop_candidates(query, min_score=0.5, candidate_source="dbow_detector", return_diagnostics=True)
 
-    assert _candidate_ids(result) == [3]
+    assert _candidate_ids(result) == [1, 3]
+
+
+def test_dbow_detector_excludes_connected_within_temporal_window():
+    # Companion to the above: a connected KF *within* the temporal window (trivially
+    # adjacent) IS filtered, while a connected KF outside the window is kept.
+    query = DummyKeyFrame(100, {1: 1.0})
+    near_connected = DummyKeyFrame(80, {1: 1.0})  # |80-100|=20: > min_delta(10) (passes temporal), <= window(30) -> connected-filtered
+    far_connected = DummyKeyFrame(1, {1: 1.0})    # |1-100|=99 > window -> kept
+    valid = DummyKeyFrame(3, {1: 1.0})
+    query.set_connected(near_connected, far_connected)
+    database = _make_database_with_candidates(near_connected, far_connected, valid)
+    _set_raw_query_results(database, [(near_connected, 0.97), (far_connected, 0.96), (valid, 0.80)])
+
+    result = database.detect_loop_candidates(query, min_score=0.5, candidate_source="dbow_detector", return_diagnostics=True)
+
+    assert _candidate_ids(result) == [1, 3]  # near_connected(80) excluded; far_connected(1) + valid(3) kept
 
 
 def test_dbow_detector_returns_direct_candidates_to_consistency():

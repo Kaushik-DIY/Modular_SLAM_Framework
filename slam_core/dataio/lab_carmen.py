@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import numpy as np
 
 
@@ -50,5 +51,40 @@ def read_lab_carmen_log(path: str):
                     "t": t,
                 }
             )
+
+    return scans
+
+
+def read_lab_hybrid_lidar_csv(path: str):
+    """
+    Parser for the hybrid lab LiDAR CSV export.
+
+    Expected columns
+    ----------------
+        timestamp, frame_id, angle_min, angle_max, angle_increment,
+        range_min, range_max, num_ranges, ranges
+
+    The ranges column contains space-separated range values.
+    """
+    scans = []
+
+    with open(path, "r", newline="", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                n = int(row.get("num_ranges", "0"))
+                ranges = np.asarray(str(row["ranges"]).split(), dtype=float)
+                if n > 0 and len(ranges) != n:
+                    continue
+                scans.append(
+                    {
+                        "ranges": ranges,
+                        "odom": None,
+                        "laser_pose": None,
+                        "t": float(row["timestamp"]),
+                    }
+                )
+            except Exception:
+                continue
 
     return scans

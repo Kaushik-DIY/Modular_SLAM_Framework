@@ -297,7 +297,126 @@ class TestLocalBA:
         assert tracked == expected
 
 
+class TestNativeLocalBAPack:
+    def test_matches_python_pack_fallback(self, monkeypatch):
+        """Native C++ BA packing must produce the same arrays as the Python packer."""
+        import cpp_slam_core
+        from visual_slam.orbslam.slam import slam_optimizer_bridge as bridge
+
+        kfs, mps = _build_scenario(n_kfs=3, n_shared=6)
+
+        class FeatureManager:
+            inv_level_sigmas2 = np.asarray([1.0, 0.7, 0.5, 0.35], dtype=np.float64)
+
+        fm = FeatureManager()
+        local_kfs = [kfs[1], kfs[2]]
+        fixed_kfs = [kfs[0]]
+
+        native = cpp_slam_core.pack_local_ba_native(
+            local_kfs,
+            fixed_kfs,
+            mps,
+            fm.inv_level_sigmas2,
+        )
+        assert native is not None
+
+        monkeypatch.setattr(bridge, "_CPP_SLAM_CORE", None)
+        fallback = bridge.pack_local_ba(local_kfs, fixed_kfs, mps, fm)
+
+        for native_arr, fallback_arr in zip(native[:6], fallback[:6]):
+            np.testing.assert_allclose(np.asarray(native_arr), np.asarray(fallback_arr))
+
+        assert [id(kf) for kf in native[6]] == [id(kf) for kf in fallback[6]]
+        assert [id(mp) for mp in native[7]] == [id(mp) for mp in fallback[7]]
+        assert [(id(p), id(kf), idx) for p, kf, idx in native[8]] == [
+            (id(p), id(kf), idx) for p, kf, idx in fallback[8]
+        ]
+
+
 class TestFuseMapPoints:
+    def test_native_search_and_fuse_adds_observation(self):
+        """Native fuse matcher projects a C++ MapPoint into a C++ KeyFrame."""
+        import cpp_slam_core
+        from types import SimpleNamespace
+
+        camera = SimpleNamespace(
+            fx=100.0, fy=100.0, cx=320.0, cy=240.0,
+            width=640, height=480, bf=0.0,
+        )
+        kf = cpp_slam_core.KeyFrame(kid=10, frame_id=10, camera=camera)
+        des = np.zeros((1, 32), dtype=np.uint8)
+        kps = [cv2.KeyPoint(x=320.0, y=240.0, size=1.0, octave=0)]
+        kf.init_feature_arrays(kps, des, None, None, 1)
+
+        mp = cpp_slam_core.MapPoint(np.array([0.0, 0.0, 5.0], dtype=np.float64))
+        mp.set_des(des[0])
+
+        n_fused = cpp_slam_core.search_and_fuse(
+            [mp], kf,
+            np.ones(8, dtype=np.float32),
+            np.ones(8, dtype=np.float32),
+            3.0, 50.0, float(np.log(1.2)), 8, 1e-2, 5.991,
+        )
+
+        assert n_fused == 1
+        assert kf.get_point_match(0) is mp
+        assert mp.is_in_keyframe(kf)
+
+    def test_native_search_frame_for_triangulation_matches_python_filter(self):
+        """Native epipolar triangulation matcher agrees with the Python filter."""
+        import cpp_slam_core
+        from types import SimpleNamespace
+        from visual_slam.orbslam.slam.config_parameters import Parameters
+        from visual_slam.orbslam.slam.feature_tracker_shared import FeatureTrackerShared
+        from visual_slam.orbslam.slam.geometry_matchers import EpipolarMatcher
+
+        K = np.array([[100.0, 0.0, 320.0], [0.0, 100.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        camera = SimpleNamespace(
+            fx=100.0, fy=100.0, cx=320.0, cy=240.0,
+            width=640, height=480, bf=10.0, K=K, Kinv=np.linalg.inv(K),
+        )
+        kf1 = cpp_slam_core.KeyFrame(kid=20, frame_id=20, camera=camera)
+        kf2 = cpp_slam_core.KeyFrame(kid=21, frame_id=21, camera=camera)
+        des = np.zeros((1, 32), dtype=np.uint8)
+        kps1 = [cv2.KeyPoint(x=320.0, y=240.0, size=1.0, octave=0)]
+        kps2 = [cv2.KeyPoint(x=318.0, y=240.0, size=1.0, octave=0)]
+        kf1.init_feature_arrays(kps1, des, None, None, 1)
+        kf2.init_feature_arrays(kps2, des.copy(), None, None, 1)
+        kf1.kps = kps1
+        kf2.kps = kps2
+        kf1.update_pose(np.eye(4, dtype=np.float64))
+        Tcw2 = np.eye(4, dtype=np.float64)
+        Tcw2[0, 3] = -0.1
+        kf2.update_pose(Tcw2)
+        kf1.angles = np.array([0.0], dtype=np.float32)
+        kf2.angles = np.array([0.0], dtype=np.float32)
+
+        old_cpp = Parameters.USE_CPP_CORE
+        old_fm = FeatureTrackerShared.feature_manager
+        old_dist = FeatureTrackerShared.descriptor_distance
+        old_oriented = FeatureTrackerShared.oriented_features
+        try:
+            FeatureTrackerShared.feature_manager = SimpleNamespace(level_sigmas2=np.ones(8, dtype=np.float32))
+            FeatureTrackerShared.descriptor_distance = lambda a, b: cv2.norm(a, b, cv2.NORM_HAMMING)
+            FeatureTrackerShared.oriented_features = False
+            Parameters.USE_CPP_CORE = False
+            py1, py2, pyn = EpipolarMatcher.search_frame_for_triangulation(
+                kf1, kf2, [0], [0], max_descriptor_distance=50.0, is_monocular=False
+            )
+            cpp1, cpp2, cppn = cpp_slam_core.search_frame_for_triangulation(
+                kf1, kf2, [0], [0], np.ones(8, dtype=np.float32), [0.0], [0.0],
+                50.0, 0.7, False,
+            )
+        finally:
+            Parameters.USE_CPP_CORE = old_cpp
+            FeatureTrackerShared.feature_manager = old_fm
+            FeatureTrackerShared.descriptor_distance = old_dist
+            FeatureTrackerShared.oriented_features = old_oriented
+
+        assert cppn == pyn == 1
+        assert list(cpp1) == list(py1) == [0]
+        assert list(cpp2) == list(py2) == [0]
+
     def test_returns_int(self):
         """fuse_map_points() returns an integer (number of fused points)."""
         import cpp_slam_core

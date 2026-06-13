@@ -464,6 +464,15 @@ def main():
             # and zero loop candidates are ever generated. 0 lets the robot close
             # the loop against the start submap when it returns near the origin.
             recent_finished_submap_exclusion=int(cfg.PGO_RECENT_SUBMAP_EXCLUSION),
+            # Bound retrospective finished-submap loop work (0 = unbounded legacy
+            # default). Caps candidates per finished submap + B&B verifies per tick
+            # so large multi-room maps don't stall draining loop-closure work.
+            max_candidate_nodes_per_finished_target=int(
+                getattr(cfg, "PGO_MAX_CANDIDATE_NODES_PER_TARGET", 0)
+            ),
+            finished_submap_verification_budget_per_tick=int(
+                getattr(cfg, "PGO_FINISHED_SUBMAP_BUDGET_PER_TICK", 24)
+            ),
         )
         global_slam = CartoGlobalSlam2D(
             loop_closure_adapter=CartoLoopClosureAdapter(

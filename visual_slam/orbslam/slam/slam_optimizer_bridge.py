@@ -14,6 +14,11 @@ from typing import Iterable
 from visual_slam.orbslam.slam.map_point import MapPoint
 from visual_slam.orbslam.slam.keyframe import KeyFrame
 
+try:
+    import cpp_slam_core as _CPP_SLAM_CORE
+except ImportError:
+    _CPP_SLAM_CORE = None
+
 
 def _get_inv_sigma2(kf: KeyFrame, idx: int, feature_manager) -> float:
     """inv_sigma2 for octave level at idx — matches get_inv_level_sigma2 in optimizer_g2o.py."""
@@ -64,6 +69,25 @@ def pack_local_ba(
         pt_list       list[MapPoint]   ordered point list (index = row in point_pos)
         obs_triples   list[(point, kf, idx)]   one per observation row, for unpack
     """
+    native_pack = getattr(_CPP_SLAM_CORE, "pack_local_ba_native", None) if _CPP_SLAM_CORE is not None else None
+    if native_pack is not None:
+        try:
+            inv_level_sigmas2 = (
+                np.asarray(feature_manager.inv_level_sigmas2, dtype=np.float64)
+                if feature_manager is not None
+                else np.empty(0, dtype=np.float64)
+            )
+            packed = native_pack(
+                list(local_keyframes),
+                list(fixed_keyframes),
+                list(points),
+                inv_level_sigmas2,
+            )
+            if packed is not None:
+                return packed
+        except Exception:
+            pass
+
     # Deduplicated ordered KF list: local first, then fixed boundary
     kf_list: list[KeyFrame] = []
     seen_kf: set = set()
@@ -73,7 +97,6 @@ def pack_local_ba(
             seen_kf.add(id(kf))
 
     fixed_ids = {id(kf) for kf in fixed_keyframes}
-    local_ids = {id(kf) for kf in local_keyframes}
 
     kf_index = {id(kf): i for i, kf in enumerate(kf_list)}
     N = len(kf_list)
@@ -94,13 +117,37 @@ def pack_local_ba(
     pt_index = {id(p): i for i, p in enumerate(pt_list)}
     M = len(pt_list)
 
-    point_pos = np.array([p.get_position() for p in pt_list], dtype=np.float64)
-    if point_pos.ndim == 1:
-        point_pos = point_pos.reshape(0, 3) if M == 0 else point_pos.reshape(M, 3)
+    point_pos = np.empty((M, 3), dtype=np.float64)
+    point_valid = np.zeros(M, dtype=bool)
+    for i, p in enumerate(pt_list):
+        pos = np.asarray(p.get_position(), dtype=np.float64).reshape(3)
+        point_pos[i] = pos
+        point_valid[i] = bool(np.all(np.isfinite(pos)))
 
     # Observations
     obs_rows = []
     obs_triples = []  # (point, kf, idx) for unpack
+
+    inv_level_sigmas2 = None
+    if feature_manager is not None:
+        inv_level_sigmas2 = np.asarray(feature_manager.inv_level_sigmas2, dtype=np.float64)
+
+    kf_cache = {}
+    for kf in kf_list:
+        kid = id(kf)
+        points_list = list(getattr(kf, "points", []))
+        kpsu = getattr(kf, "kpsu", None)
+        kps_ur = getattr(kf, "kps_ur", None)
+        if kps_ur is None:
+            kps_ur = getattr(kf, "uRs", None)
+        octaves = getattr(kf, "octaves", None)
+        kf_cache[kid] = {
+            "points": points_list,
+            "n_points": len(points_list),
+            "kpsu": kpsu,
+            "kps_ur": kps_ur,
+            "octaves": octaves,
+        }
 
     # Pick camera from first local KF
     ref_kf = kf_list[0] if kf_list else None
@@ -114,8 +161,7 @@ def pack_local_ba(
 
     for p in pt_list:
         pt_row = pt_index[id(p)]
-        pt_pos = p.get_position()
-        if not np.all(np.isfinite(pt_pos)):
+        if not point_valid[pt_row]:
             continue
 
         for kf, idx in p.observations():
@@ -124,12 +170,15 @@ def pack_local_ba(
             kf_row = kf_index.get(id(kf))
             if kf_row is None:
                 continue
-            if idx < 0 or idx >= len(getattr(kf, "points", [])):
+            cache = kf_cache.get(id(kf))
+            if cache is None:
                 continue
-            if kf.get_point_match(idx) is not p:
+            if idx < 0 or idx >= cache["n_points"]:
+                continue
+            if cache["points"][idx] is not p:
                 continue
 
-            kpsu = getattr(kf, "kpsu", None)
+            kpsu = cache["kpsu"]
             if kpsu is None or idx >= len(kpsu):
                 continue
             kp = kpsu[idx]
@@ -140,9 +189,23 @@ def pack_local_ba(
             if not (np.isfinite(u) and np.isfinite(v)):
                 continue
 
-            ur = _get_ur(kf, idx)
-            inv_s2 = _get_inv_sigma2(kf, idx, feature_manager)
-            octave = int(getattr(kf, "octaves", [0] * (idx + 1))[idx])
+            kps_ur = cache["kps_ur"]
+            if kps_ur is None or idx >= len(kps_ur):
+                ur = -1.0
+            else:
+                ur = float(kps_ur[idx])
+
+            octaves = cache["octaves"]
+            if octaves is None or idx >= len(octaves):
+                octave = 0
+            else:
+                octave = int(octaves[idx])
+
+            if inv_level_sigmas2 is None or len(inv_level_sigmas2) == 0:
+                inv_s2 = 1.0
+            else:
+                oct_level = min(max(octave, 0), len(inv_level_sigmas2) - 1)
+                inv_s2 = float(inv_level_sigmas2[oct_level])
             is_stereo = 1.0 if ur >= 0.0 else 0.0
 
             obs_rows.append([
@@ -262,16 +325,14 @@ def unpack_local_ba(
     Write optimized poses and positions back to the live map.
     Mirrors the write-back block in _bundle_adjustment_core().
     """
-    import g2o
-
     updated_poses = result["updated_poses"]   # (N, 16)
     updated_points = result["updated_points"] # (M, 3)
     outlier_mask = result["outlier_mask"]     # (K,)
 
     local_ids = {id(kf) for kf in local_keyframes}
-    fixed_ids = {id(kf) for kf in fixed_keyframes}
 
     # Collect updates before acquiring map lock
+    pose_update_mask = np.zeros(len(kf_list), dtype=bool)
     pose_updates: dict = {}
     for i, kf in enumerate(kf_list):
         if id(kf) not in local_ids:
@@ -281,8 +342,10 @@ def unpack_local_ba(
         T = updated_poses[i].reshape(4, 4)
         if not np.all(np.isfinite(T)):
             continue
+        pose_update_mask[i] = True
         pose_updates[kf] = T
 
+    point_update_mask = np.zeros(len(pt_list), dtype=bool)
     point_updates: list[tuple] = []
     if not fixed_points:
         for j, p in enumerate(pt_list):
@@ -291,25 +354,61 @@ def unpack_local_ba(
             pos = updated_points[j]
             if not np.all(np.isfinite(pos)):
                 continue
+            point_update_mask[j] = True
             point_updates.append((p, pos))
 
     outlier_obs: list[tuple] = []
     if prune_outliers:
-        for k, (p, kf, idx) in enumerate(obs_triples):
-            if k < len(outlier_mask) and outlier_mask[k]:
-                outlier_obs.append((p, kf, idx))
+        outlier_mask_arr = np.asarray(outlier_mask, dtype=bool).reshape(-1)
+        for k in np.flatnonzero(outlier_mask_arr[:len(obs_triples)]):
+            outlier_obs.append(obs_triples[int(k)])
+
+    batch_writeback = (
+        _CPP_SLAM_CORE is not None
+        and hasattr(_CPP_SLAM_CORE, "update_local_ba_poses_batch")
+        and hasattr(_CPP_SLAM_CORE, "update_local_ba_points_batch")
+    )
 
     # Write back under map lock
     lock_ctx = map_lock if map_lock is not None else nullcontext()
     with lock_ctx:
         if prune_outliers:
+            kf_points_cache = {}
             for p, kf, idx in outlier_obs:
                 if _is_bad_pt(p) or _is_bad_kf(kf):
                     continue
-                if idx < 0 or idx >= len(getattr(kf, "points", [])):
+                kid = id(kf)
+                points_list = kf_points_cache.get(kid)
+                if points_list is None:
+                    points_list = list(getattr(kf, "points", []))
+                    kf_points_cache[kid] = points_list
+                if idx < 0 or idx >= len(points_list):
                     continue
-                if kf.get_point_match(idx) is p:
+                if points_list[idx] is p:
                     p.remove_observation(kf, idx, map_no_lock=True)
+
+        if batch_writeback:
+            try:
+                _CPP_SLAM_CORE.update_local_ba_poses_batch(
+                    list(kf_list), np.asarray(updated_poses, dtype=np.float64), pose_update_mask
+                )
+                pose_updates = {}
+            except Exception:
+                pass
+
+            if not fixed_points:
+                try:
+                    _CPP_SLAM_CORE.update_local_ba_points_batch(
+                        list(pt_list), np.asarray(updated_points, dtype=np.float64), point_update_mask
+                    )
+                    point_updates = []
+                except Exception:
+                    pass
+
+            if not pose_updates and (fixed_points or not point_updates):
+                return
+
+        import g2o
 
         for kf, T in pose_updates.items():
             if not _is_bad_kf(kf):

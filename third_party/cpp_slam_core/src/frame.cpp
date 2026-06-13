@@ -1,5 +1,7 @@
 #include "frame.h"
 
+#include <cmath>
+#include <limits>
 #include <sstream>
 
 namespace slam {
@@ -155,6 +157,66 @@ void Frame::init_feature_arrays(py::object kps_in, py::array_t<uint8_t> des_in,
     // Initialize point associations
     points.assign(n_features, py::none());
     outliers.assign(n_features, false);
+
+    // kpsu changed -> invalidate any previously-built kd-tree (rebuilt lazily).
+    kd_built_ = false;
+}
+
+// ---- 2D kd-tree over kpsu --------------------------------------------------
+void Frame::ensure_kd() const {
+    if (kd_built_) return;
+    const int n = static_cast<int>(kpsu.rows());
+    if (n > 0) {
+        // kpsu is row-major (N,2) float -> contiguous x0,y0,x1,y1,...
+        kd_.build(kpsu.data(), static_cast<std::size_t>(n));
+    }
+    kd_built_ = true;
+}
+
+std::vector<int> Frame::kd_query_ball(float x, float y, float r) const {
+    ensure_kd();
+    if (kpsu.rows() == 0) return {};
+    return kd_.query_ball_point(x, y, r);
+}
+
+// ---- Native C++ projection -------------------------------------------------
+void Frame::ensure_camera() const {
+    if (cam_cached_) return;
+    cam_cached_ = true;  // set first so failures don't retry every call
+    if (camera.is_none()) return;
+    try {
+        cfx_ = camera.attr("fx").cast<double>();
+        cfy_ = camera.attr("fy").cast<double>();
+        ccx_ = camera.attr("cx").cast<double>();
+        ccy_ = camera.attr("cy").cast<double>();
+        cwidth_ = camera.attr("width").cast<int>();
+        cheight_ = camera.attr("height").cast<int>();
+        py::object bf = camera.attr("bf");
+        cbf_ = bf.is_none() ? 0.0 : bf.cast<double>();
+    } catch (...) {
+        // leave zeros; project_world will produce degenerate values caught by is_in_image
+    }
+}
+
+Eigen::Vector3d Frame::project_world(const Eigen::Vector3d &Xw) const {
+    ensure_camera();
+    const Eigen::Matrix4d T = Tcw();
+    // Xc = R * Xw + t  (camera frame)
+    const Eigen::Vector3d Xc = T.block<3, 3>(0, 0) * Xw + T.block<3, 1>(0, 3);
+    const double z = Xc.z();
+    if (z <= 0.0)
+        return Eigen::Vector3d(std::numeric_limits<double>::quiet_NaN(),
+                               std::numeric_limits<double>::quiet_NaN(), z);
+    const double u = cfx_ * Xc.x() / z + ccx_;
+    const double v = cfy_ * Xc.y() / z + ccy_;
+    return Eigen::Vector3d(u, v, z);
+}
+
+bool Frame::is_in_image(double u, double v, double z) const {
+    ensure_camera();
+    return z > 0.0 && std::isfinite(u) && std::isfinite(v) &&
+           u >= 0.0 && u < static_cast<double>(cwidth_) &&
+           v >= 0.0 && v < static_cast<double>(cheight_);
 }
 
 // ---- Pose ------------------------------------------------------------------

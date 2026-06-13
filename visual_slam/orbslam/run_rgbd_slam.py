@@ -52,6 +52,7 @@ from visual_slam.orbslam.io.rgbd_dataset import (
     make_rgbd_camera,
     resolve_camera_metadata,
 )
+from visual_slam.orbslam.imu_fallback import ImuFallbackExtrapolator
 from visual_slam.orbslam.slam import Slam, SlamState, SensorType
 from visual_slam.orbslam.slam.config_parameters import Parameters
 from visual_slam.orbslam.slam.loop_oracle import TumLoopOracle
@@ -115,6 +116,18 @@ MEMORY_PROFILE_COLUMNS = [
     "keyframe_depth_images",
     "local_mapping_queue_size",
     "estimated_heavy_mb",
+]
+
+IMU_FALLBACK_COLUMNS = [
+    "timestamp",
+    "source",
+    "state",
+    "tx",
+    "ty",
+    "tz",
+    "imu_yaw",
+    "dt_since_visual",
+    "speed_mps",
 ]
 
 LOCAL_MAP_PROFILE_COLUMNS = [
@@ -776,6 +789,7 @@ def build_run_summary(
     frames_attempted: int,
     tracking_ok_count: int,
     tracking_lost_count: int,
+    imu_propagated_count: int = 0,
     errors: int,
     final_state: str,
     keyframes: int,
@@ -801,6 +815,7 @@ def build_run_summary(
         "frames_attempted": int(frames_attempted),
         "tracking_ok_count": int(tracking_ok_count),
         "tracking_lost_count": int(tracking_lost_count),
+        "imu_propagated_count": int(imu_propagated_count),
         "errors": int(errors),
         "final_state": final_state,
         "keyframes": int(keyframes),
@@ -899,7 +914,11 @@ def create_arg_parser() -> argparse.ArgumentParser:
     gba_group = parser.add_mutually_exclusive_group()
     gba_group.add_argument("--enable-global-ba", action="store_true", help="Enable loop-triggered Global BA.")
     gba_group.add_argument("--disable-global-ba", action="store_true", help="Disable loop-triggered Global BA.")
-    parser.add_argument("--global-ba-after-loop", action="store_true", help="Run Global BA after accepted loop closures.")
+    parser.add_argument("--global-ba-after-loop", action="store_true", help="Run Global BA after accepted loop closures (online; blocks).")
+    parser.add_argument("--final-global-ba", action="store_true",
+                        help="Run ONE full Global BA at the end of the run (deferred; keeps "
+                             "online operation real-time). Recommended way to get a polished "
+                             "final map without blocking online tracking.")
     parser.add_argument("--global-ba-iterations", type=int, default=10)
     parser.add_argument("--loop-debug", action="store_true")
     parser.add_argument("--loop-retrieval-trace", action="store_true")
@@ -921,11 +940,27 @@ def create_arg_parser() -> argparse.ArgumentParser:
         ),
         default=getattr(Parameters, "kLoopCandidateSource", "auto"),
     )
-    parser.add_argument("--start-local-mapping-thread", action="store_true")
+    # Local mapping defaults to INLINE (sequential). Measured on lab_rgbd_run_2:
+    # threading is ~17% slower, stutters tracking more (GIL contention — the
+    # Python-heavy local-mapping work can't truly overlap tracking), and raises
+    # run-to-run variance. Threading only helps live streaming (fixed camera
+    # rate, tracking must not block), so it stays opt-in for future Jetson use.
+    parser.add_argument(
+        "--start-local-mapping-thread",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run local mapping on a background thread (opt-in; for live "
+             "streaming. Slower for batch dataset runs — see note in code).",
+    )
     parser.add_argument("--lm-wait-timeout", type=float, default=0.5)
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--memory-profile-every", type=int, default=1)
     parser.add_argument("--memory-profile-mode", choices=("cheap", "deep"), default="cheap")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Bit-reproducible eval mode: seed cv2 RNG, pin cv2/BLAS to 1 thread, "
+                             "disable parallel matching, force inline local mapping. SLOW "
+                             "(single-threaded BA) — for short reproducible segments / validation.")
+    parser.add_argument("--deterministic-seed", type=int, default=0)
     parser.add_argument("--profile-runtime", action="store_true")
     parser.add_argument("--runtime-profile-every", type=int, default=1)
     parser.add_argument("--profile-local-map", action="store_true")
@@ -933,6 +968,25 @@ def create_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-limit-gb", type=float, default=0.0)
     parser.add_argument("--frame-view-prune-every", type=int, default=Parameters.kFrameViewPruneEveryNFrames)
     parser.add_argument("--lean-memory", action="store_true")
+    parser.add_argument(
+        "--use-imu-fallback",
+        action="store_true",
+        help="Write an IMU-assisted fallback trajectory for frames where visual tracking is lost.",
+    )
+    parser.add_argument(
+        "--imu-aided-tracking",
+        action="store_true",
+        help="Loosely-coupled IMU aid: feed the IMU dead-reckoned pose as the tracking "
+             "prior when the visual motion model is weak and carry the trajectory "
+             "through visual loss (continuous, IMU_PROPAGATED frames). Implies "
+             "--use-imu-fallback. Map stays visual-only. Default off.",
+    )
+    parser.add_argument(
+        "--imu-path",
+        type=Path,
+        default=None,
+        help="IMU CSV path for --use-imu-fallback (defaults to <dataset>/imu.csv).",
+    )
     parser.add_argument("--no-map-export", action="store_true")
     parser.add_argument("--no-heavy-loop-reports", action="store_true")
     parser.add_argument("--no-loop-candidate-pair-reports", action="store_true")
@@ -955,6 +1009,7 @@ def run_rgbd_slam(
     enable_global_ba: bool = False,
     global_ba_after_loop: bool = False,
     global_ba_iterations: int = 10,
+    final_global_ba: bool = False,
     loop_debug: bool = False,
     loop_retrieval_trace: bool = False,
     loop_retrieval_trace_raw_k: int = 0,
@@ -974,6 +1029,9 @@ def run_rgbd_slam(
     memory_limit_gb: float = 0.0,
     frame_view_prune_every: int = Parameters.kFrameViewPruneEveryNFrames,
     lean_memory: bool = False,
+    use_imu_fallback: bool = False,
+    imu_aided_tracking: bool = False,
+    imu_path: Path | None = None,
     no_map_export: bool = False,
     no_heavy_loop_reports: bool = False,
     no_loop_candidate_pair_reports: bool = False,
@@ -1009,6 +1067,18 @@ def run_rgbd_slam(
         frames = frames[start_index:]
     if max_frames > 0:
         frames = frames[:max_frames]
+
+    imu_fallback = None
+    resolved_imu_path = None
+    # IMU-aided tracking needs the same extrapolator the sidecar uses; enabling it
+    # implies the fallback so the runner's observe() loop keeps its anchor current.
+    if imu_aided_tracking:
+        use_imu_fallback = True
+    if use_imu_fallback:
+        resolved_imu_path = Path(imu_path).expanduser().resolve() if imu_path is not None else dataset / "imu.csv"
+        if not resolved_imu_path.exists():
+            raise RuntimeError(f"--use-imu-fallback requested but IMU CSV does not exist: {resolved_imu_path}")
+        imu_fallback = ImuFallbackExtrapolator(resolved_imu_path)
 
     selected_backend = None if feature_backend in {None, "auto"} else feature_backend
     feature_tracker_config = None if selected_backend is None else {"extractor_backend": selected_backend}
@@ -1069,6 +1139,9 @@ def run_rgbd_slam(
             no_loop_candidate_pair_reports=no_loop_candidate_pair_reports,
             frame_view_prune_every=Parameters.kFrameViewPruneEveryNFrames,
         )
+        run_config["use_imu_fallback"] = bool(imu_fallback is not None)
+        run_config["imu_path"] = str(resolved_imu_path) if resolved_imu_path is not None else None
+        run_config["imu_samples"] = int(imu_fallback.num_samples) if imu_fallback is not None else 0
         effective_run_config_path = write_effective_run_config(output_dir, run_config)
 
         profiler = RuntimeProfiler(enabled=profile_runtime)
@@ -1086,6 +1159,8 @@ def run_rgbd_slam(
                 global_ba_iterations=global_ba_iterations,
             )
             slam.runtime_profiler = profiler
+            if imu_aided_tracking and imu_fallback is not None:
+                slam.set_imu_predictor(imu_fallback)
             slam.tracking.profile_local_map = effective_profile_local_map
             slam.tracking.profile_keyframes = effective_profile_keyframes
             slam.local_mapping.profile_keyframes = effective_profile_keyframes
@@ -1147,11 +1222,17 @@ def run_rgbd_slam(
             print(f"Runtime profile:     {'enabled' if profile_runtime else 'disabled'}")
             print(f"Local map profile:   {'enabled' if effective_profile_local_map else 'disabled'}")
             print(f"Keyframe profile:    {'enabled' if effective_profile_keyframes else 'disabled'}")
+            if imu_fallback is not None:
+                print(f"IMU fallback:        enabled ({imu_fallback.num_samples} samples from {resolved_imu_path})")
+            else:
+                print("IMU fallback:        disabled")
+            print(f"IMU-aided tracking:  {'enabled' if imu_aided_tracking else 'disabled'}")
             print("=" * 80)
 
             start_t = time.perf_counter()
             num_ok = 0
             num_lost = 0
+            num_imu_propagated = 0
             num_errors = 0
             accepted_loop_count = 0
             stop_requested = False
@@ -1172,6 +1253,10 @@ def run_rgbd_slam(
             loop_consistency_progression_rows: list[dict] = []
             loop_geometry_trace_rows: list[dict] = []
             memory_profile_rows: list[dict] = []
+            imu_fallback_rows: list[dict] = []
+            imu_fallback_poses: list[np.ndarray] = []
+            imu_fallback_timestamps: list[float] = []
+            imu_fallback_count = 0
             peak_rss_mb = 0.0
             pair_report_dir = output_dir / "loop_candidate_pair_reports"
             runtime_profile_live_file = output_dir / "runtime_profile_live.csv"
@@ -1353,8 +1438,28 @@ def run_rgbd_slam(
                     peak_rss_mb = max(peak_rss_mb, frame_rss_mb)
 
                     state = slam.get_tracking_state()
+                    if imu_fallback is not None:
+                        visual_Tcw = None
+                        if ok and state == SlamState.OK and getattr(slam.tracking, "f_cur", None) is not None:
+                            visual_Tcw = slam.tracking.f_cur.pose()
+                        fallback_result = imu_fallback.observe(
+                            entry.timestamp,
+                            visual_Tcw,
+                            _state_name(state),
+                        )
+                        if fallback_result is not None:
+                            imu_fallback_rows.append(fallback_result.row())
+                            imu_fallback_poses.append(fallback_result.Tcw)
+                            imu_fallback_timestamps.append(entry.timestamp)
+                            if fallback_result.source == "imu_fallback":
+                                imu_fallback_count += 1
+                                # Feed the recovery anchor used by the existing RGB-D reinit safety net.
+                                slam.tracking.last_good_pose = fallback_result.Tcw.copy()
+
                     if ok and state == SlamState.OK:
                         num_ok += 1
+                    elif state == SlamState.IMU_PROPAGATED:
+                        num_imu_propagated += 1
                     elif state == SlamState.LOST:
                         num_lost += 1
 
@@ -1437,7 +1542,25 @@ def run_rgbd_slam(
 
             elapsed = time.perf_counter() - start_t
 
+            # Threaded local mapping: drain any keyframes still queued before
+            # finalizing. stop_thread() abandons the queue, so without this the
+            # last few keyframes would miss local BA / point creation and the
+            # exported map would be incomplete. Bounded so a stuck worker can't
+            # hang shutdown.
+            if threaded_lm and slam.local_mapping is not None:
+                drain_deadline = time.perf_counter() + 60.0
+                while (slam.local_mapping.queue_size() > 0
+                       and time.perf_counter() < drain_deadline):
+                    slam.local_mapping.wait_idle(timeout=Parameters.kWaitForLocalMappingTimeout)
+                slam.local_mapping.wait_idle(timeout=5.0)
+                # Quiesce the worker before finalize/compaction/export so no
+                # concurrent map mutation races the single-threaded finalization.
+                slam.local_mapping.stop_thread()
+
             trajectory = slam.get_final_trajectory()
+            # Include IMU_PROPAGATED frames so the loosely-coupled IMU carry-through
+            # keeps the main trajectory continuous through visual loss (their pose is
+            # the IMU dead-reckoned estimate, not a stale/garbage pose).
             ok_pairs = [
                 (pose, ts)
                 for pose, ts, state in zip(
@@ -1445,13 +1568,21 @@ def run_rgbd_slam(
                     trajectory["timestamps"],
                     trajectory["slam_states"],
                 )
-                if state == SlamState.OK
+                if state in (SlamState.OK, SlamState.IMU_PROPAGATED)
             ]
             poses = [pose for pose, _ in ok_pairs]
             timestamps = [stamp for _, stamp in ok_pairs]
 
             traj_file = output_dir / f"trajectory_{dataset_name}.txt"
             save_tum_trajectory(poses, timestamps, traj_file)
+
+            imu_fallback_traj_file = None
+            imu_fallback_log_file = None
+            if imu_fallback is not None:
+                imu_fallback_traj_file = output_dir / f"trajectory_{dataset_name}_imu_fallback.txt"
+                save_tum_trajectory(imu_fallback_poses, imu_fallback_timestamps, imu_fallback_traj_file)
+                imu_fallback_log_file = output_dir / "imu_fallback_log.csv"
+                write_csv(imu_fallback_log_file, imu_fallback_rows, IMU_FALLBACK_COLUMNS)
 
             frame_log_file = output_dir / f"frame_log_{dataset_name}.csv"
             write_csv(frame_log_file, per_frame_log, FRAME_LOG_COLUMNS)
@@ -1561,6 +1692,39 @@ def run_rgbd_slam(
                 profiler.write_csv(runtime_profile_csv)
                 profiler.write_json(runtime_profile_json)
 
+            # Final Global BA (deferred). Online operation runs only local BA +
+            # loop pose-graph correction (real-time, never blocks on GBA); one
+            # full global BA runs here, after the last frame, to polish the whole
+            # map/trajectory — "GBA at the end." Not counted in avg_fps (elapsed
+            # was measured above), reported separately.
+            final_gba_sec = 0.0
+            if final_global_ba and slam.map.num_keyframes() > 2:
+                _gba_t = time.perf_counter()
+                try:
+                    gba_result = slam.bundle_adjust()
+                    final_gba_sec = time.perf_counter() - _gba_t
+                    _ok = getattr(gba_result, "success", None)
+                    _reason = getattr(gba_result, "reason", "")
+                    _ned = getattr(gba_result, "num_edges", 0)
+                    _nin = getattr(gba_result, "num_inliers", 0)
+                    print(f"final global BA:       {final_gba_sec:.1f}s "
+                          f"(success={_ok}, reason='{_reason}', edges={_ned}, "
+                          f"inliers={_nin}, keyframes={slam.map.num_keyframes()})")
+                except Exception as _gba_exc:
+                    print(f"final global BA skipped: {_gba_exc}")
+
+            # Final purge of bad/fusion-replaced ghost points so the reported
+            # map_points count and exported map reflect the live good map (the
+            # C++ MapPoint backend leaves dead points in Map.points; see
+            # Map.compact_points()). Runs after GBA so GBA-flagged outliers are
+            # dropped too.
+            try:
+                n_compacted = slam.map.compact_points()
+                if n_compacted:
+                    print(f"final map compaction:  purged {n_compacted} ghost points")
+            except Exception as _compact_exc:
+                print(f"final map compaction skipped: {_compact_exc}")
+
             map_export = {"map_points_ply": None, "keyframes_json": None, "keyframe_graph_json": None}
             if not no_map_export:
                 map_export = export_orbslam_map(slam, output_dir)
@@ -1645,6 +1809,10 @@ def run_rgbd_slam(
                 "local_mapping_schedule_log_file": str(local_mapping_schedule_log_file) if local_mapping_schedule_log_file is not None else None,
                 "runtime_profile_csv": str(runtime_profile_csv) if runtime_profile_csv is not None else None,
                 "runtime_profile_json": str(runtime_profile_json) if runtime_profile_json is not None else None,
+                "imu_fallback_trajectory_file": str(imu_fallback_traj_file) if imu_fallback_traj_file is not None else None,
+                "imu_fallback_log_file": str(imu_fallback_log_file) if imu_fallback_log_file is not None else None,
+                "imu_fallback_pose_count": len(imu_fallback_poses),
+                "imu_fallback_lost_pose_count": int(imu_fallback_count),
                 "standardized_trajectory_file": standardized_output_files["trajectory_file"],
                 "standardized_frame_log_file": standardized_output_files["frame_log_file"],
                 "standardized_frame_timing_file": standardized_output_files["frame_timing_file"],
@@ -1679,6 +1847,7 @@ def run_rgbd_slam(
                 frames_attempted=len(per_frame_log),
                 tracking_ok_count=num_ok,
                 tracking_lost_count=num_lost,
+                imu_propagated_count=num_imu_propagated,
                 errors=num_errors,
                 final_state=_state_name(slam.get_tracking_state()),
                 keyframes=slam.map.num_keyframes(),
@@ -1707,6 +1876,7 @@ def run_rgbd_slam(
             print(f"frames_attempted:     {summary['frames_attempted']}")
             print(f"tracking_ok_count:    {summary['tracking_ok_count']}")
             print(f"tracking_lost_count:  {summary['tracking_lost_count']}")
+            print(f"imu_propagated_count: {summary.get('imu_propagated_count', 0)}")
             print(f"errors:               {summary['errors']}")
             print(f"final_state:          {summary['final_state']}")
             print(f"keyframes:            {summary['keyframes']}")
@@ -1715,6 +1885,10 @@ def run_rgbd_slam(
             print(f"elapsed_sec:          {summary['elapsed_sec']:.3f}")
             print(f"avg_fps:              {summary['avg_fps']:.2f}")
             print(f"trajectory_file:      {traj_file}")
+            if imu_fallback_traj_file is not None:
+                print(f"imu_fallback_traj:    {imu_fallback_traj_file}")
+                print(f"imu_fallback_log:     {imu_fallback_log_file}")
+                print(f"imu_fallback_lost:    {imu_fallback_count}")
             print(f"frame_log_file:       {frame_log_file}")
             print(f"frame_timing_file:    {frame_timing_file}")
             print(f"map_points_ply:       {map_export['map_points_ply']}")
@@ -1778,9 +1952,57 @@ def run_rgbd_slam(
                 slam.shutdown()
 
 
+_DETERMINISTIC_TP_LIMITER = None
+
+
+def apply_deterministic_mode(seed: int = 0) -> None:
+    """Maximize run-to-run reproducibility for benchmarking/validation.
+
+    Removes the *controllable* nondeterminism sources in this pipeline:
+      1. unseeded cv2 RANSAC in PnP relocalization + tracking -> seed cv2 RNG and
+         force single-threaded cv2;
+      2. ThreadPool keypoint matching in local mapping / relocalization -> disable;
+      3. multithreaded BLAS in the C++ BA -> pin to 1 thread (threadpoolctl).
+    Sim3 RANSAC is already seeded (sim3_solver seed=226) and ORB extraction is
+    already deterministic (verified bit-identical; Parameters.kORBDeterministic).
+
+    IMPORTANT LIMITATION: this gets variance down to ~mm but is NOT bit-identical.
+    The residual nondeterminism is INSIDE the C++ BA solver (slam_optimizer_core):
+    its internal threading/ordering is not controllable from Python. Pinning at
+    *launch* helps (export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+    -> ~2cm down to ~4mm), but true bit-determinism needs a single-threaded
+    deterministic build of that C++ solver (out of scope). Also slow (single-thread
+    BA) — intended for SHORT reproducible segments / unit validation, not full runs.
+    """
+    global _DETERMINISTIC_TP_LIMITER
+    np.random.seed(int(seed))
+    cv2.setRNGSeed(int(seed))
+    cv2.setNumThreads(1)
+    try:
+        import threadpoolctl
+        # Held for the process lifetime so the 1-thread BLAS limit stays active.
+        _DETERMINISTIC_TP_LIMITER = threadpoolctl.threadpool_limits(limits=1)
+    except Exception as exc:  # best-effort; env pinning is the fallback
+        print(f"[deterministic] threadpoolctl unavailable ({exc})")
+    Parameters.kLocalMappingParallelKpsMatching = False
+    Parameters.kRelocalizationParallelKpsMatching = False
+    _env_pinned = os.environ.get("OMP_NUM_THREADS") == "1"
+    print(f"[deterministic] enabled (seed={seed}): cv2 RNG seeded, single-thread "
+          f"cv2/BLAS, parallel matching off, inline LM.")
+    if not _env_pinned:
+        print("[deterministic] TIP: for best reproducibility also launch with "
+              "OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 "
+              "(C++ BA solver reads these at start). Residual ~mm variance remains "
+              "(C++ solver internals); not bit-identical.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = create_arg_parser()
     args = parser.parse_args(argv)
+
+    if getattr(args, "deterministic", False):
+        apply_deterministic_mode(int(getattr(args, "deterministic_seed", 0)))
+        args.start_local_mapping_thread = False  # inline => deterministic ordering
 
     enable_loop_closing = bool(args.enable_loop_closing and not args.disable_loop_closing)
     enable_global_ba = bool(args.enable_global_ba and not args.disable_global_ba)
@@ -1800,6 +2022,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_global_ba=enable_global_ba,
         global_ba_after_loop=bool(args.global_ba_after_loop),
         global_ba_iterations=int(args.global_ba_iterations),
+        final_global_ba=bool(args.final_global_ba),
         loop_debug=bool(args.loop_debug),
         loop_retrieval_trace=bool(args.loop_retrieval_trace),
         loop_retrieval_trace_raw_k=int(args.loop_retrieval_trace_raw_k),
@@ -1822,6 +2045,9 @@ def main(argv: list[str] | None = None) -> int:
         no_map_export=bool(args.no_map_export),
         no_heavy_loop_reports=bool(args.no_heavy_loop_reports),
         no_loop_candidate_pair_reports=bool(args.no_loop_candidate_pair_reports),
+        use_imu_fallback=bool(args.use_imu_fallback),
+        imu_aided_tracking=bool(args.imu_aided_tracking),
+        imu_path=args.imu_path,
     )
     return 0
 
