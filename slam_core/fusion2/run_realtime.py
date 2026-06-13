@@ -335,14 +335,27 @@ class LidarFEAdapter:
             kf_min_dt_s=cfg.kf_min_dt_s)
         self.fem = FrontEndManager(make_fe, initial_kind, grace_scans)
         self.last_fe_pose: Optional[fc.Pose2] = None
+        self._last_pose: Optional[fc.Pose2] = None    # latest FE estimate (any scan)
 
     @property
     def variant(self) -> str:
         return self.fem.active_kind
 
+    def current_pose(self) -> Optional[fc.Pose2]:
+        """The latest front-end pose estimate (for a cross-sensor flip baseline)."""
+        return self._last_pose
+
+    def reset_baseline(self, pose: fc.Pose2):
+        """On a cross-sensor handoff INTO this adapter, anchor relative-motion
+        chaining at `pose` so the next keyframe continues from the last graph
+        pose (V5.3 fresh-from-handoff mechanism, sensor-independent)."""
+        self.last_fe_pose = pose
+
     def feed(self, ev) -> Tuple[Optional[KeyframeData], Optional[fc.Pose2]]:
         _, t, scan = ev
         fe_pose_py, pts, is_kf, flip = self.fem.process(t, scan)
+        self._last_pose = fc.Pose2(float(fe_pose_py.x), float(fe_pose_py.y),
+                                   float(fe_pose_py.theta))
         if flip is not None:
             # handoff complete: reset the relative-motion baseline to the new
             # front-end's frame so chaining continues seamlessly (no jump).
@@ -379,6 +392,17 @@ class VoFEAdapter:
         self.K = self.fe.K
         self.reinits = 0
         self.variant = "visual_vo"
+        self._last_pose: Optional[fc.Pose2] = None    # latest tracked pose (any frame)
+        self._baseline_override: Optional[fc.Pose2] = None
+
+    def current_pose(self) -> Optional[fc.Pose2]:
+        return self._last_pose
+
+    def reset_baseline(self, pose: fc.Pose2):
+        """On a cross-sensor handoff INTO VO, anchor the NEXT keyframe's relative
+        motion at `pose` (the VO estimate at the flip instant) so it chains from
+        the last graph pose — instead of from the discarded grace keyframe."""
+        self._baseline_override = pose
 
     def feed(self, ev) -> Tuple[Optional[KeyframeData], Optional[fc.Pose2]]:
         import cv2
@@ -388,13 +412,19 @@ class VoFEAdapter:
         if rgb is None or depth is None:
             return None, None
         Twc, state, nkf = self.fe.track(rgb, depth, t)
+        self._last_pose = _cam_to_se2(Twc)
         if state == fc.VoState.REINIT:
             self.reinits += 1
         if nkf is None:
             return None, None
         fe_pose = _cam_to_se2(nkf.Twc)
         blind = nkf.state == fc.VoState.REINIT
-        if nkf.prev_Twc is None:
+        if self._baseline_override is not None:
+            # first keyframe after a cross-sensor handoff: chain from the flip
+            # baseline, then resume the BA-refined prev_Twc spine.
+            rel = _rel(self._baseline_override, fe_pose)
+            self._baseline_override = None
+        elif nkf.prev_Twc is None:
             rel = None
         else:
             rel = _rel(_cam_to_se2(nkf.prev_Twc), fe_pose)
@@ -413,6 +443,82 @@ def make_adapter(sensor_kind: str, cfg, stream, K, attach_visual, grace_scans=15
     if sensor_kind == "visual_vo":
         return VoFEAdapter(cfg, stream)
     return LidarFEAdapter(cfg, stream, K, attach_visual, sensor_kind, grace_scans)
+
+
+SENSOR_OF_KIND = {"visual_vo": "vo", "native_s2s": "lidar", "native_s2m": "lidar"}
+SENSOR_OF_EVENT = {"lidar": "lidar", "rgbd": "vo"}    # merged-timeline tag -> sensor
+
+
+# ---------------------------------------------------------------------------
+# SensorManager — orchestrates CROSS-sensor (visual VO <-> LiDAR) front-end
+# switches on top of the per-sensor adapters (V5.7). Same-sensor LiDAR variant
+# switches (s2s<->s2m) delegate to the LiDAR adapter's own FrontEndManager.
+#
+# On a cross-sensor request a fresh target adapter is built and warmed up on ITS
+# sensor's events for `grace_scans` events while the active adapter keeps driving
+# the graph. At the flip the target becomes active and its relative-motion
+# baseline is reset to its own pose at that instant, so the first post-flip
+# keyframe continues from the last graph pose (valid because both adapters emit
+# REP-103 base poses).
+# ---------------------------------------------------------------------------
+class SensorManager:
+    def __init__(self, make_adapter_fn, initial_adapter, grace_scans: int = 20):
+        self._make = make_adapter_fn          # (kind) -> adapter
+        self.active = initial_adapter
+        self.grace_scans = int(grace_scans)
+        self.pending = None
+        self.pending_kind = None
+        self._grace = 0
+
+    @property
+    def active_sensor(self) -> str:
+        return self.active.sensor
+
+    @property
+    def active_variant(self) -> str:
+        return self.active.variant
+
+    def request_switch(self, target_kind: str) -> str:
+        target_sensor = SENSOR_OF_KIND[target_kind]
+        if target_sensor == self.active.sensor:
+            # same-sensor: a LiDAR variant switch handled by the LiDAR adapter.
+            if isinstance(self.active, LidarFEAdapter):
+                return self.active.fem.request_switch(target_kind)
+            return f"already on {target_kind}; ignored"
+        if self.pending is not None:
+            return f"cross-sensor switch to {self.pending_kind} in progress; ignored"
+        self.pending = self._make(target_kind)
+        self.pending_kind = target_kind
+        self._grace = self.grace_scans
+        return (f"requested cross-sensor -> {target_kind}; effective in "
+                f"{self.grace_scans} {target_sensor} events (warming up)")
+
+    def feed(self, ev):
+        """Route an event. The pending adapter (if any) warms up on its sensor's
+        events; the active adapter drives the graph on its sensor's events.
+        Returns (kfd, fe_flip, sensor_flip):
+          kfd          — KeyframeData for the graph, or None
+          fe_flip      — same-sensor (s2s<->s2m) variant handoff pose, or None
+          sensor_flip  — dict(kind, sensor) when a cross-sensor flip completes."""
+        sensor = SENSOR_OF_EVENT[ev[0]]
+        sensor_flip = None
+        just_flipped = False
+        if self.pending is not None and sensor == self.pending.sensor:
+            self.pending.feed(ev)                  # warm up (output discarded)
+            self._grace -= 1
+            if self._grace <= 0:
+                pk = self.pending_kind
+                self.active = self.pending
+                self.pending = self.pending_kind = None
+                base = self.active.current_pose()
+                if base is not None:
+                    self.active.reset_baseline(base)
+                sensor_flip = dict(kind=pk, sensor=self.active.sensor)
+                just_flipped = True
+        kfd = fe_flip = None
+        if not just_flipped and sensor == self.active.sensor:
+            kfd, fe_flip = self.active.feed(ev)
+        return kfd, fe_flip, sensor_flip
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +648,8 @@ def _parse_args():
                         "available live (~78 KB/keyframe).")
     p.add_argument("--max-scans", type=int, default=0,
                    help="Cap on active-sensor keyframe-driving events (0 = all).")
+    p.add_argument("--grace-scans", type=int, default=20,
+                   help="Warm-up events for a front-end handoff (variant + cross-sensor).")
     p.add_argument("--speed", type=float, default=1.0,
                    help="1.0=real-time, 0=as-fast-as-possible.")
     p.add_argument("--draw-every", type=int, default=5)
@@ -572,50 +680,53 @@ def main(argv=None):
     if args.proposer is not None:
         proposer = args.proposer
 
-    # visual payload availability. VO modes ARE visual; LiDAR modes opt in.
-    if start_sensor == "vo":
-        visual_available = True
-    else:
-        visual_available = bool(args.attach_visual) or args.mode == "lidar_orb"
-    if verifier == "pnp" and not visual_available:
+    # LiDAR adapters attach the visual payload (so pnp/dbow survive a switch TO
+    # LiDAR) iff the user opted in (--attach-visual) or started in lidar_orb.
+    # VO adapters are always visual. This holds for the initial AND any pending
+    # (cross-sensor) adapter, so capability is consistent across switches.
+    lidar_attach = bool(args.attach_visual) or args.mode == "lidar_orb"
+    start_visual = True if start_sensor == "vo" else lidar_attach
+    if verifier == "pnp" and not start_visual:
         raise SystemExit("pnp verification needs visual payload: add --attach-visual "
                          "(or --mode lidar_orb).")
-    if proposer == "dbow" and not visual_available:
+    if proposer == "dbow" and not start_visual:
         raise SystemExit("--proposer dbow needs descriptors: add --attach-visual.")
 
     stream = LabHybridStream(cfg.dataset, cfg.sync_tolerance_s)
 
-    # camera intrinsics (for PnP / lidar attach-visual extraction)
-    K = None
-    if start_sensor != "vo" and visual_available:
-        import yaml
-        sc = yaml.safe_load(open(Path(cfg.dataset) / "sensor_config.yaml"))["camera"]
-        K = np.array([[sc["fx"], 0, sc["cx"]], [0, sc["fy"], sc["cy"]], [0, 0, 1]])
+    # camera intrinsics — needed by any visual-attaching adapter (PnP / dbow).
+    import yaml
+    sc = yaml.safe_load(open(Path(cfg.dataset) / "sensor_config.yaml"))["camera"]
+    K = np.array([[sc["fx"], 0, sc["cx"]], [0, sc["fy"], sc["cy"]], [0, 0, 1]])
+
+    def _build(kind):
+        return make_adapter(kind, cfg, stream, K, lidar_attach,
+                            grace_scans=args.grace_scans)
 
     initial_kind = "visual_vo" if start_sensor == "vo" else cfg.lidar_frontend
-    adapter = make_adapter(initial_kind, cfg, stream, K, visual_available)
-    if start_sensor == "vo":
-        K = adapter.K
+    sm = SensorManager(_build, _build(initial_kind), grace_scans=args.grace_scans)
     shared = build_shared_map(cfg)
     eng = IngestEngine(shared, cfg, K=K, verifier=verifier, proposer=proposer)
     eng.set_active_sensor(start_sensor)
     if proposer == "dbow":
         eng.ensure_appearance()
+    visual_available = _visual_available(sm.active)
 
     print("=" * 60)
     print(f"Dataset   : {cfg.dataset}")
-    print(f"Front-end : {adapter.variant}  (mode {cfg.mode}, sensor {start_sensor})")
+    print(f"Front-end : {sm.active_variant}  (mode {cfg.mode}, sensor {start_sensor})")
     print(f"Verifier  : {verifier}   Proposer: {proposer}")
-    print(f"Visual    : {'available' if visual_available else 'lean (scan only)'}")
+    print(f"Visual    : {'available' if visual_available else 'lean (scan only)'}"
+          f"{'' if start_sensor == 'vo' else ' (LiDAR attach=%s)' % lidar_attach}")
     print(f"Playback  : {'real-time' if args.speed > 0 else 'max'} (speed={args.speed}x)")
     print("Live cmds : verifier bnb|icp|pnp · proposer proximity|dbow · "
-          "fe vo|s2s|s2m · status · quit")
+          "fe vo|lidar|s2s|s2m · status · quit")
     print("=" * 60)
 
     switch_q: "queue.Queue" = queue.Queue()
     _start_switch_reader(switch_q)
 
-    live = LiveView(f"fusion realtime — {cfg.mode}/{adapter.variant}")
+    live = LiveView(f"fusion realtime — {cfg.mode}/{sm.active_variant}")
     timer = StageTimer()
 
     xs, ys, cloud_chunks = [], [], []
@@ -633,37 +744,47 @@ def main(argv=None):
         ev_start = time.perf_counter()
 
         # drain live commands (main thread only)
-        if _apply_switches(switch_q, eng, adapter, visual_available, k):
+        if _apply_switches(switch_q, eng, sm, k):
             break
 
-        # only the active sensor's events drive keyframes (V5.6: single FE)
-        if sensor == eng_sensor(adapter):
-            t_a = time.perf_counter()
-            kfd, flip = adapter.feed(ev)
-            timer.add("slam", time.perf_counter() - t_a)
-            if flip is not None:
-                cfg.lidar_frontend = adapter.variant
-                print(f"[switch] >>> front-end now {adapter.variant} at k={k} "
-                      f"(graph continues from last pose).")
-            if kfd is not None:
-                active_events += 1
-                scan = np.asarray(kfd.raw_scan, np.float64)
-                t_b = time.perf_counter()
-                kf_id, node_pose, sig = eng.ingest(kfd)
-                did_opt = eng.close_loops(kf_id, node_pose, sig, scan)
-                timer.add("loop", time.perf_counter() - t_b)
-                kf_ids.append(kf_id)
-                kf_scans.append(scan)
-                if did_opt:
-                    # LOOP CORRECTION applied live: rebuild the WHOLE displayed
-                    # trajectory + cloud from the corrected graph at once.
-                    xs, ys, cloud_chunks = _rebuild_display(shared, kf_ids, kf_scans)
-                else:
-                    gp = shared.graph.get_pose(kf_id)
-                    xs.append(gp.x); ys.append(gp.y)
-                    if len(scan):
-                        c, s = math.cos(gp.theta), math.sin(gp.theta)
-                        cloud_chunks.append(scan @ np.array([[c, -s], [s, c]]).T + [gp.x, gp.y])
+        # route the event: pending FE warms up on its sensor, active FE drives.
+        t_a = time.perf_counter()
+        kfd, fe_flip, sensor_flip = sm.feed(ev)
+        timer.add("slam", time.perf_counter() - t_a)
+        if sensor_flip is not None:
+            # cross-sensor flip: re-tune scan verification for the new modality
+            # and auto-fall-back any module the new front-end cannot feed.
+            eng.set_active_sensor(sensor_flip["sensor"])
+            fb = _autofallback(eng, sm.active)
+            visual_available = _visual_available(sm.active)
+            cfg.lidar_frontend = sm.active_variant
+            extra = (" [auto-fallback: " + ", ".join(fb) + "]") if fb else ""
+            print(f"[switch] >>> SENSOR now {sensor_flip['sensor']} "
+                  f"({sm.active_variant}) at k={k} (graph continues from last "
+                  f"pose).{extra}")
+        if fe_flip is not None:
+            cfg.lidar_frontend = sm.active_variant
+            print(f"[switch] >>> front-end now {sm.active_variant} at k={k} "
+                  f"(graph continues from last pose).")
+        if kfd is not None:
+            active_events += 1
+            scan = np.asarray(kfd.raw_scan, np.float64)
+            t_b = time.perf_counter()
+            kf_id, node_pose, sig = eng.ingest(kfd)
+            did_opt = eng.close_loops(kf_id, node_pose, sig, scan)
+            timer.add("loop", time.perf_counter() - t_b)
+            kf_ids.append(kf_id)
+            kf_scans.append(scan)
+            if did_opt:
+                # LOOP CORRECTION applied live: rebuild the WHOLE displayed
+                # trajectory + cloud from the corrected graph at once.
+                xs, ys, cloud_chunks = _rebuild_display(shared, kf_ids, kf_scans)
+            else:
+                gp = shared.graph.get_pose(kf_id)
+                xs.append(gp.x); ys.append(gp.y)
+                if len(scan):
+                    c, s = math.cos(gp.theta), math.sin(gp.theta)
+                    cloud_chunks.append(scan @ np.array([[c, -s], [s, c]]).T + [gp.x, gp.y])
 
         # live draw (throttled)
         t_c = time.perf_counter()
@@ -674,7 +795,7 @@ def main(argv=None):
             live.update(xs, ys,
                         cloud[:, 0] if cloud is not None else None,
                         cloud[:, 1] if cloud is not None else None,
-                        title=f"{cfg.mode}/{adapter.variant} v={eng.verifier} "
+                        title=f"{cfg.mode}/{sm.active_variant} v={eng.verifier} "
                               f"p={eng.proposer} kf={eng.stats['keyframes']} "
                               f"loops={eng.stats['loops_accepted']}")
         timer.add("draw", time.perf_counter() - t_c)
@@ -697,7 +818,7 @@ def main(argv=None):
         if k % max(1, args.print_every) == 0:
             print(f"k={k:5d} kf={eng.stats['keyframes']:4d} "
                   f"loops={eng.stats['loops_accepted']:3d} v={eng.verifier} "
-                  f"p={eng.proposer} fe={adapter.variant} lag={lag:6.3f}s")
+                  f"p={eng.proposer} fe={sm.active_variant} lag={lag:6.3f}s")
 
         if args.max_scans and active_events >= args.max_scans:
             break
@@ -705,15 +826,31 @@ def main(argv=None):
     # final optimize + outputs (+ auto-display the corrected fused map)
     shared.graph.optimize()
     eng.stats["optimize_calls"] += 1
-    if isinstance(adapter, VoFEAdapter):
-        eng.stats["reinits"] = adapter.reinits
+    if isinstance(sm.active, VoFEAdapter):
+        eng.stats["reinits"] = sm.active.reinits
     timer.summary(lag)
-    _finalize_and_show(shared, cfg, eng, adapter, args, live)
+    _finalize_and_show(shared, cfg, eng, sm.active, args, live)
 
 
-def eng_sensor(adapter) -> str:
-    """The sensor the currently-active adapter consumes."""
-    return adapter.sensor
+def _visual_available(adapter) -> bool:
+    """Whether the active adapter's keyframes carry a visual payload (pnp/dbow)."""
+    if isinstance(adapter, VoFEAdapter):
+        return True
+    return bool(getattr(adapter, "attach_visual", False))
+
+
+def _autofallback(eng, new_adapter) -> list:
+    """When a cross-sensor flip strands the active verifier/proposer (the new
+    front-end can't feed it), fall back to a compatible module and report it."""
+    msgs = []
+    if not _visual_available(new_adapter):
+        if eng.verifier == "pnp":
+            eng.verifier = "bnb"
+            msgs.append("verifier pnp->bnb")
+        if eng.proposer == "dbow":
+            eng.proposer = "proximity"
+            msgs.append("proposer dbow->proximity")
+    return msgs
 
 
 # ---- helpers --------------------------------------------------------------
@@ -741,10 +878,17 @@ def _start_switch_reader(q):
     threading.Thread(target=_reader, name="switch-reader", daemon=True).start()
 
 
-def _apply_switches(q, eng, adapter, visual_available, k) -> bool:
-    """Drain stdin commands on the MAIN thread. Returns True on quit.
-    Verifier/proposer + LiDAR front-end variant s2s<->s2m switching. Cross-sensor
-    (visual<->LiDAR) front-end switching is wired in V5.7."""
+_FE_ALIAS = {"s2s": "native_s2s", "s2m": "native_s2m",
+             "native_s2s": "native_s2s", "native_s2m": "native_s2m",
+             "vo": "visual_vo", "orb": "visual_vo", "visual": "visual_vo",
+             "visual_vo": "visual_vo", "lidar": "native_s2s"}
+
+
+def _apply_switches(q, eng, sm, k) -> bool:
+    """Drain stdin commands on the MAIN thread. Returns True on quit. Switches:
+    verifier (bnb|icp|pnp), proposer (proximity|dbow), and the front-end —
+    LiDAR variant s2s<->s2m AND cross-sensor visual<->LiDAR (V5.7)."""
+    visual_available = _visual_available(sm.active)
     while True:
         try:
             cmd = q.get_nowait()
@@ -758,10 +902,10 @@ def _apply_switches(q, eng, adapter, visual_available, k) -> bool:
             print(f"[switch] quit at k={k}.")
             return True
         if head in ("status", "?"):
-            pend = ""
-            if isinstance(adapter, LidarFEAdapter) and adapter.fem.pending:
-                pend = f" (switching->{adapter.fem.pending})"
-            print(f"[status] k={k} sensor={adapter.sensor} fe={adapter.variant}{pend} "
+            pend = f" (switching->{sm.pending_kind})" if sm.pending_kind else ""
+            if isinstance(sm.active, LidarFEAdapter) and sm.active.fem.pending:
+                pend = f" (variant->{sm.active.fem.pending})"
+            print(f"[status] k={k} sensor={sm.active_sensor} fe={sm.active_variant}{pend} "
                   f"verifier={eng.verifier} proposer={eng.proposer} "
                   f"kf={eng.stats['keyframes']} loops={eng.stats['loops_accepted']} "
                   f"visual={'on' if visual_available else 'off'}")
@@ -771,8 +915,8 @@ def _apply_switches(q, eng, adapter, visual_available, k) -> bool:
             if v not in ("bnb", "icp", "pnp"):
                 print(f"[switch] unknown verifier {v!r}")
             elif v == "pnp" and not visual_available:
-                print("[switch] pnp unavailable: run with --attach-visual (no visual "
-                      "payload on keyframes).")
+                print("[switch] pnp unavailable on the active front-end (no visual "
+                      "payload). Switch to a visual front-end or run --attach-visual.")
             else:
                 eng.verifier = v
                 print(f"[switch] verifier -> {v} (effective next proposal).")
@@ -782,8 +926,8 @@ def _apply_switches(q, eng, adapter, visual_available, k) -> bool:
             if pr not in ("proximity", "dbow"):
                 print(f"[switch] unknown proposer {pr!r}")
             elif pr == "dbow" and not visual_available:
-                print("[switch] dbow unavailable: run with --attach-visual (no "
-                      "descriptors indexed).")
+                print("[switch] dbow unavailable on the active front-end (no "
+                      "descriptors). Switch to a visual front-end or run --attach-visual.")
             else:
                 if pr == "dbow":
                     eng.ensure_appearance()
@@ -792,21 +936,15 @@ def _apply_switches(q, eng, adapter, visual_available, k) -> bool:
             continue
         if head == "fe" and len(parts) == 2:
             target = parts[1]
-            alias = {"s2s": "native_s2s", "s2m": "native_s2m",
-                     "native_s2s": "native_s2s", "native_s2m": "native_s2m"}
-            if target in ("orb", "vo", "visual", "lidar"):
-                print("[switch] cross-sensor front-end switching (visual<->LiDAR) is "
-                      "wired in V5.7 (unified multi-sensor driver landed in V5.6).")
-            elif target not in alias:
-                print(f"[switch] unknown front-end {target!r}. Try: fe s2s | fe s2m")
-            elif not isinstance(adapter, LidarFEAdapter):
-                print("[switch] s2s/s2m variants apply to the LiDAR front-end only.")
+            if target not in _FE_ALIAS:
+                print(f"[switch] unknown front-end {target!r}. "
+                      "Try: fe vo | fe lidar | fe s2s | fe s2m")
             else:
-                print(f"[switch] {adapter.fem.request_switch(alias[target])}")
+                print(f"[switch] {sm.request_switch(_FE_ALIAS[target])}")
             continue
         print(f"[switch] unknown command {cmd!r}. "
-              "Try: verifier bnb|icp|pnp · proposer proximity|dbow · fe s2s|s2m · "
-              "status · quit")
+              "Try: verifier bnb|icp|pnp · proposer proximity|dbow · "
+              "fe vo|lidar|s2s|s2m · status · quit")
 
 
 def _rebuild_display(shared, kf_ids, kf_scans):

@@ -7,20 +7,28 @@ front-end variant LIVE (typed on stdin) while the SAME shared C++ map keeps
 mapping. The fused occupancy map is rendered at the end.
 
     .venv/bin/python run_fusion_realtime.py --dataset datasets/lab_hybrid \
-        --mode lidar --lidar-frontend native_s2s --verifier bnb [--attach-visual]
+        --mode lidar --lidar-frontend native_s2s --verifier bnb --attach-visual
+    # or start visual-led:
+    .venv/bin/python run_fusion_realtime.py --dataset datasets/lab_hybrid --mode orb_lidar
 
 Live commands (type + Enter):
-    verifier bnb|icp|pnp   · proposer proximity|dbow   · fe s2s|s2m
+    verifier bnb|icp|pnp   · proposer proximity|dbow   · fe vo|lidar|s2s|s2m
     status                 · quit
 
-Switch axes (Phase 1 = LiDAR-led front-ends):
-    A1 front-end : native_s2s <-> native_s2m   (grace-buffer handoff, fresh local map)
-    A2 proposer  : proximity  <-> dbow         (dbow needs descriptors: --attach-visual)
-    A3 verifier  : bnb <-> icp <-> pnp         (pnp needs visual: --attach-visual)
+Switch axes (all live; the shared C++ map persists across every switch):
+    A1 front-end : visual_vo <-> native_s2s <-> native_s2m
+                   (grace-buffer handoff; cross-sensor warms the new sensor's FE
+                    on its own events, then flips fresh-from-origin — no teleport)
+    A2 proposer  : proximity  <-> dbow         (dbow needs descriptors)
+    A3 verifier  : bnb <-> icp <-> pnp         (pnp needs a visual payload)
 
-Out of scope (rejected live, with reason): cross-sensor visual<->LiDAR front-end
-(Phase 2, needs a unified multi-sensor driver); memory-tier caps / grid resolution
-/ sensor calibration (startup-only — changing them mid-run destabilizes the map).
+A cross-sensor flip that strands the active verifier/proposer (e.g. onto a lean
+LiDAR front-end) AUTO-FALLS-BACK to a compatible module (pnp->bnb, dbow->proximity)
+and prints a notice. LiDAR keyframes carry visual only with --attach-visual (or
+--mode lidar_orb); VO keyframes are always visual.
+
+Out of scope (rejected live, with reason): memory-tier caps / grid resolution /
+sensor calibration (startup-only — changing them mid-run destabilizes the map).
 """
 import sys
 from pathlib import Path

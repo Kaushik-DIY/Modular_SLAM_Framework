@@ -275,13 +275,12 @@ on stdin while the SAME shared C++ map keeps mapping; fused occupancy at the end
 | A2 proposer | proximity ⇄ dbow | **Yes** (dbow needs `--attach-visual`) | proximity reads graph poses; dbow reads the incrementally-built AppearanceIndex |
 | A3 verifier | bnb ⇄ icp ⇄ pnp | **Yes**, payload-gated | stateless per-candidate against candidate-local neighbourhood; pnp needs visual |
 
-**Out of scope (rejected live, with reason):** cross-sensor visual⇄LiDAR FE (Phase 2 —
-the two sensors run different stream rates with no merged timeline); memory-tier caps
-(mid-run rebalancing destabilizes); grid resolution / map frame / calibration / sync
-tolerance (storage constants — changing invalidates stored scans); sub-keyframe FE state
-transfer (impossible — switch is always a clean handoff); verifier onto a payload-less
-keyframe (silently skipped); graph backend (only g2o); retroactive re-verification (future
-proposals only).
+**Out of scope (rejected live, with reason):** memory-tier caps (mid-run rebalancing
+destabilizes); grid resolution / map frame / calibration / sync tolerance (storage
+constants — changing invalidates stored scans); sub-keyframe FE state transfer (impossible
+— switch is always a clean handoff); verifier onto a payload-less keyframe (auto-falls-back,
+see Phase 2); graph backend (only g2o); retroactive re-verification (future proposals only).
+(Cross-sensor visual⇄LiDAR FE was the only remaining deferred axis — now DONE in Phase 2.)
 
 **Payload policy:** lean default (LiDAR keyframes = scan only → verifier {bnb,icp}); opt-in
 `--attach-visual` adds ORB (~78 KB/KF) → {bnb,icp,pnp} + dbow. Visual-FE runs carry both for
@@ -295,4 +294,27 @@ guards · V5.3 live s2s⇄s2m grace handoff (mid-run flip step 8.2 cm < 24 cm me
 Real-time: 11.5 ms/scan FE + 1.2 ms/scan loop on the dev machine (≪ 104 ms LiDAR period).
 **Online-SLAM behaviour (V5.5):** loop closures optimize the graph IMMEDIATELY (not just periodically) and the LIVE trajectory + cloud snap to the corrected poses at the moment of closure (robot localization corrected on the run); the high-res fused occupancy is still rendered once at the end and now AUTO-DISPLAYS when the run finishes (no second command).
 
-**Phase 2 (deferred):** cross-sensor VO⇄LiDAR live switch via a unified multi-sensor driver.
+**Phase 2 — cross-sensor VO⇄LiDAR live switch (DONE, 2026-06-14):** `run_realtime.py`
+extended into a UNIFIED multi-sensor timeline driver. The FE axis is now
+**visual_vo ⇄ native_s2s ⇄ native_s2m**, all live-switchable.
+- **V5.6** — `merged_events()` two-pointer-merges the LiDAR (~10 Hz) + RGB-D (~30 Hz)
+  timelines onto one real-time clock (RGB-D events carry only paths → free for LiDAR-led
+  runs). `KeyframeData` uniform contract; `LidarFEAdapter`/`VoFEAdapter` produce it on
+  their own sensor's events; `IngestEngine.ingest(KeyframeData)` generalizes both batch
+  ingest paths; `set_active_sensor()` re-tunes B&B-seeding + angular window per modality;
+  `close_loops()` gates proximity per-N-kf but queries dbow every keyframe. **Single-FE
+  parity:** LiDAR path BIT-IDENTICAL to V5.1 (0.0 m, 159 kf / 32 loops); VO orb_lidar
+  path matches batch `run_orb_mode_native` to 6.5e-7 m (249 kf / 78 reinits).
+- **V5.7** — `SensorManager` orchestrates cross-sensor grace: the pending FE warms up on
+  ITS sensor's events while the active FE drives; at the flip the new FE's baseline resets
+  to its own pose (V5.3 mechanism, sensor-independent because both emit REP-103 base poses)
+  → **no teleport** (vo⇄lidar flips at 0.8×/0.9× median stride on small). **Auto-fallback:**
+  a flip onto a lean LiDAR FE that strands pnp/dbow downgrades to bnb/proximity + prints a
+  notice. `fe vo|lidar|s2s|s2m` live commands.
+- **V5.8** — `tests/fusion2/test_v5_phase2_crossmodal.py` (3 tests: no-teleport vo⇄lidar
+  round-trip + loops both sides, auto-fallback on lean LiDAR, final map non-empty). CLI
+  end-to-end verified (piped `fe vo` switch → coherent fused map). Docs updated.
+
+**Fusion layer is feature-complete:** every module (front-end sensor + variant, proposer,
+verifier) is live-switchable over one persistent shared map. Remaining levers are tuning /
+deployment only (SQLite LTM offload for unbounded runs; camera-IMU extrinsic; ROS/Jetson).
