@@ -128,6 +128,14 @@ class Tracking:
         self.last_good_pose = None
         self.total_reinit_from_depth = 0
 
+        # Loosely-coupled IMU aid (opt-in via run_rgbd_slam --imu-aided-tracking).
+        # When set, an ImuFallbackExtrapolator supplies a dead-reckoned pose prior
+        # while the visual motion model is weak, and carries the trajectory forward
+        # during unrecoverable loss. The map stays visual-only. Default None keeps
+        # standalone behaviour byte-for-byte unchanged.
+        self.imu_predictor = None
+        self.total_imu_propagated_frames = 0
+
         self.pose_is_ok = False
         self.mean_pose_opt_chi2_error = None
         self.predicted_pose = None
@@ -175,6 +183,28 @@ class Tracking:
     @property
     def local_mapping(self):
         return getattr(self.slam, "local_mapping", None)
+
+    def set_imu_predictor(self, predictor) -> None:
+        """Attach a loosely-coupled IMU pose predictor (opt-in).
+
+        ``predictor`` must expose ``predict(timestamp) -> Tcw (4x4) | None``
+        (see visual_slam.orbslam.imu_fallback.ImuFallbackExtrapolator). The
+        runner is responsible for feeding it visual poses each frame (via the
+        existing ``observe`` sidecar loop) so its anchor/velocity stay current.
+        """
+        self.imu_predictor = predictor
+
+    def _imu_prior_isometry(self, timestamp):
+        """Return the IMU-extrapolated pose as a g2o.Isometry3d, or None."""
+        if self.imu_predictor is None or timestamp is None:
+            return None
+        try:
+            Tcw = self.imu_predictor.predict(timestamp)
+        except Exception:
+            return None
+        if Tcw is None:
+            return None
+        return g2o.Isometry3d(np.asarray(Tcw, dtype=np.float64).reshape(4, 4))
 
     def _profile_section(self, name: str):
         profiler = getattr(self.slam, "runtime_profiler", None)
@@ -1411,6 +1441,10 @@ class Tracking:
         self.pose_is_ok = False
         self.num_matched_map_points = 0
         self.mean_pose_opt_chi2_error = float("inf")
+        # Set True when visual tracking failed but the IMU predictor carried the
+        # pose forward this frame (loosely-coupled fallback). Used below to record
+        # a continuous trajectory and tag the frame as IMU_PROPAGATED.
+        imu_carried = False
 
         # First frame: create initial RGB-D keyframe/map.
         if self.state in (SlamState.NO_IMAGES_YET, SlamState.NOT_INITIALIZED):
@@ -1432,10 +1466,19 @@ class Tracking:
             if self.motion_model.is_ok:
                 predicted_pose, _ = self.motion_model.predict_pose(timestamp)
                 f_cur.update_pose(predicted_pose)
-            elif self.f_ref is not None:
-                f_cur.update_pose(self.f_ref.pose())
-            elif self.kf_ref is not None:
-                f_cur.update_pose(self.kf_ref.pose())
+            else:
+                # Weak motion model (just lost lock / right after reloc) is exactly
+                # when featureless frames break tracking. Prefer an IMU dead-reckoned
+                # prior over a stale reference pose so search-by-projection starts
+                # near the true pose. Falls back to the original behaviour when no
+                # IMU predictor is attached.
+                imu_prior = self._imu_prior_isometry(timestamp)
+                if imu_prior is not None:
+                    f_cur.update_pose(imu_prior)
+                elif self.f_ref is not None:
+                    f_cur.update_pose(self.f_ref.pose())
+                elif self.kf_ref is not None:
+                    f_cur.update_pose(self.kf_ref.pose())
 
             if (not self.motion_model.is_ok) and self.kf_ref is not None:
                 self.track_keyframe(self.kf_ref, f_cur, "match-frame-keyframe")
@@ -1470,12 +1513,29 @@ class Tracking:
                 self.pose_is_ok = False
                 self.consecutive_reloc_failures += 1
                 Printer.red("Relocalization failed")
+                # Loosely-coupled carry-through: dead-reckon the pose from the IMU
+                # so the MAIN trajectory stays continuous (no teleport gap) instead
+                # of leaving f_cur at a stale/failed pose. The map stays visual-only;
+                # this only fills the per-frame pose recorded in update_history().
+                imu_prior = self._imu_prior_isometry(timestamp)
+                if imu_prior is not None:
+                    f_cur.update_pose(imu_prior)
+                    imu_carried = True
+                    self.total_imu_propagated_frames += 1
+                    try:
+                        _ip = imu_prior.matrix()
+                        self.last_good_pose = np.array(_ip, dtype=np.float64).reshape(4, 4)
+                    except Exception:
+                        pass
                 # Safety net: after prolonged unrecoverable loss, re-initialize a
-                # fresh RGB-D submap from depth (anchored at the last good pose)
-                # so the system continues instead of staying dead for the rest of
-                # the run. Only reached while already LOST -> cannot affect the
-                # normal tracking path.
-                limit = int(getattr(Parameters, "kMaxRelocFailuresBeforeReinit", 0))
+                # fresh RGB-D submap from depth (anchored at the last good pose,
+                # which is now the IMU-carried pose when available) so the system
+                # continues instead of staying dead for the rest of the run.
+                if self.imu_predictor is not None:
+                    limit = int(getattr(Parameters, "kImuAidedRelocFailuresBeforeReinit",
+                                        getattr(Parameters, "kMaxRelocFailuresBeforeReinit", 0)))
+                else:
+                    limit = int(getattr(Parameters, "kMaxRelocFailuresBeforeReinit", 0))
                 if (limit > 0 and self.consecutive_reloc_failures >= limit
                         and depth is not None):
                     if self._reinitialize_from_depth(f_cur, img=img):
@@ -1503,7 +1563,18 @@ class Tracking:
             if self.need_new_keyframe():
                 self.create_new_keyframe(img=img)
         else:
-            self.state = SlamState.LOST
+            # Carry-through for any loss path not already handled above (notably the
+            # OK->fail transition frame): dead-reckon from the IMU so the MAIN
+            # trajectory stays continuous instead of leaving a gap/teleport.
+            if not imu_carried:
+                imu_prior = self._imu_prior_isometry(timestamp)
+                if imu_prior is not None:
+                    f_cur.update_pose(imu_prior)
+                    imu_carried = True
+                    self.total_imu_propagated_frames += 1
+            # IMU_PROPAGATED marks frames where vision failed but the IMU carried
+            # the pose forward (continuous trajectory); plain LOST is a true gap.
+            self.state = SlamState.IMU_PROPAGATED if imu_carried else SlamState.LOST
             self.motion_model.is_ok = False
 
         # Important: do not assign self.f_ref = f_cur here.

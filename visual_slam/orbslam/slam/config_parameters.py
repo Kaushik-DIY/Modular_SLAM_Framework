@@ -340,6 +340,11 @@ class Parameters:
     # instead of staying permanently dead. Only ever triggers in the already-LOST
     # state, so it cannot affect normally-tracking runs. Set <=0 to disable.
     kMaxRelocFailuresBeforeReinit = 30
+    # Loosely-coupled IMU-aided tracking only: recover faster (re-init from depth at
+    # the IMU-anchored pose) so feature-starved stretches don't stay LOST for ~30
+    # frames. Applies ONLY when an IMU predictor is attached; standalone runs keep
+    # the value above.
+    kImuAidedRelocFailuresBeforeReinit = 10
     kRelocalizationMaxReprojectionDistanceMapSearchCoarse = 10
     kRelocalizationMaxReprojectionDistanceMapSearchFine = 3
 

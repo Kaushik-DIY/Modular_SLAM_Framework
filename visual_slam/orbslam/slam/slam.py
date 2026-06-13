@@ -200,6 +200,11 @@ class Slam:
         except Exception:
             pass
 
+    def set_imu_predictor(self, predictor) -> None:
+        """Attach a loosely-coupled IMU pose predictor to the tracker (opt-in)."""
+        if self.tracking is not None:
+            self.tracking.set_imu_predictor(predictor)
+
     def track(
         self,
         img,

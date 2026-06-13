@@ -17,3 +17,7 @@ class SlamState(Enum):
     LOST = 3
     RELOCALIZE = 4
     INIT_RELOCALIZE = 5
+    # Visual tracking is lost but the pose is being carried forward by the IMU
+    # dead-reckoning predictor (loosely-coupled fallback). Distinct from LOST so
+    # logs/plots can tell IMU-propagated frames apart from true gaps.
+    IMU_PROPAGATED = 6

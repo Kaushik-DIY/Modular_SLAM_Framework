@@ -1,0 +1,21 @@
+{
+  "mode": "orb",
+  "frontend": "native",
+  "frames": 2466,
+  "keyframes": 440,
+  "proposals": 22,
+  "verified": 22,
+  "loops_accepted": 12,
+  "rehearsal_merges": 0,
+  "optimize_calls": 15,
+  "reinits": 284,
+  "elapsed_sec": 73.0,
+  "fps": 33.78,
+  "peak_rss_gb": 0.66,
+  "track_ms_mean": 14.7,
+  "verify_ms_mean": 2.8,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 210,
+  "map_payload_mb": 7.6
+}

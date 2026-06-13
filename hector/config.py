@@ -126,6 +126,12 @@ _COMMON: dict = dict(
     PGO_HISTORICAL_NODE_STRIDE = 3,    # stride when scanning historical nodes for candidates
     PGO_CHECK_EVERY_N_NODES   = 5,     # only run loop search on every Nth node (bounds cost)
     PGO_RECENT_SUBMAP_EXCLUSION = 0,   # exclude this many most-recent finished submaps from loop search
+    # Cap retrospective loop-search work spawned when a submap finishes. 0 = no cap
+    # (every historical node within the search radius is verified -> fine for tiny
+    # maps like lab_run_2, explodes on large multi-room maps). budget_per_tick
+    # bounds B&B verifies per node insertion.
+    PGO_MAX_CANDIDATE_NODES_PER_TARGET = 0,   # 0 = unbounded (legacy default)
+    PGO_FINISHED_SUBMAP_BUDGET_PER_TICK = 24, # max B&B loop verifies drained per node insertion
     PGO_CORRECTION_ALPHA      = 0.5,   # blend factor when writing optimized poses back online
 
     # --- Realtime-viz runtime defaults (overridable by CLI flags) ---
@@ -461,6 +467,35 @@ _PROFILES: dict = {
         PGO_DAMPING     = 1e-6,
     ),
 }
+
+# The hybrid dataset shares lab_run_2's physical LiDAR geometry and per-scan
+# front-end tuning (voxel filter, submap size); the dataset catalog supplies the
+# new CSV/IMU file paths. It DIFFERS in scale: lab_hybrid covers TWO rooms
+# (~14 x 10 m, ~86 m path, ~16 finished submaps) versus lab_run_2's single
+# ~8 x 6 m room (~2 finished submaps). The _COMMON PGO loop-search window
+# (7 m / 30 deg, checked every 5th node against up to 3 targets within 8 m) was
+# sized for that tiny room; on the larger map it makes the branch-and-bound loop
+# search explode (confirmed: scan_to_submap+PGO stalls ~scan 600, CPU-pinned in
+# branch_and_bound_backend._branch_and_bound). Right-size the loop search here so
+# it stays tractable while still tolerating the pre-loop drift (a few metres /
+# IMU-bounded heading error) seen before the first closure.
+_PROFILES["lab_hybrid"] = dict(
+    _PROFILES["lab_run_2"],
+    PGO_LOOP_SEARCH_XY         = 3.5,   # 7.0 -> 3.5 m: ~4x smaller coarse search area
+    PGO_LOOP_SEARCH_TH_DEG     = 15.0,  # 30 -> 15 deg: ~2x fewer angular perturbations (IMU yaw is reliable)
+    PGO_SPATIAL_SEARCH_RADIUS  = 6.0,   # 8.0 -> 6.0 m: fewer candidate submaps per new node
+    PGO_MAX_CANDIDATE_TARGETS  = 2,     # 3 -> 2: fewer B&B evaluations per node
+    PGO_HISTORICAL_NODE_STRIDE = 5,     # 3 -> 5: sparser historical-node scan
+    PGO_CHECK_EVERY_N_NODES    = 10,    # 5 -> 10: halve loop-search invocation frequency
+    # ROOT-CAUSE FIX for the scan-to-submap+PGO stall: the legacy default of 0
+    # (unbounded) queues EVERY historical node near a finished submap for B&B
+    # verification. On this two-room map that is dozens of expensive verifies per
+    # finished submap -> the pipeline freezes. Cap to the 6 closest historical
+    # nodes (the most likely true loop ends) and drain at most 8 B&B verifies per
+    # node insertion so loop-closure work is amortised instead of stalling.
+    PGO_MAX_CANDIDATE_NODES_PER_TARGET  = 6,
+    PGO_FINISHED_SUBMAP_BUDGET_PER_TICK = 8,
+)
 
 
 def _apply_profile(dataset_name: str) -> None:

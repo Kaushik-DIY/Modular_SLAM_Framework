@@ -21,6 +21,9 @@ DATASET_TYPE_TUM = "tum_rgbd"
 DATASET_TYPE_LAB = "lab_rgbd"
 DATASET_TYPE_AUTO = "auto"
 
+LAB_CAMERA_CONFIG_FILENAMES = ("camera.yaml", "sensor_config.yaml")
+LAB_ASSOCIATION_FILENAMES = ("associations.txt", "associations_rgbd.txt")
+
 TUM_CAMERA_PROFILES = {
     "tum_fr1": "rgbd_dataset_freiburg1",
     "tum_fr2": "rgbd_dataset_freiburg2",
@@ -105,10 +108,10 @@ def _tum_files_hint(dataset: Path) -> bool:
 
 def _lab_files_hint(dataset: Path) -> bool:
     return (
-        (dataset / "camera.yaml").exists()
+        any((dataset / filename).exists() for filename in LAB_CAMERA_CONFIG_FILENAMES)
         and (dataset / "rgb").is_dir()
         and (dataset / "depth").is_dir()
-        and (dataset / "associations.txt").exists()
+        and any((dataset / filename).exists() for filename in LAB_ASSOCIATION_FILENAMES)
     )
 
 
@@ -150,12 +153,14 @@ def resolve_lab_camera_config_path(dataset: str | Path, camera_config: str | Pat
             raise FileNotFoundError(f"Lab RGB-D camera config does not exist: {path}")
         return path
 
-    candidate = dataset / "camera.yaml"
-    if candidate.exists():
-        return candidate
+    for filename in LAB_CAMERA_CONFIG_FILENAMES:
+        candidate = dataset / filename
+        if candidate.exists():
+            return candidate
 
     raise FileNotFoundError(
-        f"Lab RGB-D dataset requires camera.yaml or --camera-config. Missing: {candidate}"
+        "Lab RGB-D dataset requires camera.yaml, sensor_config.yaml, or "
+        f"--camera-config. Checked: {', '.join(str(dataset / filename) for filename in LAB_CAMERA_CONFIG_FILENAMES)}"
     )
 
 
@@ -172,11 +177,18 @@ def load_lab_camera_config(camera_config: str | Path) -> dict:
         fy = float(flat["camera.fy"])
         cx = float(flat["camera.cx"])
         cy = float(flat["camera.cy"])
-        width = int(flat.get("image.width", 640))
-        height = int(flat.get("image.height", 480))
-        fps = float(flat.get("image.fps", 30.0))
-        distortion = list(flat.get("camera.distortion", [0.0, 0.0, 0.0, 0.0, 0.0]))
-        depth_map_factor = float(flat.get("depth.depth_map_factor", 1000.0))
+        width = int(flat.get("image.width", flat.get("camera.width", 640)))
+        height = int(flat.get("image.height", flat.get("camera.height", 480)))
+        fps = float(flat.get("image.fps", flat.get("camera.fps", 30.0)))
+        distortion = list(
+            flat.get(
+                "camera.distortion",
+                flat.get("camera.distortion_coefficients", [0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+        )
+        depth_map_factor = float(
+            flat.get("depth.depth_map_factor", flat.get("camera.depth_map_factor", 1000.0))
+        )
         has_depth_threshold = "depth.depth_threshold" in flat
         has_baseline = "depth.baseline_m" in flat
         depth_threshold = float(flat.get("depth.depth_threshold", 40.0))
@@ -336,7 +348,13 @@ def load_rgbd_associations(
 ) -> list[TumRgbdFrame]:
     dataset = Path(dataset).expanduser().resolve()
     if associations is None:
-        return load_tum_rgbd_associations(dataset)
+        for filename in LAB_ASSOCIATION_FILENAMES:
+            candidate = dataset / filename
+            if candidate.exists():
+                associations = candidate
+                break
+        else:
+            return load_tum_rgbd_associations(dataset)
 
     associations_path = Path(associations).expanduser().resolve()
     if not associations_path.exists():
@@ -349,16 +367,25 @@ def load_rgbd_associations(
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) < 4:
+            if len(parts) >= 4:
+                timestamp = float(parts[0])
+                rgb_rel = parts[1]
+                depth_rel = parts[3]
+            elif len(parts) >= 3:
+                timestamp = float(parts[0])
+                rgb_rel = parts[1]
+                depth_rel = parts[2]
+            else:
                 raise ValueError(
                     f"Invalid associations line in {associations_path}: '{line}'. "
-                    "Expected: rgb_timestamp rgb/file depth_timestamp depth/file"
+                    "Expected: rgb_timestamp rgb/file depth_timestamp depth/file "
+                    "or timestamp rgb/file depth/file"
                 )
             frames.append(
                 TumRgbdFrame(
-                    timestamp=float(parts[0]),
-                    rgb_path=dataset / parts[1],
-                    depth_path=dataset / parts[3],
+                    timestamp=timestamp,
+                    rgb_path=dataset / rgb_rel,
+                    depth_path=dataset / depth_rel,
                 )
             )
     return frames
