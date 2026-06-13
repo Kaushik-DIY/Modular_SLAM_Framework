@@ -259,3 +259,38 @@ RSS < 1 GB, faster than sensor rate. Montages + REPORT.md in the run folder.
   are unit-proven verbatim (grids bit-identical). s2s is exact end-to-end.
 
 **FUSION LAYER IMPLEMENTATION COMPLETE.** Remaining work = fine-tuning only.
+
+## V5 — real-time module-switching runner (live viz + stable handoff, 2026-06-13)
+
+Separate experimental runner `slam_core/fusion2/run_realtime.py` (entry
+`run_fusion_realtime.py`) beside the untouched batch `runner.py` — mirrors how
+`hector/run_realtime_viz.py` sits beside `run_local_slam_new.py`. Replays at real
+sensor cadence with a LIVE trajectory + accumulating scan cloud; switch modules LIVE
+on stdin while the SAME shared C++ map keeps mapping; fused occupancy at the end.
+
+**Switchability spec (3 independent axes; the 4 modes are presets):**
+| Axis | Live options | Switchable | Mechanism |
+|---|---|---|---|
+| A1 front-end | native_s2s ⇄ native_s2m | **Yes (same-sensor)** | grace-buffer handoff (old FE drives graph while new FE warms up N=15 scans, then flips; new FE fresh-from-origin, baseline reset to its pose → no jump) |
+| A2 proposer | proximity ⇄ dbow | **Yes** (dbow needs `--attach-visual`) | proximity reads graph poses; dbow reads the incrementally-built AppearanceIndex |
+| A3 verifier | bnb ⇄ icp ⇄ pnp | **Yes**, payload-gated | stateless per-candidate against candidate-local neighbourhood; pnp needs visual |
+
+**Out of scope (rejected live, with reason):** cross-sensor visual⇄LiDAR FE (Phase 2 —
+the two sensors run different stream rates with no merged timeline); memory-tier caps
+(mid-run rebalancing destabilizes); grid resolution / map frame / calibration / sync
+tolerance (storage constants — changing invalidates stored scans); sub-keyframe FE state
+transfer (impossible — switch is always a clean handoff); verifier onto a payload-less
+keyframe (silently skipped); graph backend (only g2o); retroactive re-verification (future
+proposals only).
+
+**Payload policy:** lean default (LiDAR keyframes = scan only → verifier {bnb,icp}); opt-in
+`--attach-visual` adds ORB (~78 KB/KF) → {bnb,icp,pnp} + dbow. Visual-FE runs carry both for
+free. Long-run RAM grows linearly (LTM in-RAM) → SQLite LTM offload is the lever.
+
+**Phases (all DONE):** V5.0 factored `render_fused_occupancy` (shared by both runners,
+batch output byte-identical) · V5.1 skeleton + IngestEngine (**bit-identical parity** vs batch:
+bnb 31 / icp 6 loops on small, 0.00 mm/kf) · V5.2 live verifier+proposer switch + available-set
+guards · V5.3 live s2s⇄s2m grace handoff (mid-run flip step 8.2 cm < 24 cm median = no teleport)
+· V5.4 guards + `run_fusion_realtime.py` + `tests/fusion2/test_v5_realtime_switch.py` (3 tests).
+Real-time: 11.5 ms/scan FE + 1.2 ms/scan loop on the dev machine (≪ 104 ms LiDAR period).
+**Phase 2 (deferred):** cross-sensor VO⇄LiDAR live switch via a unified multi-sensor driver.

@@ -244,6 +244,47 @@ def _anchor_poses(poses: np.ndarray) -> np.ndarray:
     return out
 
 
+def render_fused_occupancy(render_sigs, render_poses, traj_xyt, grid_cfg, out_png,
+                           title, npy_path=None, meta_path=None):
+    """Fuse the given signatures' scans (at their optimized poses) into ONE
+    log-odds occupancy grid (C++ assemble_local_grid) and render it grayscale
+    with the trajectory overlay. Shared by the batch runner (write_outputs) and
+    the real-time runner (V5) so the map convention is identical. `traj_xyt` is
+    an (N,3) x/y/theta array for the blue path + start/end markers. Returns
+    (prob, extent) or (None, None) if there is nothing with scans to render."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    if not render_sigs:
+        return None, None
+    grid = fc.assemble_local_grid(render_sigs, render_poses, grid_cfg)
+    prob = np.asarray(grid.probability())
+    extent = [grid.origin_x, grid.origin_x + grid.width * grid.resolution,
+              grid.origin_y, grid.origin_y + grid.height * grid.resolution]
+    if npy_path is not None:
+        np.save(npy_path, prob)
+    if meta_path is not None:
+        with open(meta_path, "w") as f:
+            json.dump(dict(origin_x=grid.origin_x, origin_y=grid.origin_y,
+                           resolution=grid.resolution, width=grid.width,
+                           height=grid.height, extent=extent), f, indent=2)
+    traj = np.asarray(traj_xyt, dtype=float)
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.imshow(prob, cmap="gray_r", vmin=0.0, vmax=1.0, origin="lower",
+              extent=extent, interpolation="nearest")
+    if len(traj):
+        ax.plot(traj[:, 0], traj[:, 1], "-", lw=1.0, color="tab:blue", alpha=0.9)
+        ax.scatter(traj[0, 0], traj[0, 1], c="g", s=50, zorder=5, label="start")
+        ax.scatter(traj[-1, 0], traj[-1, 1], c="r", s=50, zorder=5, label="end")
+    ax.set_title(title)
+    ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+    ax.grid(alpha=0.15); ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+    return prob, extent
+
+
 def write_outputs(shared: SharedMap, cfg: FusionV2Config, run_dir: Path,
                   kf_stamps: dict, stats: dict,
                   skip_scan_ids: Optional[set] = None) -> None:
@@ -281,29 +322,10 @@ def write_outputs(shared: SharedMap, cfg: FusionV2Config, run_dir: Path,
     # Primary output: FUSED log-odds occupancy grid (V4.2, thesis-grade).
     # Reuses the same C++ integration the B&B verifier trusts; overlapping
     # observations reinforce walls instead of smearing as a scatter band.
-    if render_sigs:
-        grid = fc.assemble_local_grid(render_sigs, render_poses, shared.grid_cfg)
-        prob = np.asarray(grid.probability())
-        extent = [grid.origin_x, grid.origin_x + grid.width * grid.resolution,
-                  grid.origin_y, grid.origin_y + grid.height * grid.resolution]
-        np.save(run_dir / "map.npy", prob)
-        with open(run_dir / "map_meta.json", "w") as f:
-            json.dump(dict(origin_x=grid.origin_x, origin_y=grid.origin_y,
-                           resolution=grid.resolution, width=grid.width,
-                           height=grid.height, extent=extent), f, indent=2)
-
-        fig, ax = plt.subplots(figsize=(12, 8))
-        ax.imshow(prob, cmap="gray_r", vmin=0.0, vmax=1.0, origin="lower",
-                  extent=extent, interpolation="nearest")
-        ax.plot(poses[:, 1], poses[:, 2], "-", lw=1.0, color="tab:blue", alpha=0.9)
-        ax.scatter(poses[0, 1], poses[0, 2], c="g", s=50, zorder=5, label="start")
-        ax.scatter(poses[-1, 1], poses[-1, 2], c="r", s=50, zorder=5, label="end")
-        ax.set_title(title)
-        ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
-        ax.grid(alpha=0.15); ax.legend()
-        fig.tight_layout()
-        fig.savefig(run_dir / "occupancy.png", dpi=200)
-        plt.close(fig)
+    render_fused_occupancy(
+        render_sigs, render_poses, poses[:, 1:4] if len(poses) else np.zeros((0, 3)),
+        shared.grid_cfg, run_dir / "occupancy.png", title,
+        npy_path=run_dir / "map.npy", meta_path=run_dir / "map_meta.json")
 
     # Secondary debug output: raw scan scatter (the pre-V4.2 rendering).
     fig, ax = plt.subplots(figsize=(12, 7))
