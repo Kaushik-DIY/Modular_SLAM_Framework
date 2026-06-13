@@ -1,11 +1,12 @@
 """V5 — real-time module-switching runner: stability across live switches.
 
-Drives the shared IngestEngine + FrontEndManager in-process over lab_hybrid_small
-with a mid-run verifier switch and a mid-run LiDAR front-end switch (s2s<->s2m),
-asserting the run never crashes, the shared-map tiers stay bounded, loops keep
-closing, the front-end handoff introduces no teleport, and the final fused
-occupancy map is non-empty. (The stdin/live-viz/pacing layer is a thin shell
-over these objects; this exercises the substantive switching machinery.)
+Drives the shared IngestEngine + LidarFEAdapter (FrontEndManager) in-process over
+lab_hybrid_small with a mid-run verifier switch and a mid-run LiDAR front-end
+switch (s2s<->s2m), asserting the run never crashes, the shared-map tiers stay
+bounded, loops keep closing, the front-end handoff introduces no teleport, and
+the final fused occupancy map is non-empty. (The stdin/live-viz/pacing layer is a
+thin shell over these objects; this exercises the substantive switching
+machinery.)
 """
 import math
 from pathlib import Path
@@ -18,7 +19,6 @@ fusion_core = pytest.importorskip("fusion_core")
 import slam_core.fusion2.run_realtime as R
 from slam_core.fusion2.config import FusionV2Config
 from slam_core.fusion2.dataset import LabHybridStream
-from slam_core.fusion2.lidar_frontend import make_lidar_frontend
 from slam_core.fusion2.runner import build_shared_map
 
 _DS = Path("datasets/lab_hybrid_small")
@@ -30,20 +30,17 @@ def _drive(verifier_switch_at=None, fe_switch_at=None, max_scans=0,
     cfg = FusionV2Config(mode="lidar", dataset=_DS, lidar_frontend="native_s2s",
                          scan_verifier="bnb")
     stream = LabHybridStream(cfg.dataset, cfg.sync_tolerance_s)
-    imu = str(cfg.dataset / "imu.csv")
     K = None
     if attach_visual:
         import yaml
         sc = yaml.safe_load(open(cfg.dataset / "sensor_config.yaml"))["camera"]
         K = np.array([[sc["fx"], 0, sc["cx"]], [0, sc["fy"], sc["cy"]], [0, 0, 1]])
 
-    mk = lambda kind: make_lidar_frontend(
-        kind, dataset_name="lab_hybrid", imu_path=imu,
-        kf_min_dist_m=cfg.kf_min_dist_m, kf_min_angle_rad=cfg.kf_min_angle_rad,
-        kf_min_dt_s=cfg.kf_min_dt_s)
-    fem = R.FrontEndManager(mk, "native_s2s", grace_scans=15)
+    adapter = R.LidarFEAdapter(cfg, stream, K, attach_visual, "native_s2s",
+                               grace_scans=15)
     shared = build_shared_map(cfg)
     eng = R.IngestEngine(shared, cfg, K=K, verifier="bnb", proposer="proximity")
+    eng.set_active_sensor("lidar")
 
     loops_before_fe_switch = None
     fe_handoff_step = None
@@ -55,27 +52,25 @@ def _drive(verifier_switch_at=None, fe_switch_at=None, max_scans=0,
         if verifier_switch_at is not None and kf == verifier_switch_at \
                 and eng.verifier == "bnb":
             eng.verifier = "icp"
-        if fe_switch_at is not None and kf == fe_switch_at and fem.pending is None \
-                and fem.active_kind == "native_s2s":
+        if fe_switch_at is not None and kf == fe_switch_at \
+                and adapter.fem.pending is None \
+                and adapter.fem.active_kind == "native_s2s":
             loops_before_fe_switch = eng.stats["loops_accepted"]
-            fem.request_switch("native_s2m")
+            adapter.fem.request_switch("native_s2m")
 
-        fe_pose_py, pts, is_kf, flip = fem.process(t, scan)
+        kfd, flip = adapter.feed(("lidar", t, scan))
         if flip is not None:
-            eng.last_fe_pose = flip
             pending_handoff = True
-        if is_kf:
-            fe_pose = fusion_core.Pose2(float(fe_pose_py.x), float(fe_pose_py.y),
-                                        float(fe_pose_py.theta))
-            kf_id, node_pose, sig = eng.ingest(t, fe_pose, scan)
-            eng.close_loops(kf_id, node_pose, sig, scan)
+        if kfd is not None:
+            kf_id, node_pose, sig = eng.ingest(kfd)
+            eng.close_loops(kf_id, node_pose, sig, np.asarray(kfd.raw_scan))
             gp = shared.graph.get_pose(kf_id)
             if pending_handoff and kf_xy:
                 fe_handoff_step = math.hypot(gp.x - kf_xy[-1][0], gp.y - kf_xy[-1][1])
                 pending_handoff = False
             kf_xy.append((gp.x, gp.y))
     shared.graph.optimize()
-    return shared, eng, fem, np.array(kf_xy), loops_before_fe_switch, fe_handoff_step
+    return shared, eng, adapter, np.array(kf_xy), loops_before_fe_switch, fe_handoff_step
 
 
 @needs_ds
@@ -83,7 +78,6 @@ def test_realtime_parity_no_switch():
     """No-switch in-process drive must match the batch lidar/native_s2s/bnb run
     (same ingest path) — bit-identical keyframe poses."""
     shared, eng, _, kf_xy, _, _ = _drive()
-    # batch reference produced 159 kf / 31 loops on this dataset
     assert eng.stats["keyframes"] == len(kf_xy)
     assert eng.stats["loops_accepted"] >= 1
     assert shared.memory.stm_count() <= 30
@@ -92,11 +86,11 @@ def test_realtime_parity_no_switch():
 
 @needs_ds
 def test_live_verifier_and_fe_switch_stable():
-    shared, eng, fem, kf_xy, loops_before, handoff_step = _drive(
+    shared, eng, adapter, kf_xy, loops_before, handoff_step = _drive(
         verifier_switch_at=40, fe_switch_at=80)
 
     # the run completed and switched
-    assert fem.active_kind == "native_s2m", "front-end switch did not take effect"
+    assert adapter.fem.active_kind == "native_s2m", "front-end switch did not take effect"
     assert eng.verifier == "icp", "verifier switch did not take effect"
 
     # shared map stayed bounded across both switches
