@@ -43,7 +43,7 @@ from slam_core.fusion2.config import FusionV2Config
 from slam_core.fusion2.dataset import LabHybridStream
 from slam_core.fusion2.lidar_frontend import make_lidar_frontend
 from slam_core.fusion2.runner import (_rel, _rel_sane, build_shared_map,
-                                      propose_candidates, render_fused_occupancy,
+                                      propose_candidates,
                                       verify_candidate_bnb, verify_candidate_icp)
 
 
@@ -200,11 +200,18 @@ class IngestEngine:
                     shared.memory.on_loop_confirmed(kf_id, cand)
                     self.stats["loops_accepted"] += 1
                     any_loop = True
-        if kf_id > 0 and kf_id % cfg.optimize_every_n_kf == 0:
+        # Online SLAM: optimize IMMEDIATELY on an accepted loop (so the robot's
+        # corrected localization is available at the moment of closure), as well
+        # as on the periodic cadence. The expensive fused-map render stays at the
+        # end; only the cheap pose-graph solve runs live. Returns True if the
+        # graph was re-optimized this keyframe (-> caller refreshes the display).
+        did_opt = False
+        if (any_loop and kf_id > 0) or (kf_id > 0 and kf_id % cfg.optimize_every_n_kf == 0):
             shared.graph.optimize()
             self.stats["optimize_calls"] += 1
             self.last_graph_pose = shared.graph.get_pose(kf_id)
-        return any_loop
+            did_opt = True
+        return did_opt
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +429,7 @@ def main(argv=None):
     timer = StageTimer()
 
     xs, ys, cloud_chunks = [], [], []
+    kf_ids, kf_scans = [], []     # for live re-projection on loop correction
     t0_data = t0_wall = None
     lag = 0.0
     quit_req = False
@@ -456,14 +464,22 @@ def main(argv=None):
                 visual = _extract_visual(stream, t, K)
             t_b = time.perf_counter()
             kf_id, node_pose, sig = eng.ingest(t, fe_pose, scan, visual=visual)
-            eng.close_loops(kf_id, node_pose, sig, scan)
+            did_opt = eng.close_loops(kf_id, node_pose, sig, scan)
             timer.add("loop", time.perf_counter() - t_b)
-            # use the (possibly loop-corrected) graph pose for display
-            gp = shared.graph.get_pose(kf_id)
-            xs.append(gp.x); ys.append(gp.y)
-            c, s = math.cos(gp.theta), math.sin(gp.theta)
-            cloud_chunks.append(np.asarray(scan, np.float64) @ np.array([[c, -s], [s, c]]).T
-                                + [gp.x, gp.y])
+            kf_ids.append(kf_id)
+            kf_scans.append(np.asarray(scan, np.float64))
+            if did_opt:
+                # LOOP CORRECTION applied live: the graph just re-optimized, so
+                # every past pose may have shifted. Rebuild the WHOLE displayed
+                # trajectory + cloud from the corrected graph (the robot's
+                # localization snaps to the corrected estimate immediately).
+                xs, ys, cloud_chunks = _rebuild_display(shared, kf_ids, kf_scans)
+            else:
+                gp = shared.graph.get_pose(kf_id)
+                xs.append(gp.x); ys.append(gp.y)
+                c, s = math.cos(gp.theta), math.sin(gp.theta)
+                cloud_chunks.append(np.asarray(scan, np.float64)
+                                    @ np.array([[c, -s], [s, c]]).T + [gp.x, gp.y])
 
         # live draw (throttled)
         t_c = time.perf_counter()
@@ -499,12 +515,11 @@ def main(argv=None):
                   f"loops={eng.stats['loops_accepted']:3d} v={eng.verifier} "
                   f"p={eng.proposer} fe={cfg.lidar_frontend} lag={lag:6.3f}s")
 
-    # final optimize + outputs
+    # final optimize + outputs (+ auto-display the corrected fused map)
     shared.graph.optimize()
     eng.stats["optimize_calls"] += 1
     timer.summary(lag)
-    _write_final(shared, cfg, eng, args)
-    live.keep_open()
+    _finalize_and_show(shared, cfg, eng, args, live)
 
 
 # ---- helpers --------------------------------------------------------------
@@ -598,7 +613,24 @@ def _apply_switches(q, eng, fem, attach_visual, k) -> bool:
               "Try: verifier bnb|icp|pnp · proposer proximity|dbow · status · quit")
 
 
-def _write_final(shared, cfg, eng, args):
+def _rebuild_display(shared, kf_ids, kf_scans):
+    """Re-read every keyframe pose from the (just-optimized) graph and re-project
+    its scan, so the live trajectory + cloud reflect the loop correction at once.
+    Cheap (poses + a numpy transform); runs only on optimize events."""
+    xs, ys, chunks = [], [], []
+    for kfid, scan in zip(kf_ids, kf_scans):
+        gp = shared.graph.get_pose(kfid)
+        xs.append(gp.x); ys.append(gp.y)
+        c, s = math.cos(gp.theta), math.sin(gp.theta)
+        chunks.append(scan @ np.array([[c, -s], [s, c]]).T + [gp.x, gp.y])
+    return xs, ys, chunks
+
+
+def _finalize_and_show(shared, cfg, eng, args, live):
+    """Write outputs and DISPLAY the final corrected fused map directly (no
+    second command). Uses the live interactive backend when available, else Agg."""
+    import json
+
     from slam_core.fusion2.runner import _anchor_poses
     run_dir = Path(args.output) / f"realtime_{cfg.mode}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -608,24 +640,63 @@ def _write_final(shared, cfg, eng, args):
             t = eng.kf_stamps.get(int(nid), float(nid))
             qz, qw = math.sin(th / 2.0), math.cos(th / 2.0)
             f.write(f"{t:.6f} {x:.6f} {y:.6f} 0.0 0.0 0.0 {qz:.9f} {qw:.9f}\n")
-    if not args.no_map and len(poses):
-        rs, rp = [], []
-        for nid, x, y, th in poses:
-            sig = shared.memory.get(int(nid))
-            if sig is not None and sig.has_scan:
-                rs.append(sig); rp.append(fc.Pose2(float(x), float(y), float(th)))
-        title = (f"realtime {cfg.mode}/{cfg.lidar_frontend}: {len(poses)} kf, "
-                 f"{eng.stats['loops_accepted']} loops")
-        render_fused_occupancy(rs, rp, poses[:, 1:4], shared.grid_cfg,
-                               run_dir / "occupancy.png", title,
-                               npy_path=run_dir / "map.npy",
-                               meta_path=run_dir / "map_meta.json")
-    import json
     with open(run_dir / "run_summary.json", "w") as f:
         json.dump(dict(mode=cfg.mode, frontend=cfg.lidar_frontend,
                        final_verifier=eng.verifier, final_proposer=eng.proposer,
                        **eng.stats), f, indent=2, default=str)
+
+    if args.no_map or not len(poses):
+        print(f"\nWrote: {run_dir}")
+        if live.ok:
+            live.keep_open()
+        return
+
+    # fuse all scans at the FINAL corrected poses into one occupancy grid
+    rs, rp = [], []
+    for nid, x, y, th in poses:
+        sig = shared.memory.get(int(nid))
+        if sig is not None and sig.has_scan:
+            rs.append(sig); rp.append(fc.Pose2(float(x), float(y), float(th)))
+    if not rs:
+        print(f"\nWrote: {run_dir}")
+        return
+    grid = fc.assemble_local_grid(rs, rp, shared.grid_cfg)
+    prob = np.asarray(grid.probability())
+    extent = [grid.origin_x, grid.origin_x + grid.width * grid.resolution,
+              grid.origin_y, grid.origin_y + grid.height * grid.resolution]
+    np.save(run_dir / "map.npy", prob)
+    with open(run_dir / "map_meta.json", "w") as f:
+        json.dump(dict(origin_x=grid.origin_x, origin_y=grid.origin_y,
+                       resolution=grid.resolution, width=grid.width,
+                       height=grid.height, extent=extent), f, indent=2)
+
+    # render on the live interactive backend if present (so it can be SHOWN),
+    # else Agg (headless: save only).
+    import matplotlib
+    if not live.ok:
+        matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    if live.ok and live.fig is not None:
+        plt.close(live.fig)                 # replace the live trajectory window
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.imshow(prob, cmap="gray_r", vmin=0.0, vmax=1.0, origin="lower",
+              extent=extent, interpolation="nearest")
+    ax.plot(poses[:, 1], poses[:, 2], "-", lw=1.0, color="tab:blue", alpha=0.9)
+    ax.scatter(poses[0, 1], poses[0, 2], c="g", s=50, zorder=5, label="start")
+    ax.scatter(poses[-1, 1], poses[-1, 2], c="r", s=50, zorder=5, label="end")
+    ax.set_title(f"realtime {cfg.mode}/{cfg.lidar_frontend} — final corrected map: "
+                 f"{len(poses)} kf, {eng.stats['loops_accepted']} loops")
+    ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+    ax.grid(alpha=0.15); ax.legend()
+    fig.tight_layout()
+    fig.savefig(run_dir / "occupancy.png", dpi=200)
     print(f"\nWrote: {run_dir}")
+    if live.ok:
+        print("[viz] showing final corrected map — close the window to exit.")
+        live._plt.ioff()
+        live._plt.show(block=True)
+    else:
+        plt.close(fig)
 
 
 if __name__ == "__main__":

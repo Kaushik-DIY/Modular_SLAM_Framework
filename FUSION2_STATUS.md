@@ -293,4 +293,6 @@ bnb 31 / icp 6 loops on small, 0.00 mm/kf) · V5.2 live verifier+proposer switch
 guards · V5.3 live s2s⇄s2m grace handoff (mid-run flip step 8.2 cm < 24 cm median = no teleport)
 · V5.4 guards + `run_fusion_realtime.py` + `tests/fusion2/test_v5_realtime_switch.py` (3 tests).
 Real-time: 11.5 ms/scan FE + 1.2 ms/scan loop on the dev machine (≪ 104 ms LiDAR period).
+**Online-SLAM behaviour (V5.5):** loop closures optimize the graph IMMEDIATELY (not just periodically) and the LIVE trajectory + cloud snap to the corrected poses at the moment of closure (robot localization corrected on the run); the high-res fused occupancy is still rendered once at the end and now AUTO-DISPLAYS when the run finishes (no second command).
+
 **Phase 2 (deferred):** cross-sensor VO⇄LiDAR live switch via a unified multi-sensor driver.
