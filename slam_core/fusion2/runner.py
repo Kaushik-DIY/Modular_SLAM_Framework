@@ -458,7 +458,7 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
                 t0 = time.perf_counter()
                 accepted = False
                 rel = None
-                row = dict(query=kf_id, cand=cand)
+                row = dict(query=kf_id, cand=cand, rx=None, ry=None, rth=None)
                 if visual_backend:
                     cand_sig = shared.memory.get(cand)
                     if (cand_sig is None or not cand_sig.has_visual
@@ -519,6 +519,10 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
                 row["accepted"] = accepted
                 verify_log.append(row)
                 if accepted and rel is not None:
+                    # measured loop transform (cand->query), for offline true/false
+                    # loop analysis (tools/analyze_fusion_loops.py)
+                    row.update(rx=round(rel.x, 4), ry=round(rel.y, 4),
+                               rth=round(rel.theta, 5))
                     shared.graph.add_loop_edge(cand, kf_id, rel,
                                                cfg.loop_trans_weight,
                                                cfg.loop_rot_weight)
@@ -658,7 +662,7 @@ def run_orb_mode(cfg: FusionV2Config) -> dict:
             t0 = time.perf_counter()
             accepted = False
             rel_lp = None
-            row = dict(query=kf_id, cand=cand)
+            row = dict(query=kf_id, cand=cand, rx=None, ry=None, rth=None)
             if scan_backend:
                 if sig.has_scan:
                     r = (verify_candidate_icp if cfg.scan_verifier == "icp"
@@ -719,6 +723,8 @@ def run_orb_mode(cfg: FusionV2Config) -> dict:
                                            cfg.loop_rot_weight)
                 sig.add_link(cand, fc.LinkType.LOOP, rel_lp,
                              cfg.loop_trans_weight, cfg.loop_rot_weight)
+                row.update(rx=round(rel_lp.x, 4), ry=round(rel_lp.y, 4),
+                           rth=round(rel_lp.theta, 5))
                 shared.memory.on_loop_confirmed(kf_id, cand)
                 stats["loops_accepted"] += 1
 
@@ -863,7 +869,8 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
             t0 = time.perf_counter()
             accepted = False
             rel_lp = None
-            row = dict(query=kf_id, cand=cand, dbow=round(dbow_score, 4))
+            row = dict(query=kf_id, cand=cand, dbow=round(dbow_score, 4),
+                       rx=None, ry=None, rth=None)
             if scan_backend:
                 if sig.has_scan:
                     # Standalone ICP (RTAB-style): seeded only by the graph
@@ -931,6 +938,8 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
                                            cfg.loop_trans_weight, cfg.loop_rot_weight)
                 sig.add_link(cand, fc.LinkType.LOOP, rel_lp,
                              cfg.loop_trans_weight, cfg.loop_rot_weight)
+                row.update(rx=round(rel_lp.x, 4), ry=round(rel_lp.y, 4),
+                           rth=round(rel_lp.theta, 5))
                 shared.memory.on_loop_confirmed(kf_id, cand)
                 stats["loops_accepted"] += 1
                 any_loop_this_kf = True
