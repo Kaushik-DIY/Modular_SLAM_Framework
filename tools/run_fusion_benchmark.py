@@ -129,10 +129,16 @@ def main():
     ap.add_argument("--combos", nargs="+", default=None,
                     help="subset of combo ids (default: all 9)")
     ap.add_argument("--output", type=Path, default=Path("fusion2_outputs"))
+    ap.add_argument("--into", type=Path, default=None,
+                    help="re-run --combos into an EXISTING benchmark folder and "
+                         "rebuild the report from all runs on disk (no new folder)")
     a = ap.parse_args()
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out_root = a.output / f"benchmark_{stamp}"
+    if a.into is not None:
+        out_root = a.into
+    else:
+        out_root = a.output / f"benchmark_{stamp}"
     out_root.mkdir(parents=True, exist_ok=True)
     combos = [c for c in MATRIX if a.combos is None or c[0] in a.combos]
 
@@ -140,20 +146,30 @@ def main():
                             capture_output=True, text=True).stdout.strip()
     print(f"benchmark -> {out_root}  (commit {commit})", flush=True)
 
-    all_rows = []
     for map_name in a.maps:
         for combo, mode, ov in combos:
             print(f"\n{'='*64}\n  [{map_name}] {combo}\n{'='*64}", flush=True)
             try:
                 row = _run_one(map_name, combo, mode, ov, out_root)
-                all_rows.append(row)
                 print(f"  -> loops {row['loops_accepted']} "
                       f"(true {row.get('true_accepted')}/{row.get('false_accepted')} false), "
                       f"precision {row.get('precision')}, drift {row.get('end_start_drift_m')} m, "
                       f"sharp {row.get('map_sharpness')}, rss {row.get('peak_rss_gb')} GB", flush=True)
             except Exception as e:
                 print(f"  FAILED: {e}\n{traceback.format_exc()}", flush=True)
-                all_rows.append(dict(map=map_name, combo=combo, mode=mode, error=str(e)))
+
+    # gather ALL runs present on disk (re-run + pre-existing), in matrix order, so
+    # an --into update rebuilds the report over the full folder.
+    order = {c[0]: i for i, c in enumerate(MATRIX)}
+    all_rows = []
+    for map_name in a.maps:
+        rows_m = []
+        for d in (out_root / map_name).glob("*"):
+            mj = d / "benchmark_metrics.json"
+            if mj.exists():
+                rows_m.append(json.loads(mj.read_text()))
+        rows_m.sort(key=lambda r: order.get(r.get("combo"), 99))
+        all_rows.extend(rows_m)
 
     # ---- metrics.csv ----
     import csv as _csv
@@ -191,7 +207,9 @@ def main():
                 "\n\n### Cost & health\n", _table(mrows, cost_cols), "\n"]
     # cross-map: precision + drift + sharpness side by side
     rep += ["\n## Cross-map summary (precision / drift / sharpness)\n"]
-    combos_seen = [c[0] for c in combos]
+    order = {c[0]: i for i, c in enumerate(MATRIX)}
+    combos_seen = sorted({r["combo"] for r in all_rows if "combo" in r},
+                         key=lambda c: order.get(c, 99))
     cross = []
     for cid in combos_seen:
         row = {"combo": cid}
@@ -218,12 +236,13 @@ def main():
             f"- outputs: metrics.csv, BENCHMARK_REPORT.md, montages, per-run loop_labels.csv\n"]
     (out_root / "RUN_NOTE.md").write_text("\n".join(note) + "\n")
 
-    # ---- index pointer ----
-    idx = a.output / "INDEX.md"
-    line = f"- [benchmark_{stamp}](benchmark_{stamp}/BENCHMARK_REPORT.md) — " \
-           f"{len(combos_seen)} combos x {len(a.maps)} maps, GT-free method comparison\n"
-    with open(idx, "a") as f:
-        f.write(line)
+    # ---- index pointer (fresh runs only) ----
+    if a.into is None:
+        idx = a.output / "INDEX.md"
+        line = f"- [benchmark_{stamp}](benchmark_{stamp}/BENCHMARK_REPORT.md) — " \
+               f"{len(combos_seen)} combos x {len(a.maps)} maps, GT-free method comparison\n"
+        with open(idx, "a") as f:
+            f.write(line)
 
     print(f"\nDONE -> {out_root}/BENCHMARK_REPORT.md  ({len(all_rows)} runs)")
 

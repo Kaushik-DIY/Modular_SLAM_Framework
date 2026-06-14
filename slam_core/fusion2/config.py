@@ -102,6 +102,15 @@ class FusionV2Config:
 
     # --- native VO front-end ---
     vo_depth_max: float = 4.0              # depth-point cap (m); was hardcoded
+    # VoConfig tracking/KF/BA knobs. Default widens the projection-match radius:
+    # tuned 2026-06-14, the 7 px default missed correspondences when the
+    # constant-velocity prediction is off on fast turns (the rotation-pathological
+    # failure that smeared the small-map orb map). 10 px / 22 px fallback cut
+    # end-start drift small 1.22->0.05 m, large 1.83->0.67 m, sharper maps + fewer
+    # reinits on BOTH maps. (radius12 / +patience regressed; see git log.)
+    vo_overrides: dict = field(
+        default_factory=lambda: {"match_radius_px": 10.0,
+                                 "match_radius_fallback_px": 22.0})
 
     # --- soft sync (RGB-D <-> LiDAR) ---
     sync_tolerance_s: float = 0.05

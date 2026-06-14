@@ -385,7 +385,8 @@ class VoFEAdapter:
         self.fe = NativeOrbFrontend(cfg.dataset,
                                     imu_path=str(Path(cfg.dataset) / "imu.csv"),
                                     depth_max=cfg.vo_depth_max,
-                                    imu_dropout=cfg.vo_imu_dropout)
+                                    imu_dropout=cfg.vo_imu_dropout,
+                                    vo_overrides=cfg.vo_overrides)
         self.K = self.fe.K
         self.reinits = 0
         self.variant = "visual_vo"

@@ -51,7 +51,7 @@ def _rot_about_axis(u: np.ndarray, angle: float) -> np.ndarray:
 class NativeOrbFrontend:
     def __init__(self, dataset: Path, imu_path: Optional[str] = None,
                  n_features: int = 2000, depth_max: float = 4.0,
-                 imu_dropout: bool = True):
+                 imu_dropout: bool = True, vo_overrides: Optional[dict] = None):
         sc = yaml.safe_load(open(Path(dataset) / "sensor_config.yaml"))["camera"]
         cfg = fc.VoConfig()
         cfg.fx, cfg.fy = float(sc["fx"]), float(sc["fy"])
@@ -61,6 +61,11 @@ class NativeOrbFrontend:
         # 8cm baseline and th=40 => ~3.2 m; allow a little more for the lab.
         cfg.depth_max = float(depth_max)
         cfg.n_features = int(n_features)
+        # optional VoConfig overrides (tracking/keyframe/BA knobs) for tuning
+        for k, v in (vo_overrides or {}).items():
+            if not hasattr(cfg, k):
+                raise AttributeError(f"VoConfig has no field {k!r}")
+            setattr(cfg, k, v)
         self._imu_dropout_enabled = bool(imu_dropout)
         self.cfg = cfg
         self.vo = fc.VoFrontend(cfg)

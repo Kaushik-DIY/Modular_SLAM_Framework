@@ -788,7 +788,8 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
     stream = LabHybridStream(cfg.dataset, cfg.sync_tolerance_s)
     fe = NativeOrbFrontend(cfg.dataset, imu_path=str(Path(cfg.dataset) / "imu.csv"),
                            depth_max=cfg.vo_depth_max,
-                           imu_dropout=cfg.vo_imu_dropout)
+                           imu_dropout=cfg.vo_imu_dropout,
+                           vo_overrides=cfg.vo_overrides)
     shared = build_shared_map(cfg)
     index = AppearanceIndex(min_score=cfg.dbow_min_score,
                             min_separation=cfg.min_kf_separation,
