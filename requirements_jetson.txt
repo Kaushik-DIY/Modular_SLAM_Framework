@@ -1,0 +1,13 @@
+# Minimal Python 3.8 runtime deps for the fusion SLAM on Jetson Nano (aarch64).
+# NOT the dev 3.11 lock — these are the only packages the online runner needs,
+# at versions with prebuilt aarch64 wheels for py3.8 (so `pip install` does NOT
+# compile them). OpenCV is intentionally NOT here: use conda-forge `opencv` or
+# JetPack's system cv2 (one OpenCV only — see setup_jetson.md).
+numpy<1.25            # 1.24.x is the last numpy line for py3.8
+scipy<1.11            # only the offline analyzer needs it; harmless to include
+PyYAML
+matplotlib<3.8        # headless (Agg); only for the final map render
+pybind11              # build-time (header-only) for the C++ extensions
+# small_gicp  -> NO aarch64 wheel; build from source (only the `icp` verifier needs it)
+# pydbow3     -> built locally via tools/build_pyslam_pydbow3_local.sh (dbow/visual modes)
+# fusion_core -> built locally via tools/build_fusion_core.sh (C++17, stock gcc)

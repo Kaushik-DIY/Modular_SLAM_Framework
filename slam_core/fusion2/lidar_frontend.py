@@ -40,7 +40,7 @@ class LidarFrontend:
     def __init__(self, dataset_name: str = "lab_hybrid", imu_path: Optional[str] = None,
                  kf_min_dist_m: float = 0.25, kf_min_angle_rad: float = math.radians(12.0),
                  kf_min_dt_s: float = 2.0, use_vectorized_search: bool = True,
-                 matcher_kind: str = "scan_to_submap"):
+                 matcher_kind: str = "scan_to_submap", imu_samples=None):
         hcfg._apply_profile(dataset_name)
         cfg = hcfg
         if matcher_kind not in ("scan_to_submap", "scan_to_map"):
@@ -81,10 +81,16 @@ class LidarFrontend:
             global_slam=None,
         )
 
-        self._imu: List[Tuple[float, float, float]] = []
+        # IMU samples the extrapolator drains by timestamp. A live (growing) list
+        # injected via `imu_samples` (online/ROS) takes precedence over imu.csv;
+        # the drain loop `while idx < len(samples)` works on either.
         self._imu_idx = 0
-        if imu_path and os.path.exists(imu_path):
+        if imu_samples is not None:
+            self._imu = imu_samples
+        elif imu_path and os.path.exists(imu_path):
             self._imu = imu_rows_to_samples(read_imu_csv(imu_path))
+        else:
+            self._imu = []
 
         self.kf_min_dist = float(kf_min_dist_m)
         self.kf_min_angle = float(kf_min_angle_rad)
@@ -196,7 +202,7 @@ def make_lidar_frontend(kind: str, dataset_name: str = "lab_hybrid",
                         imu_path: Optional[str] = None,
                         kf_min_dist_m: float = 0.25,
                         kf_min_angle_rad: float = math.radians(12.0),
-                        kf_min_dt_s: float = 2.0):
+                        kf_min_dt_s: float = 2.0, imu_samples=None):
     """Front-end factory for the fusion runner (V4.3).
 
     kind: native_s2s | native_s2m (C++, V4.4) | legacy_s2s | legacy_s2m (Python).
@@ -208,10 +214,10 @@ def make_lidar_frontend(kind: str, dataset_name: str = "lab_hybrid",
     if kind in ("legacy_s2s", "legacy_s2m"):
         matcher_kind = "scan_to_submap" if kind == "legacy_s2s" else "scan_to_map"
         return LidarFrontend(dataset_name=dataset_name, imu_path=imu_path,
-                             matcher_kind=matcher_kind, **kf)
+                             matcher_kind=matcher_kind, imu_samples=imu_samples, **kf)
     if kind in ("native_s2s", "native_s2m"):
         from slam_core.fusion2.native_lidar_frontend import NativeLidarFrontend
         return NativeLidarFrontend(kind=kind, dataset_name=dataset_name,
-                                   imu_path=imu_path, **kf)
+                                   imu_path=imu_path, imu_samples=imu_samples, **kf)
     raise ValueError(f"unknown lidar front-end kind {kind!r} "
                      "(expected native_s2s|native_s2m|legacy_s2s|legacy_s2m)")

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(fusion_core CXX)
-set(CMAKE_CXX_STANDARD 20)
+# C++17 (was 20): the sources use no C++20-only features, and C++17 builds with
+# the Jetson/Ubuntu-18.04 stock GCC 7.5 — no gcc-10/PPA needed for aarch64.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------

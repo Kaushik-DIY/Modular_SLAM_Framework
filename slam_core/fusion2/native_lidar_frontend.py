@@ -106,7 +106,7 @@ class NativeLidarFrontend:
     def __init__(self, kind: str = "native_s2s", dataset_name: str = "lab_hybrid",
                  imu_path: Optional[str] = None, kf_min_dist_m: float = 0.25,
                  kf_min_angle_rad: float = math.radians(12.0),
-                 kf_min_dt_s: float = 2.0):
+                 kf_min_dt_s: float = 2.0, imu_samples=None):
         matcher_kind = "scan_to_submap" if kind == "native_s2s" else "scan_to_map"
         self.matcher_kind = matcher_kind
         cfg = _config_from_hector_profile(dataset_name, matcher_kind,
@@ -114,10 +114,14 @@ class NativeLidarFrontend:
                                           kf_min_dt_s)
         self._fe = fc.NativeLidarFrontend(cfg)
 
-        self._imu: List[Tuple[float, float, float]] = []
+        # live (growing) IMU list injected for online/ROS takes precedence over csv
         self._imu_idx = 0
-        if imu_path and os.path.exists(imu_path):
+        if imu_samples is not None:
+            self._imu = imu_samples
+        elif imu_path and os.path.exists(imu_path):
             self._imu = imu_rows_to_samples(read_imu_csv(imu_path))
+        else:
+            self._imu = []
 
         self.fallback_count = 0
         self.process_ms: List[float] = []

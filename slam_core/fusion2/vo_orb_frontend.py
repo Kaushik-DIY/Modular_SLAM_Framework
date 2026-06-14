@@ -51,7 +51,8 @@ def _rot_about_axis(u: np.ndarray, angle: float) -> np.ndarray:
 class NativeOrbFrontend:
     def __init__(self, dataset: Path, imu_path: Optional[str] = None,
                  n_features: int = 2000, depth_max: float = 4.0,
-                 imu_dropout: bool = True, vo_overrides: Optional[dict] = None):
+                 imu_dropout: bool = True, vo_overrides: Optional[dict] = None,
+                 imu_buffer=None):
         sc = yaml.safe_load(open(Path(dataset) / "sensor_config.yaml"))["camera"]
         cfg = fc.VoConfig()
         cfg.fx, cfg.fy = float(sc["fx"]), float(sc["fy"])
@@ -71,8 +72,10 @@ class NativeOrbFrontend:
         self.vo = fc.VoFrontend(cfg)
         self.K = np.array([[cfg.fx, 0, cfg.cx], [0, cfg.fy, cfg.cy], [0, 0, 1]])
 
-        self._imu = None
-        if imu_path and Path(imu_path).exists():
+        # IMU for the dropout prior: a live buffer (online/ROS) takes precedence
+        # over the imu.csv file; both expose yaw_at(t).
+        self._imu = imu_buffer
+        if self._imu is None and imu_path and Path(imu_path).exists():
             from visual_slam.orbslam.imu_fallback import ImuFallbackExtrapolator
             self._imu = ImuFallbackExtrapolator(imu_path)
         self._last_result = None

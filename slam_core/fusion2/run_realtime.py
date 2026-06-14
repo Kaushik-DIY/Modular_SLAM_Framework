@@ -320,14 +320,16 @@ class FrontEndManager:
 class LidarFEAdapter:
     sensor = "lidar"
 
-    def __init__(self, cfg, stream, K, attach_visual, initial_kind, grace_scans=15):
+    def __init__(self, cfg, stream, K, attach_visual, initial_kind, grace_scans=15,
+                 imu=None):
         self.cfg = cfg
         self.stream = stream
         self.K = K
         self.attach_visual = attach_visual
-        imu_path = str(Path(cfg.dataset) / "imu.csv")
+        imu_path = None if imu is not None else str(Path(cfg.dataset) / "imu.csv")
+        imu_samples = imu.samples if imu is not None else None
         make_fe = lambda kind: make_lidar_frontend(
-            kind, dataset_name="lab_hybrid", imu_path=imu_path,
+            kind, dataset_name="lab_hybrid", imu_path=imu_path, imu_samples=imu_samples,
             kf_min_dist_m=cfg.kf_min_dist_m, kf_min_angle_rad=cfg.kf_min_angle_rad,
             kf_min_dt_s=cfg.kf_min_dt_s)
         self.fem = FrontEndManager(make_fe, initial_kind, grace_scans)
@@ -375,18 +377,29 @@ class LidarFEAdapter:
         return kfd, flip
 
 
+def _as_img(x, flag):
+    """An event/payload image is either a decoded ndarray (ROS/online) or a file
+    path (disk dataset). Return the ndarray either way."""
+    if isinstance(x, np.ndarray):
+        return x
+    import cv2
+    return cv2.imread(str(x), flag)
+
+
 class VoFEAdapter:
     sensor = "vo"
 
-    def __init__(self, cfg, stream):
+    def __init__(self, cfg, stream, imu=None):
         from slam_core.fusion2.vo_orb_frontend import NativeOrbFrontend
         self.cfg = cfg
         self.stream = stream
         self.fe = NativeOrbFrontend(cfg.dataset,
-                                    imu_path=str(Path(cfg.dataset) / "imu.csv"),
+                                    imu_path=(None if imu is not None
+                                              else str(Path(cfg.dataset) / "imu.csv")),
                                     depth_max=cfg.vo_depth_max,
                                     imu_dropout=cfg.vo_imu_dropout,
-                                    vo_overrides=cfg.vo_overrides)
+                                    vo_overrides=cfg.vo_overrides,
+                                    imu_buffer=imu)
         self.K = self.fe.K
         self.reinits = 0
         self.variant = "visual_vo"
@@ -405,8 +418,8 @@ class VoFEAdapter:
     def feed(self, ev) -> Tuple[Optional[KeyframeData], Optional[fc.Pose2]]:
         import cv2
         _, t, rgb_p, depth_p = ev
-        rgb = cv2.imread(str(rgb_p), cv2.IMREAD_COLOR)
-        depth = cv2.imread(str(depth_p), cv2.IMREAD_UNCHANGED)
+        rgb = _as_img(rgb_p, cv2.IMREAD_COLOR)
+        depth = _as_img(depth_p, cv2.IMREAD_UNCHANGED)
         if rgb is None or depth is None:
             return None, None
         Twc, state, nkf = self.fe.track(rgb, depth, t)
@@ -435,12 +448,14 @@ class VoFEAdapter:
         return kfd, None
 
 
-def make_adapter(sensor_kind: str, cfg, stream, K, attach_visual, grace_scans=15):
+def make_adapter(sensor_kind: str, cfg, stream, K, attach_visual, grace_scans=15,
+                 imu=None):
     """Build the adapter for a front-end kind:
-    visual_vo | native_s2s | native_s2m (the last two share the LiDAR adapter)."""
+    visual_vo | native_s2s | native_s2m (the last two share the LiDAR adapter).
+    `imu` (a LiveImuBuffer) injects the online IMU; None = use the dataset imu.csv."""
     if sensor_kind == "visual_vo":
-        return VoFEAdapter(cfg, stream)
-    return LidarFEAdapter(cfg, stream, K, attach_visual, sensor_kind, grace_scans)
+        return VoFEAdapter(cfg, stream, imu=imu)
+    return LidarFEAdapter(cfg, stream, K, attach_visual, sensor_kind, grace_scans, imu=imu)
 
 
 SENSOR_OF_KIND = {"visual_vo": "vo", "native_s2s": "lidar", "native_s2m": "lidar"}
@@ -630,7 +645,14 @@ def merged_events(stream: LabHybridStream):
 # ---------------------------------------------------------------------------
 def _parse_args():
     p = argparse.ArgumentParser(description="Fusion real-time module-switching runner (V5)")
-    p.add_argument("--dataset", type=Path, default=Path("datasets/lab_hybrid"))
+    p.add_argument("--dataset", type=Path, default=Path("datasets/lab_hybrid"),
+                   help="Disk dataset (source=dataset), or a config dir holding "
+                        "sensor_config.yaml for calibration (source=ros).")
+    p.add_argument("--source", choices=("dataset", "ros"), default="dataset",
+                   help="dataset = offline replay from disk; ros = LIVE events from "
+                        "the ROS bridge over --ros-socket (online SLAM).")
+    p.add_argument("--ros-socket", type=str, default="/tmp/fusion_ros.sock",
+                   help="Unix socket the ROS py2 bridge connects to (source=ros).")
     p.add_argument("--mode", choices=("lidar", "lidar_orb", "orb", "orb_lidar"),
                    default="lidar",
                    help="Starting front-end: lidar* (LiDAR-led) or orb* (visual-led).")
@@ -690,16 +712,25 @@ def main(argv=None):
     if proposer == "dbow" and not start_visual:
         raise SystemExit("--proposer dbow needs descriptors: add --attach-visual.")
 
-    stream = LabHybridStream(cfg.dataset, cfg.sync_tolerance_s)
+    # data source: offline disk replay, or a LIVE ROS-fed event stream + IMU.
+    if args.source == "ros":
+        from slam_core.fusion2.ros_source import RosEventSource
+        live_src = RosEventSource(args.ros_socket, sync_tol=cfg.sync_tolerance_s).start()
+        stream, imu = live_src, live_src.imu
+        print(f"[ros] waiting for the bridge on {args.ros_socket} ...")
+    else:
+        live_src = None
+        stream, imu = LabHybridStream(cfg.dataset, cfg.sync_tolerance_s), None
 
     # camera intrinsics — needed by any visual-attaching adapter (PnP / dbow).
+    # (static calibration; read from the config dir even in ros mode.)
     import yaml
     sc = yaml.safe_load(open(Path(cfg.dataset) / "sensor_config.yaml"))["camera"]
     K = np.array([[sc["fx"], 0, sc["cx"]], [0, sc["fy"], sc["cy"]], [0, 0, 1]])
 
     def _build(kind):
         return make_adapter(kind, cfg, stream, K, lidar_attach,
-                            grace_scans=args.grace_scans)
+                            grace_scans=args.grace_scans, imu=imu)
 
     initial_kind = "visual_vo" if start_sensor == "vo" else cfg.lidar_frontend
     sm = SensorManager(_build, _build(initial_kind), grace_scans=args.grace_scans)
@@ -733,17 +764,27 @@ def main(argv=None):
     lag = 0.0
     active_events = 0
 
-    events = list(merged_events(stream))
-    n_events = len(events)
-    for k, ev in enumerate(events):
+    # event iterator: a materialised disk list (with real-time pacing) OR the
+    # LIVE ROS generator (arrives in real time; no pacing).
+    if args.source == "ros":
+        events, n_events, paced = None, None, False
+        event_iter = enumerate(live_src.live_events())
+    else:
+        events = list(merged_events(stream))
+        n_events, paced = len(events), args.speed > 0
+        event_iter = enumerate(events)
+
+    for k, ev in event_iter:
         sensor, t = ev[0], ev[1]
-        if t0_data is None:
-            t0_data, t0_wall = t, time.perf_counter()
         ev_start = time.perf_counter()
 
         # drain live commands (main thread only)
         if _apply_switches(switch_q, eng, sm, k):
             break
+        if sensor == "__tick__":      # ros heartbeat: no sensor data this tick
+            continue
+        if t0_data is None:
+            t0_data, t0_wall = t, time.perf_counter()
 
         # route the event: pending FE warms up on its sensor, active FE drives.
         t_a = time.perf_counter()
@@ -798,11 +839,11 @@ def main(argv=None):
                               f"loops={eng.stats['loops_accepted']}")
         timer.add("draw", time.perf_counter() - t_c)
 
-        # real-time pacing
-        period = (events[k + 1][1] - t) if (k + 1) < n_events else 0.0
-        if period > 0 and (time.perf_counter() - ev_start) > period and args.speed > 0:
-            timer.late += 1
-        if args.speed > 0:
+        # real-time pacing — dataset replay only (ROS already arrives in real time)
+        if paced:
+            period = (events[k + 1][1] - t) if (k + 1) < n_events else 0.0
+            if period > 0 and (time.perf_counter() - ev_start) > period:
+                timer.late += 1
             target = t0_wall + (t - t0_data) / args.speed
             sl = target - time.perf_counter()
             t_d = time.perf_counter()
@@ -855,11 +896,11 @@ def _autofallback(eng, new_adapter) -> list:
 def _extract_visual(stream, t, K):
     import cv2
     from slam_core.fusion2.visual_features import extract_orb_rgbd
-    pair = stream.nearest_rgbd(t)
+    pair = stream.nearest_rgbd(t)   # (path,path) disk OR (rgb_arr,depth_arr) online
     if pair is None:
         return None
-    rgb = cv2.imread(str(pair[0]), cv2.IMREAD_COLOR)
-    depth = cv2.imread(str(pair[1]), cv2.IMREAD_UNCHANGED)
+    rgb = _as_img(pair[0], cv2.IMREAD_COLOR)
+    depth = _as_img(pair[1], cv2.IMREAD_UNCHANGED)
     if rgb is None or depth is None:
         return None
     kpts, des, pts3d = extract_orb_rgbd(rgb, depth, K)
