@@ -141,39 +141,38 @@ def verify_candidate_bnb(shared: SharedMap, cfg: FusionV2Config, query_id: int,
 
 def verify_candidate_icp(shared: SharedMap, cfg: FusionV2Config, query_id: int,
                          query_scan: np.ndarray, query_pose: fc.Pose2,
-                         cand_id: int, seed_from_bnb: bool = False):
-    """ICP alternative (small_gicp) on the same candidate-local neighborhood:
-    align the query scan against the neighborhood point cloud (2D -> z=0),
-    mirroring v1 ICPLoopVerifier semantics. Returns a BnbResult-shaped object.
+                         cand_id: int):
+    """Standalone ICP loop verifier (small_gicp), RTAB-Map RegistrationIcp style
+    and INDEPENDENT of B&B. Align the query scan against the candidate-local
+    neighbourhood cloud, seeded ONLY by the graph-predicted relative pose (the
+    "guess from odometry" RTAB uses), and accept on the ICP's OWN quality
+    metrics: the correspondence ratio (fraction of query points with a target
+    neighbour within icp_fitness_dist) and the inlier RMSE. Returns a
+    BnbResult-shaped object with coarse_score=correspondence_ratio,
+    refined_score=inlier_rmse (metres, LOWER is better).
 
-    seed_from_bnb: GICP only converges within ~icp_max_corr_dist of the truth;
-    in the orb-led mode the VO's drift exceeds that basin, so the alignment is
-    first coarse-initialized with B&B on the candidate-local grid and GICP then
-    refines metrically (observed: prediction-seeded GICP locked into local
-    minima on EVERY orb-led candidate). LiDAR-led modes keep the pure
-    prediction-seeded ICP variant (their drift is within the basin)."""
+    No B&B coarse seed and no occupancy-grid cross-check. The "result must stay
+    near the guess" slide-lock guard is RTAB's max-translation/rotation bound,
+    applied by the caller as the rel-sanity gate. Consequence by design: ICP
+    needs a good initial guess, so high-drift front-ends (e.g. visual-led
+    orb_lidar, where VO drift exceeds GICP's convergence basin) will verify
+    fewer/no loops with ICP than with B&B — that is a property of metric ICP to
+    be studied comparatively, not a fault to be patched with a B&B seed."""
     import small_gicp
 
     sigs, poses = _candidate_neighborhood(shared, cfg, query_id, cand_id)
     if len(sigs) < 2:
         return None
-    grid = fc.assemble_local_grid(sigs, poses, shared.grid_cfg)
-
-    seed_pose = query_pose
-    if seed_from_bnb:
-        r0 = fc.bnb_match(grid, np.asarray(query_scan, np.float32), query_pose,
-                          shared.bnb_cfg)
-        if r0.success and r0.coarse_score >= 0.0:
-            seed_pose = r0.pose
 
     tgt_pts = []
     for s, p in zip(sigs, poses):
         sc = np.asarray(s.scan_xy, dtype=np.float64)
         c, sn = math.cos(p.theta), math.sin(p.theta)
         tgt_pts.append(sc @ np.array([[c, sn], [-sn, c]]) + [p.x, p.y])
-    tgt = np.vstack(tgt_pts)
-    tgt3 = np.c_[tgt, np.zeros(len(tgt))]
+    tgt3 = np.c_[np.vstack(tgt_pts), np.zeros(sum(len(t) for t in tgt_pts))]
 
+    # seed = graph-predicted pose (RTAB's odometry guess); NO coarse pre-search.
+    seed_pose = query_pose
     q = np.asarray(query_scan, dtype=np.float64)
     c, sn = math.cos(seed_pose.theta), math.sin(seed_pose.theta)
     q_world = q @ np.array([[c, sn], [-sn, c]]) + [seed_pose.x, seed_pose.y]
@@ -186,34 +185,23 @@ def verify_candidate_icp(shared: SharedMap, cfg: FusionV2Config, query_id: int,
     dx, dy = float(T[0, 3]), float(T[1, 3])
     dth = float(math.atan2(T[1, 0], T[0, 0]))
 
-    # fitness: fraction of corrected query points with a close target neighbor
-    corr = (np.c_[q_world, np.zeros(len(q_world))] @ T[:3, :3].T) + T[:3, 3]
+    # ICP-native quality: correspondence ratio + inlier RMSE over the aligned
+    # query (RTAB's correspondencesRatio and inlier residual).
+    corr = (src3 @ T[:3, :3].T) + T[:3, 3]
     tree = small_gicp.KdTree(tgt3)
-    k_sq = np.array([tree.nearest_neighbor_search(p)[2] for p in corr])
-    fitness = float(np.mean(np.sqrt(k_sq) < cfg.icp_fitness_dist))
+    d = np.sqrt(np.array([tree.nearest_neighbor_search(p)[2] for p in corr]))
+    inl = d < cfg.icp_fitness_dist
+    corr_ratio = float(inl.mean())
+    inlier_rmse = float(np.sqrt(np.mean(d[inl] ** 2))) if inl.any() else cfg.icp_max_corr_dist
 
-    # corrected query pose = T (world correction) ∘ seed_pose
     cx = T[0, 0] * seed_pose.x + T[0, 1] * seed_pose.y + dx
     cy = T[1, 0] * seed_pose.x + T[1, 1] * seed_pose.y + dy
     corrected_pose = fc.Pose2(cx, cy, seed_pose.theta + dth)
 
-    # V4.5 grid cross-check: nearest-neighbour fitness is blind to corridor
-    # slide-locks (every point lies near SOME wall point -> fitness ~1.0 at a
-    # longitudinally wrong pose; observed: 0.98-fitness loops that B&B rightly
-    # rejected warped orb_lidar_icp by ~8 m). Score the corrected pose on the
-    # SAME candidate-local occupancy grid B&B uses and gate it identically.
-    prob = np.asarray(grid.probability())
-    cth, sth = math.cos(corrected_pose.theta), math.sin(corrected_pose.theta)
-    qg = q @ np.array([[cth, sth], [-sth, cth]]) + [corrected_pose.x, corrected_pose.y]
-    gx = np.floor((qg[:, 0] - grid.origin_x) / grid.resolution).astype(int)
-    gy = np.floor((qg[:, 1] - grid.origin_y) / grid.resolution).astype(int)
-    inb = (gx >= 0) & (gx < grid.width) & (gy >= 0) & (gy < grid.height)
-    grid_score = float(prob[gy[inb], gx[inb]].mean()) if inb.any() else -1.0
-
     class _R:  # BnbResult-compatible shape
         success = bool(res.converged)
-        coarse_score = fitness          # gated by icp_accept_fitness
-        refined_score = grid_score      # gated by accept_refined_min (as B&B)
+        coarse_score = corr_ratio       # gated by icp_accept_fitness (>=)
+        refined_score = inlier_rmse     # gated by icp_accept_rmse (<=), metres
         pose = corrected_pose
         refined = True
     return _R()
@@ -504,10 +492,11 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
                         continue
                     stats["verified"] += 1
                     if cfg.scan_verifier == "icp":
-                        # fitness + grid cross-check (V4.5: slide-lock filter)
+                        # RTAB-style: correspondence ratio + inlier RMSE (metres,
+                        # lower=better). Standalone, no B&B grid cross-check.
                         accepted = (r.success
                                     and r.coarse_score >= cfg.icp_accept_fitness
-                                    and r.refined_score >= cfg.accept_refined_min)
+                                    and r.refined_score <= cfg.icp_accept_rmse)
                     else:
                         accepted = (r.success
                                     and r.coarse_score >= cfg.accept_coarse_min
@@ -877,13 +866,14 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
             row = dict(query=kf_id, cand=cand, dbow=round(dbow_score, 4))
             if scan_backend:
                 if sig.has_scan:
-                    # orb-led ICP needs the B&B coarse seed (VO drift exceeds
-                    # GICP's convergence basin -- see verify_candidate_icp).
+                    # Standalone ICP (RTAB-style): seeded only by the graph
+                    # prediction. Visual-led VO drift can exceed GICP's basin, so
+                    # orb_lidar+icp may verify fewer loops than +bnb -- an accepted
+                    # comparative property, not a defect (see verify_candidate_icp).
                     if cfg.scan_verifier == "icp":
                         r = verify_candidate_icp(shared, cfg, kf_id,
                                                  np.asarray(sig.scan_xy),
-                                                 node_pose, cand,
-                                                 seed_from_bnb=True)
+                                                 node_pose, cand)
                     else:
                         r = verify_candidate_bnb(shared, cfg, kf_id,
                                                  np.asarray(sig.scan_xy),
@@ -893,7 +883,7 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
                         if cfg.scan_verifier == "icp":
                             accepted = (r.success
                                         and r.coarse_score >= cfg.icp_accept_fitness
-                                        and r.refined_score >= cfg.accept_refined_min)
+                                        and r.refined_score <= cfg.icp_accept_rmse)
                         else:
                             accepted = (r.success
                                         and r.coarse_score >= cfg.accept_coarse_min

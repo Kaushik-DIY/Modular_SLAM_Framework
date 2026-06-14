@@ -95,7 +95,6 @@ class IngestEngine:
         self.K = K
         self.verifier = verifier          # bnb | icp | pnp
         self.proposer = proposer          # proximity | dbow
-        self.scan_seed_from_bnb = False   # VO-led scan verify needs the B&B coarse seed
         self._appearance = None           # lazily built AppearanceIndex (dbow)
         self.kf_id = -1
         self.last_graph_pose = None
@@ -106,11 +105,10 @@ class IngestEngine:
 
     # -- modality configuration -------------------------------------------
     def set_active_sensor(self, sensor: str):
-        """Configure scan-verifier seeding + the B&B angular window for the
-        active modality. VO-led scan verification (orb_lidar) needs B&B coarse
-        seeding (VO drift exceeds GICP's basin) and the wider ±45° window; the
-        LiDAR-led path keeps the prediction-seeded variant and the ±30° window."""
-        self.scan_seed_from_bnb = (sensor == "vo")
+        """Widen the B&B angular search window for visual-led scan verification
+        (orb_lidar): VO heading drift needs the ±45° window vs the LiDAR-led
+        ±30°. (ICP is standalone/prediction-seeded and needs no per-sensor
+        config -- see verify_candidate_icp.)"""
         self.shared.bnb_cfg.angular_search_window = (
             self.cfg.orb_bnb_window_th if sensor == "vo" else self.cfg.bnb_window_th)
 
@@ -205,10 +203,9 @@ class IngestEngine:
                 return True, rel
             return False, None
 
-        # scan verifiers (bnb / icp)
+        # scan verifiers (bnb / icp) — ICP is standalone, prediction-seeded
         if self.verifier == "icp":
-            r = verify_candidate_icp(shared, cfg, kf_id, raw_scan, node_pose, cand,
-                                     seed_from_bnb=self.scan_seed_from_bnb)
+            r = verify_candidate_icp(shared, cfg, kf_id, raw_scan, node_pose, cand)
         else:
             r = verify_candidate_bnb(shared, cfg, kf_id, raw_scan, node_pose, cand)
         if r is None:
@@ -216,7 +213,7 @@ class IngestEngine:
         self.stats["verified"] += 1
         if self.verifier == "icp":
             accepted = (r.success and r.coarse_score >= cfg.icp_accept_fitness
-                        and r.refined_score >= cfg.accept_refined_min)
+                        and r.refined_score <= cfg.icp_accept_rmse)
         else:
             accepted = (r.success and r.coarse_score >= cfg.accept_coarse_min
                         and r.refined_score >= cfg.accept_refined_min)

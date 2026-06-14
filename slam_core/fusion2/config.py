@@ -77,9 +77,11 @@ class FusionV2Config:
     accept_refined_min: float = 0.60
     # scan-side loop verifier: "bnb" (C++ correlative B&B) or "icp" (small_gicp)
     scan_verifier: str = "bnb"
-    icp_accept_fitness: float = 0.6
+    icp_accept_fitness: float = 0.6        # min correspondence ratio (RTAB-style)
     icp_max_corr_dist: float = 1.0         # GICP correspondence cap (m)
-    icp_fitness_dist: float = 0.15         # inlier distance for fitness (m)
+    icp_fitness_dist: float = 0.15         # inlier distance for the corr. ratio (m)
+    icp_accept_rmse: float = 0.10          # max inlier RMSE to accept (m); ICP-native,
+    #                                        independent of B&B's accept_refined_min
     # Relative-pose sanity gate for SCAN verifiers (B&B / ICP), mirroring the
     # PnP gate: a verified loop whose rel pose disagrees wildly with the graph
     # prediction is a rotational-ambiguity false positive (V4.1 — these warped
