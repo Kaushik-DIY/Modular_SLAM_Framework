@@ -5,28 +5,28 @@
   "imu_active": true,
   "frames": 2466,
   "keyframes": 249,
-  "proposals": 8,
+  "proposals": 9,
   "verified": 7,
-  "loops_accepted": 6,
+  "loops_accepted": 7,
   "rehearsal_merges": 0,
-  "optimize_calls": 14,
-  "reinits": 78,
-  "elapsed_sec": 80.0,
-  "fps": 30.82,
-  "peak_rss_gb": 0.86,
-  "track_ms_mean": 16.4,
-  "verify_ms_mean": 20.4,
+  "optimize_calls": 15,
+  "reinits": 70,
+  "elapsed_sec": 89.3,
+  "fps": 27.61,
+  "peak_rss_gb": 0.74,
+  "track_ms_mean": 18.3,
+  "verify_ms_mean": 27.9,
   "stm": 30,
-  "wm": 200,
-  "ltm": 19,
+  "wm": 203,
+  "ltm": 16,
   "map_payload_mb": 4.4,
-  "blind_kfs": 78,
+  "blind_kfs": 70,
   "imu_calibration": {
     "yaw_sign": 1.0,
     "up_axis": [
-      -0.3581,
-      -0.9322,
-      -0.0532
+      0.0343,
+      -0.9948,
+      0.0963
     ]
   }
 }
