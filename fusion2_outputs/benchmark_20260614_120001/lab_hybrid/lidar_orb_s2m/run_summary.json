@@ -1,0 +1,22 @@
+{
+  "mode": "lidar_orb",
+  "frontend": "native_s2m",
+  "verifier": "pnp",
+  "imu_active": true,
+  "scans": 4147,
+  "keyframes": 368,
+  "fallbacks": 75,
+  "proposals": 103,
+  "verified": 103,
+  "loops_accepted": 25,
+  "rehearsal_merges": 15,
+  "optimize_calls": 13,
+  "elapsed_sec": 108.0,
+  "peak_rss_gb": 0.74,
+  "verify_ms_mean": 10.9,
+  "verify_ms_p95": 22.9,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 123,
+  "map_payload_mb": 21.4
+}

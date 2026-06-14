@@ -1,0 +1,32 @@
+{
+  "mode": "orb_lidar",
+  "frontend": "native",
+  "verifier": "icp",
+  "imu_active": true,
+  "frames": 2466,
+  "keyframes": 249,
+  "proposals": 8,
+  "verified": 7,
+  "loops_accepted": 6,
+  "rehearsal_merges": 0,
+  "optimize_calls": 14,
+  "reinits": 78,
+  "elapsed_sec": 80.0,
+  "fps": 30.82,
+  "peak_rss_gb": 0.86,
+  "track_ms_mean": 16.4,
+  "verify_ms_mean": 20.4,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 19,
+  "map_payload_mb": 4.4,
+  "blind_kfs": 78,
+  "imu_calibration": {
+    "yaw_sign": 1.0,
+    "up_axis": [
+      -0.3581,
+      -0.9322,
+      -0.0532
+    ]
+  }
+}

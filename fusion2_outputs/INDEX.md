@@ -46,3 +46,4 @@ trajectories_montage.png inside; per-combo subfolders carry trajectory.tum,
 occupancy.png, map.npy, verifications.csv, run_summary.json. Closures:
 LiDAR-led 0.11-0.47 m; vision-led 1.16-1.81 m. All < 1 GB, all faster than
 sensor rate (lidar ~1 min wall; orb-led 32 fps).
+- [benchmark_20260614_120001](benchmark_20260614_120001/BENCHMARK_REPORT.md) — 9 combos x 2 maps, GT-free method comparison
