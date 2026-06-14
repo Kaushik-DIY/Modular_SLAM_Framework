@@ -315,6 +315,20 @@ extended into a UNIFIED multi-sensor timeline driver. The FE axis is now
   round-trip + loops both sides, auto-fallback on lean LiDAR, final map non-empty). CLI
   end-to-end verified (piped `fe vo` switch → coherent fused map). Docs updated.
 
+**ICP verifier made standalone (2026-06-14, supersedes the V4.5 design).** The ICP loop
+verifier was coupled to B&B via a coarse seed (`seed_from_bnb`) and an occupancy-grid
+cross-check (borrowing B&B's `accept_refined_min`) — against the design's module-independence.
+Reimplemented RTAB-Map RegistrationIcp style: seed ONLY from the graph-predicted pose, accept
+on the ICP's own metrics (correspondence ratio ≥ `icp_accept_fitness`, inlier RMSE ≤ new
+`icp_accept_rmse`), with the caller's rel-sanity gate as the slide-lock guard (RTAB's
+max-translation/rotation bound) instead of the grid cross-check. Validated across both maps ×
+both modes — loops: bnb→icp = small lidar 31→30, small orb_lidar 0→6, full lidar 71→70, full
+orb_lidar 42→39; trajectory spans match the B&B reference (no warping). The old B&B seed is
+unnecessary now that V3.6's drift-bounded VO keeps the prediction inside GICP's basin even for
+visual-led orb_lidar on the full map. 56/56 tests. (Supersedes the V4.5 "B&B-seeded GICP +
+grid cross-check" rows below.)
+
 **Fusion layer is feature-complete:** every module (front-end sensor + variant, proposer,
 verifier) is live-switchable over one persistent shared map. Remaining levers are tuning /
-deployment only (SQLite LTM offload for unbounded runs; camera-IMU extrinsic; ROS/Jetson).
+deployment only (SQLite LTM offload for unbounded runs; camera-IMU extrinsic — investigated,
+no-op; ROS/Jetson).
