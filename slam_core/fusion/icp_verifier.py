@@ -26,7 +26,10 @@ from slam_core.common.types import Pose2
 from slam_core.common.se2 import pose_compose, pose_inverse, wrap_angle
 from slam_core.loop_closure import ClosureTarget, LoopMatchResult, LoopNode
 
-import small_gicp
+# small_gicp is imported lazily (inside verify) so that merely importing the
+# slam_core.fusion package — which the fusion2 runtime does for signature/projection
+# — does NOT require small_gicp. It has no aarch64 wheel (Jetson source-build), and
+# only the ICP verifier path actually needs it.
 
 
 def _se2_to_mat(p: Pose2) -> np.ndarray:
@@ -97,6 +100,7 @@ class ICPLoopVerifier:
         init_rel = pose_compose(pose_inverse(target.pose_global), node.pose_guess_global)
         init_mat = _se2_to_mat(init_rel)
 
+        import small_gicp
         try:
             res = small_gicp.align(
                 tgt, src, init_mat,

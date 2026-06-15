@@ -58,12 +58,20 @@ python -c "import cv2, numpy, yaml; print('env ok', cv2.__version__)"
 > — but then `find_package(OpenCV)` in the builds must point at the JetPack OpenCV. Conda OpenCV is simpler.
 
 ## M1 — `lidar` mode ONLINE (smallest viable; proves the native core)
-Needs ONLY `fusion_core` (+ numpy/cv2/yaml). Build g2o → fusion_core:
+Needs `fusion_core` + the **g2opy python binding** (+ numpy/cv2/yaml). NOTE: the
+fusion runtime HARD-imports `g2o` (the g2opy *python* module, via
+`carto/.../g2o_backend_2d.py`) — so g2o must be built AND installed into the env,
+not only its static libs. Build g2o → fusion_core:
 
-1. **g2o static libs** (C++11; reuse `third_party/G2OPY_INSTALL_NOTES.md` for the patches):
+1. **g2o** (C++11; reuse `third_party/G2OPY_INSTALL_NOTES.md` for the patches —
+   they may already be applied to the source tree):
    ```bash
    cd ~/slam_ws/third_party/g2opy && mkdir -p build && cd build
-   cmake .. -DCMAKE_BUILD_TYPE=Release && make -j2     # produces lib/*.a + g2o/config.h
+   cmake .. -DCMAKE_BUILD_TYPE=Release && make -j2     # -> lib/*.a + g2o/config.h (for fusion_core)
+   #                                                       AND lib/g2o.cpython-38-*.so (the python binding)
+   # install the python binding (HARD import at runtime):
+   cp ../lib/g2o*.so "$(python -c 'import site;print(site.getsitepackages()[0])')/"
+   python -c "import g2o; print('g2o python OK')"
    ```
 2. **fusion_core** (already C++17 in CMakeLists → stock gcc-7; no PPA):
    ```bash
