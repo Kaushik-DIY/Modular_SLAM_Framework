@@ -1,8 +1,0 @@
-query,cand,overlap,geom_ok,res_dxy,res_dth_deg,res_ok,true_loop
-167,80,0.967,True,0.027,0.08,True,True
-169,83,0.904,True,0.044,0.13,True,True
-171,84,0.88,True,0.009,0.03,True,True
-171,83,0.885,True,0.01,0.02,True,True
-172,85,0.913,True,0.006,0.06,True,True
-177,90,0.872,True,0.0,0.0,True,True
-248,11,0.489,False,0.0,0.0,True,False

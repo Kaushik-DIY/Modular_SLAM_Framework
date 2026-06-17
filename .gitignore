@@ -57,3 +57,28 @@ third_party/pyslam_reference/
 # Fusion runner outputs (trajectories, occupancy grids, probe dumps)
 fusion_outputs/
 .venv_rc1_backup/
+
+# AI-assistant / tooling files (local reference only, never pushed)
+.claude/
+.codex/
+CLAUDE.md
+
+# Reference & planning docs (local reference only, never pushed)
+FUSION_STATUS.md
+FUSION2_STATUS.md
+FUSION_LAYER_IMPLEMENTATION_REVIEW*.md
+FUSION_PIPELINE_WORKFLOW.md
+ORB_SLAM_IMPLEMENTATION_THESIS*.md
+RTAB_inspired_implementation_plan.md
+RTAB_review.md
+Hector_implementation.md
+implementation.md
+TWELVE_FPS_HANDOFF.md
+
+# Run artifacts / results / audits (local reference only, never pushed)
+fusion2_outputs/
+visual_slam_outputs/
+baseline_snapshots/
+effective_run_config.json
+**/reference_audit/
+**/build_verify/
