@@ -100,6 +100,7 @@ class IngestEngine:
         self.last_graph_pose = None
         self.blind_ids: set = set()
         self.kf_stamps: dict = {}
+        self.verify_log: list = []   # per-candidate {query,cand,accepted,rx,ry,rth}
         self.stats = dict(keyframes=0, proposals=0, verified=0, loops_accepted=0,
                           rehearsal_merges=0, optimize_calls=0, reinits=0)
 
@@ -238,6 +239,11 @@ class IngestEngine:
             for cand in self._propose(kf_id, node_pose, sig):
                 self.stats["proposals"] += 1
                 accepted, rel = self._verify(kf_id, sig, node_pose, cand, raw_scan)
+                self.verify_log.append(dict(
+                    query=kf_id, cand=cand, accepted=bool(accepted and rel is not None),
+                    rx=round(rel.x, 4) if rel is not None else None,
+                    ry=round(rel.y, 4) if rel is not None else None,
+                    rth=round(rel.theta, 5) if rel is not None else None))
                 if accepted and rel is not None:
                     shared.graph.add_loop_edge(cand, kf_id, rel,
                                                cfg.loop_trans_weight, cfg.loop_rot_weight)
@@ -867,6 +873,15 @@ def main(argv=None):
     eng.stats["optimize_calls"] += 1
     if isinstance(sm.active, VoFEAdapter):
         eng.stats["reinits"] = sm.active.reinits
+        eng.stats["fallbacks"] = 0
+    else:
+        eng.stats["fallbacks"] = int(getattr(sm.active.fem.active, "fallback_count", 0))
+    # realtime timing -> run_summary (literal lag/late% + per-event compute)
+    eng.stats["realtime_lag_s"] = round(lag, 3)
+    eng.stats["late_pct"] = round(100.0 * timer.late / max(1, timer.n), 1)
+    eng.stats["events"] = timer.n
+    for s in ("slam", "loop", "draw"):
+        eng.stats[f"{s}_ms_mean"] = round(timer.total[s] / max(1, timer.n) * 1e3, 3)
     timer.summary(lag)
     _finalize_and_show(shared, cfg, eng, sm.active, args, live)
 
@@ -1014,10 +1029,23 @@ def _finalize_and_show(shared, cfg, eng, adapter, args, live):
             t = eng.kf_stamps.get(int(nid), float(nid))
             qz, qw = math.sin(th / 2.0), math.cos(th / 2.0)
             f.write(f"{t:.6f} {x:.6f} {y:.6f} 0.0 0.0 0.0 {qz:.9f} {qw:.9f}\n")
+    # memory footprint + tier counts for the run summary
+    from slam_core.fusion2.runner import _rss_gb
+    eng.stats["peak_rss_gb"] = round(_rss_gb(), 2)
+    eng.stats["map_payload_mb"] = round(shared.memory.payload_bytes() / 1e6, 1)
+    eng.stats["stm"] = shared.memory.stm_count()
+    eng.stats["wm"] = shared.memory.wm_count()
+    eng.stats["ltm"] = shared.memory.ltm_count()
     with open(run_dir / "run_summary.json", "w") as f:
         json.dump(dict(mode=cfg.mode, frontend=adapter.variant,
                        final_verifier=eng.verifier, final_proposer=eng.proposer,
                        blind_kfs=len(eng.blind_ids), **eng.stats), f, indent=2, default=str)
+    # per-candidate loop log (for offline true/false analysis)
+    if eng.verify_log:
+        import csv as _csv
+        with open(run_dir / "verifications.csv", "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=list(eng.verify_log[0].keys()))
+            w.writeheader(); w.writerows(eng.verify_log)
 
     if args.no_map or not len(poses):
         print(f"\nWrote: {run_dir}")
