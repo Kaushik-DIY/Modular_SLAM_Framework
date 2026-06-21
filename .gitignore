@@ -82,3 +82,4 @@ baseline_snapshots/
 effective_run_config.json
 **/reference_audit/
 **/build_verify/
+thesis_outputs/*/figures/loops/
