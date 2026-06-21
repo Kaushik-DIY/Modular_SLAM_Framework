@@ -81,20 +81,50 @@ def render(run_dir: Path, map_name: str, combo: str, out_png: Path):
     plt.close(fig)
 
 
+COMBO_ORDER = ["lidar_s2s_bnb", "lidar_s2s_icp", "lidar_s2m_bnb", "lidar_s2m_icp",
+               "lidar_orb_s2s", "lidar_orb_s2m", "orb_lidar_bnb", "orb_lidar_icp", "orb"]
+
+
+def master(figdir: Path, map_name: str):
+    """One 3x3 master image of all 9 mode maps for a map (easy side-by-side)."""
+    import matplotlib.image as mpimg
+    figs = [(c, figdir / f"{map_name}__{c}.png") for c in COMBO_ORDER]
+    figs = [(c, p) for c, p in figs if p.exists()]
+    if not figs:
+        return
+    fig, axes = plt.subplots(3, 3, figsize=(22, 12))
+    for ax in axes.ravel():
+        ax.axis("off")
+    for ax, (c, p) in zip(axes.ravel(), figs):
+        ax.imshow(mpimg.imread(p))
+        ax.set_title(MODE_LABEL.get(c, c), fontsize=12)
+    fig.suptitle(f"{MAP_LABEL.get(map_name, map_name)}  —  all 9 modes "
+                 f"(fused occupancy)", fontsize=17, y=0.99)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    out = figdir / f"master_{map_name}.png"
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  master -> {out}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, required=True)
     a = ap.parse_args()
     figdir = a.root / "figures"
     n = 0
+    maps = set()
     for run_dir in sorted(a.root.glob("*/*")):
         if not (run_dir / "map.npy").exists():
             continue
         map_name, combo = run_dir.parts[-2], run_dir.parts[-1]
         render(run_dir, map_name, combo, figdir / f"{map_name}__{combo}.png")
+        maps.add(map_name)
         n += 1
         print(f"  rendered {map_name}/{combo}")
-    print(f"\n{n} figures -> {figdir}")
+    for map_name in sorted(maps):
+        master(figdir, map_name)
+    print(f"\n{n} figures + {len(maps)} master montages -> {figdir}")
 
 
 if __name__ == "__main__":
