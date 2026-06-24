@@ -160,6 +160,12 @@ class NativeOrbFrontend:
         prior[:3, 3] = Twc_a[:3, 3] + self._vel_t * n_frames
         return prior
 
+    def imu_yaw_at(self, t: float) -> Optional[float]:
+        """Absolute IMU (AHRS) yaw at time t, interpolated; None if no IMU. Used
+        by the fusion runner to replace the drifting VO spine yaw with the
+        drift-free IMU heading (loosely-coupled, at the SE(2) graph boundary)."""
+        return self._imu.yaw_at(t) if self._imu is not None else None
+
     # ---- main entry -------------------------------------------------------
 
     def track(self, rgb: np.ndarray, depth: np.ndarray, t: float

@@ -411,6 +411,12 @@ class VoFEAdapter:
         self.variant = "visual_vo"
         self._last_pose: Optional[fc.Pose2] = None    # latest tracked pose (any frame)
         self._baseline_override: Optional[fc.Pose2] = None
+        # Loosely-coupled IMU spine-heading (Option A): online-learned sign of the
+        # IMU yaw vs the SE(2) graph frame, and the previous keyframe's IMU yaw.
+        self._imu_yaw_sign = 0.0
+        self._imu_sign_corr = 0.0
+        self._imu_sign_energy = 0.0
+        self._prev_kf_imu_yaw: Optional[float] = None
 
     def current_pose(self) -> Optional[fc.Pose2]:
         return self._last_pose
@@ -420,6 +426,31 @@ class VoFEAdapter:
         motion at `pose` (the VO estimate at the flip instant) so it chains from
         the last graph pose — instead of from the discarded grace keyframe."""
         self._baseline_override = pose
+
+    def _imu_correct_yaw(self, rel: fc.Pose2, imu_y: Optional[float]) -> fc.Pose2:
+        """Replace the spine's drifting VO relative yaw with the drift-free IMU
+        relative yaw (this KF's IMU yaw minus the previous KF's). The sign of the
+        IMU frame vs the SE(2) graph frame is learned online from correlated
+        small VO/IMU yaw deltas (the proven calibration pattern); until it is
+        committed the VO heading is kept (it is still fresh that early). alpha
+        blends: 1.0 fully adopts IMU heading, <1 nudges toward it."""
+        prev = self._prev_kf_imu_yaw
+        if imu_y is None or prev is None:
+            return rel
+        dyaw_imu = math.atan2(math.sin(imu_y - prev), math.cos(imu_y - prev))
+        dyaw_vo = rel.theta
+        if self._imu_yaw_sign == 0.0:
+            if abs(dyaw_vo) < 0.5 and abs(dyaw_imu) < 0.5:
+                self._imu_sign_corr += dyaw_vo * dyaw_imu
+                self._imu_sign_energy += abs(dyaw_vo * dyaw_imu)
+                if self._imu_sign_energy > 0.05 and \
+                        abs(self._imu_sign_corr) > 0.6 * self._imu_sign_energy:
+                    self._imu_yaw_sign = math.copysign(1.0, self._imu_sign_corr)
+            return rel
+        target = self._imu_yaw_sign * dyaw_imu
+        err = math.atan2(math.sin(target - rel.theta), math.cos(target - rel.theta))
+        nt = rel.theta + self.cfg.vo_imu_spine_alpha * err
+        return fc.Pose2(rel.x, rel.y, math.atan2(math.sin(nt), math.cos(nt)))
 
     def feed(self, ev) -> Tuple[Optional[KeyframeData], Optional[fc.Pose2]]:
         import cv2
@@ -436,6 +467,7 @@ class VoFEAdapter:
             return None, None
         fe_pose = _cam_to_se2(nkf.Twc)
         blind = nkf.state == fc.VoState.REINIT
+        spine_from_prev = False
         if self._baseline_override is not None:
             # first keyframe after a cross-sensor handoff: chain from the flip
             # baseline, then resume the BA-refined prev_Twc spine.
@@ -445,6 +477,14 @@ class VoFEAdapter:
             rel = None
         else:
             rel = _rel(_cam_to_se2(nkf.prev_Twc), fe_pose)
+            spine_from_prev = True
+        # Loosely-coupled IMU heading (Option A): on a normal prev->cur spine,
+        # swap the drifting VO relative yaw for the drift-free IMU relative yaw.
+        imu_y = self.fe.imu_yaw_at(t)
+        if spine_from_prev and self.cfg.vo_imu_spine_heading:
+            rel = self._imu_correct_yaw(rel, imu_y)
+        if imu_y is not None:
+            self._prev_kf_imu_yaw = imu_y
         scan = self.stream.nearest_scan(t)
         scan = scan if scan is not None else np.zeros((0, 2), np.float32)
         visual = (nkf.kpts, nkf.des, nkf.pts3d_cam)

@@ -7,6 +7,13 @@ datasets: **`lab_hybrid_small`** (a single cluttered workshop room, 164 s) and
 cadence, the lag / late-frame figures are literal. Each run produced a fused occupancy
 map, a trajectory, per-keyframe timing/memory, and a per-candidate loop log.
 
+The two visual-VO front-ends (`orb`, `orb_lidar`) apply a **loosely-coupled IMU heading**
+correction: each keyframe's spine edge takes its relative *yaw* from the drift-free IMU
+(absolute yaw drifts ≈ 0.001° over a run), keeping VO for translation and leaving the visual
+bundle-adjustment untouched. This is applied at the SE(2) graph boundary — a scalar
+ground-plane yaw, immune to the camera's ~8° mount tilt that makes per-frame IMU *tracking*
+priors fail — and it bounds the VO heading drift that otherwise feeds the loop verifiers.
+
 The nine combinations span the modular axes — LiDAR front-end (`scan-to-submap` /
 `scan-to-map`), loop verifier (B&B / ICP / ORB-PnP), and proposer (proximity / DBoW):
 
@@ -43,9 +50,9 @@ accepted; **recall** = true-accepted / (true-accepted + true-loops-rejected).
 | lidar_s2m_icp | 155 | 38 | 36 | 20 | 14 | 0 | 0.59 | 1.00 | 0.02 | 9 | 6.2 | 0.13 | **0.64** | **0.02** |
 | lidar_orb_s2s | 159 | 41 | 9 | 9 | 0 | 15 | **1.00** | 0.38 | 0.01 | 7 | 4.7 | 0.26 | 0.56 | 0.44 |
 | lidar_orb_s2m | 155 | 38 | 8 | 6 | 0 | 14 | **1.00** | 0.30 | 0.02 | 10 | 7.1 | 0.26 | **0.64** | 0.03 |
-| orb_lidar_bnb | 249 | 9 | 1 | 1 | 0 | 8 | **1.00** | 0.11 | 0.00 | 18 | 18.7 | 0.66 | 0.46 | 0.02 |
-| orb_lidar_icp | 249 | 9 | 7 | 7 | 0 | 2 | **1.00** | 0.78 | 0.00 | 18 | 18.5 | 0.67 | 0.44 | 0.37 |
-| orb | 249 | 9 | 9 | 9 | 0 | 0 | **1.00** | 1.00 | 0.00 | 18 | 18.5 | 0.67 | 0.50 | 0.05 |
+| orb_lidar_bnb | 249 | 9 | 1 | 1 | 0 | 8 | **1.00** | 0.11 | 0.00 | 18 | 18.1 | 0.66 | 0.49 | 0.02 |
+| orb_lidar_icp | 249 | 9 | 7 | 7 | 0 | 2 | **1.00** | 0.78 | 0.00 | 18 | 18.2 | 0.67 | 0.49 | 0.39 |
+| orb | 249 | 9 | 9 | 9 | 0 | 0 | **1.00** | 1.00 | 0.00 | 18 | 17.9 | 0.67 | 0.51 | 0.05 |
 
 Maps: `figures/lab_hybrid_small__<combo>.png`.
 
@@ -57,7 +64,7 @@ Maps: `figures/lab_hybrid_small__<combo>.png`.
 - **lidar_orb_s2s** — Precision 1.00 but recall only 0.38: visual PnP confirms only loops the camera also saw, missing the heading-divergent revisits; the map is its s2s front-end's (driftier, 0.44 m).
 - **lidar_orb_s2m** — Precision 1.00 on the crisp s2m map (sharpness 0.64, drift 0.03 m) at the lowest recall (0.30): the precision-first, clean-map option.
 - **orb_lidar_bnb** — Only 1 loop accepted (recall 0.11): VO drifts little over the short single room, so almost no revisit registers a graph offset for B&B to confirm.
-- **orb_lidar_icp** — Recall 0.78 (vs B&B's 0.11) on the same VO front-end: B&B-seeded ICP tolerates the small residual VO drift and recovers most revisits; precision stays 1.00.
+- **orb_lidar_icp** — Recall 0.78 (vs B&B's 0.11) on the same VO front-end: with the IMU-corrected heading seeding it, standalone ICP recovers most revisits at precision 1.00 even over the short room — the same map that, two-room, was its catastrophic case before the heading fix.
 - **orb** — Recall 1.00: DBoW + PnP catches every appearance revisit in the compact room; but the camera-only map is the least sharp of the LiDAR-fused options (0.50).
 
 **Single-room discussion.** Map quality clearly favours the **scan-to-map** variants
@@ -85,9 +92,9 @@ unavailable, at a clear compute and stability cost.
 | lidar_s2m_icp | 368 | 104 | 85 | 49 | 33 | 6 | 0.60 | 0.89 | 0.0 | 11 | 7.1 | 0.19 | **0.63** | 0.28 |
 | lidar_orb_s2s | 382 | 110 | 29 | 29 | 0 | 29 | **1.00** | 0.50 | 0.0 | 8 | 5.1 | 0.35 | 0.54 | 0.47 |
 | lidar_orb_s2m | 368 | 103 | 24 | 22 | 0 | 29 | **1.00** | 0.43 | 0.0 | 11 | 7.4 | 0.32 | **0.63** | **0.13** |
-| orb_lidar_bnb | 647 | 47 | 40 | 40 | 0 | 7 | **1.00** | 0.85 | 0.0 | 18 | 18.9 | 0.75 | 0.56 | 0.63 |
-| orb_lidar_icp | 647 | 47 | 38 | 38 | 0 | 9 | **1.00** | 0.81 | 0.0 | 18 | 18.2 | 0.74 | 0.55 | **4.25** |
-| orb | 647 | 47 | 31 | 31 | 0 | 16 | **1.00** | 0.66 | 0.0 | 18 | 18.1 | 0.75 | 0.57 | 0.67 |
+| orb_lidar_bnb | 647 | 47 | 40 | 40 | 0 | 7 | **1.00** | 0.85 | 0.0 | 18 | 17.8 | 0.75 | 0.58 | 0.57 |
+| orb_lidar_icp | 647 | 47 | 40 | 40 | 0 | 7 | **1.00** | 0.85 | 0.0 | 18 | 17.7 | 0.75 | 0.58 | 1.11 |
+| orb | 647 | 47 | 31 | 31 | 0 | 16 | **1.00** | 0.66 | 0.0 | 18 | 17.7 | 0.75 | 0.58 | 0.63 |
 
 Maps: `figures/lab_hybrid__<combo>.png`.
 
@@ -98,8 +105,8 @@ Maps: `figures/lab_hybrid__<combo>.png`.
 - **lidar_s2m_icp** — Highest recall on this map (0.89) on the crisp s2m map, but drift (0.28 m) is double s2m_bnb's — ICP's marginal edges loosen the global solution slightly.
 - **lidar_orb_s2s** — Precision 1.0 again, recall up 0.38 → 0.50 vs small: the longer route offers more camera-confirmable revisits, though half are still missed (heading-divergent).
 - **lidar_orb_s2m** — Precision 1.0 + the crisp s2m map (drift 0.13 m) again at low recall (0.43): the same precision-first / clean-map profile as on the small map, now over two rooms.
-- **orb_lidar_bnb** — Recall jumps 0.11 → 0.85 vs the small map: the long two-room route accrues real VO drift, so revisits produce graph offsets B&B can confirm — vision-led loop closure needs distance to "earn" loops.
-- **orb_lidar_icp** — **Drift 4.25 m despite precision 1.0**: one geometrically-valid-but-misaligned ICP loop (a corridor slide-lock) warps the global map — the cautionary run where "every accepted loop is true" still yields a poor map.
+- **orb_lidar_bnb** — Recall jumps 0.11 → 0.85 vs the small map: the long two-room route offers many camera-confirmable revisits, and with the IMU-bounded heading the B&B seed is reliable enough to confirm them (drift 0.57 m) — vision-led loop closure needs distance to "earn" loops.
+- **orb_lidar_icp** — **Drift 1.11 m (was 4.25 m before the IMU heading fix)**: with the VO spine yaw now IMU-locked, the standalone ICP seed lands in the right basin instead of a corridor slide-lock, so it matches B&B's loop set exactly (recall 0.85); the residual gap to B&B (0.57 m) is ICP's local-refinement precision, not a warp — unlike the small room, the two-room route is where this fix mattered.
 - **orb** — Recall falls 1.00 → 0.66 vs the small map: DBoW proposes fewer of the long route's revisits (appearance is viewpoint-dependent over distance); the camera-only map remains coarser than the LiDAR-fused ones.
 
 **Two-room discussion.** The larger map sharpens every trend. **`lidar_s2m_bnb`** is again the
@@ -108,8 +115,10 @@ consistent across both environments. The precision/recall split is now unmistaka
 **scan verifiers** sit at recall 0.75–0.89 / precision 0.60–0.71 (high coverage, some aliased
 accepts), while **PnP verifiers** sit at precision 1.0 / recall 0.43–0.85 (no false loops, but
 they discard heading-divergent revisits). The **visual-VO** modes reach competitive recall
-here (`orb_lidar_bnb` 0.85) but at ≈ 0.75 GB and ≈ 18 % late frames, and `orb_lidar_icp` shows
-the real risk of metric-ICP on drifted VO (the 4.25 m warp). The framework's value is exactly
+here (`orb_lidar_bnb` and `orb_lidar_icp` both 0.85) but at ≈ 0.75 GB and ≈ 18 % late frames;
+once the VO heading is IMU-bounded, `orb_lidar_icp` tracks B&B's loop set exactly and its map
+deforms only by ICP's local-refinement precision (drift 1.11 m vs B&B's 0.57 m) rather than the
+4.25 m slide-lock warp it suffered when the seed heading was left to drift. The framework's value is exactly
 this spread: a deployment that needs a **crisp metric map cheaply** picks `lidar_s2m_bnb`; one
 that **cannot tolerate a false loop** picks a PnP-verified mode; one **without LiDAR odometry**
 falls back to `orb_lidar`, accepting higher cost and the need for route length before loops

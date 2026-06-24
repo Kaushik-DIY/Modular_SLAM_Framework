@@ -24,6 +24,17 @@ class FusionV2Config:
     # --- IMU (always-on pose-prior fallback; plan V4 cross-cutting req.) ---
     lidar_use_imu: bool = True             # extrapolator gyro+yaw in LiDAR FEs
     vo_imu_dropout: bool = True            # VO dead-reckoning during dropouts
+    # Loosely-coupled IMU heading for the VO front-end (modes orb / orb_lidar):
+    # replace the DRIFTING VO relative-yaw in each keyframe's spine edge with the
+    # drift-free IMU relative-yaw (a scalar ground-plane delta, immune to the ~8 deg
+    # camera mount tilt that broke per-frame IMU tracking priors). VO still owns x/y
+    # and the visual BA is untouched (no reinit regression). This is the root-cause
+    # fix for the orb_lidar heading warp: the ICP/B&B loop seed heading becomes
+    # correct, so the EXISTING verifier finds the right yaw. Sign vs the SE(2) frame
+    # is learned online by VO/IMU delta correlation. alpha=1.0 fully replaces the
+    # spine yaw with IMU; <1 blends. No-op when imu.csv is absent.
+    vo_imu_spine_heading: bool = True
+    vo_imu_spine_alpha: float = 1.0
 
     # --- memory tiers (RTAB defaults, CLAUDE.md §2.13) ---
     stm_size: int = 30
