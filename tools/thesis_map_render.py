@@ -20,6 +20,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
+# Paper-grade defaults: embed TrueType fonts (selectable/searchable text in the
+# PDF, not type-3 outlines) and keep figures tight. Visual style is unchanged.
+matplotlib.rcParams.update({
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    "savefig.bbox": "tight",
+})
+
 MODE_LABEL = {
     "lidar_s2s_bnb": "LiDAR · scan-to-submap · B&B",
     "lidar_s2s_icp": "LiDAR · scan-to-submap · ICP",
@@ -46,7 +54,7 @@ def _scale_bar(ax, extent, metres=5.0):
             va="bottom", fontsize=11, zorder=10)
 
 
-def render(run_dir: Path, map_name: str, combo: str, out_png: Path):
+def render(run_dir: Path, map_name: str, combo: str, out_png: Path, dpi: int = 600):
     prob = np.load(run_dir / "map.npy")
     meta = json.load(open(run_dir / "map_meta.json"))
     ext = meta["extent"]
@@ -64,7 +72,7 @@ def render(run_dir: Path, map_name: str, combo: str, out_png: Path):
     fig_h = max(3.0, fig_w * span_y / max(span_x, 1e-6))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.imshow(prob, cmap="gray_r", vmin=0.0, vmax=1.0, origin="lower",
-              extent=ext, interpolation="nearest")
+              extent=ext, interpolation="nearest", rasterized=True)
     if traj is not None and len(traj):
         ax.plot(traj[:, 0], traj[:, 1], "-", lw=0.7, color="#1f77b4", alpha=0.55, zorder=4)
         ax.scatter(traj[0, 0], traj[0, 1], s=22, c="#15a015", zorder=6)   # start
@@ -77,7 +85,11 @@ def render(run_dir: Path, map_name: str, combo: str, out_png: Path):
         sp.set_edgecolor("#999"); sp.set_linewidth(0.8)
     fig.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=200, bbox_inches="tight")
+    # Paper-grade output: a vector PDF (axes/title/scale-bar stay vector; the
+    # occupancy grid is the only rasterized layer, embedded at `dpi`) plus a
+    # high-DPI PNG for quick viewing. Style unchanged from the original figure.
+    fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(out_png.with_suffix(".pdf"), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -85,7 +97,7 @@ COMBO_ORDER = ["lidar_s2s_bnb", "lidar_s2s_icp", "lidar_s2m_bnb", "lidar_s2m_icp
                "lidar_orb_s2s", "lidar_orb_s2m", "orb_lidar_bnb", "orb_lidar_icp", "orb"]
 
 
-def master(figdir: Path, map_name: str):
+def master(figdir: Path, map_name: str, dpi: int = 300):
     """One 3x3 master image of all 9 mode maps for a map (easy side-by-side)."""
     import matplotlib.image as mpimg
     figs = [(c, figdir / f"{map_name}__{c}.png") for c in COMBO_ORDER]
@@ -96,13 +108,14 @@ def master(figdir: Path, map_name: str):
     for ax in axes.ravel():
         ax.axis("off")
     for ax, (c, p) in zip(axes.ravel(), figs):
-        ax.imshow(mpimg.imread(p))
+        ax.imshow(mpimg.imread(p), interpolation="antialiased")
         ax.set_title(MODE_LABEL.get(c, c), fontsize=12)
     fig.suptitle(f"{MAP_LABEL.get(map_name, map_name)}  —  all 9 modes "
                  f"(fused occupancy)", fontsize=17, y=0.99)
     fig.tight_layout(rect=[0, 0, 1, 0.98])
     out = figdir / f"master_{map_name}.png"
-    fig.savefig(out, dpi=130, bbox_inches="tight")
+    fig.savefig(out, dpi=dpi, bbox_inches="tight")
+    fig.savefig(out.with_suffix(".pdf"), dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     print(f"  master -> {out}")
 
@@ -110,6 +123,7 @@ def master(figdir: Path, map_name: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", type=Path, required=True)
+    ap.add_argument("--dpi", type=int, default=600, help="paper-grade raster DPI")
     a = ap.parse_args()
     figdir = a.root / "figures"
     n = 0
@@ -118,7 +132,7 @@ def main():
         if not (run_dir / "map.npy").exists():
             continue
         map_name, combo = run_dir.parts[-2], run_dir.parts[-1]
-        render(run_dir, map_name, combo, figdir / f"{map_name}__{combo}.png")
+        render(run_dir, map_name, combo, figdir / f"{map_name}__{combo}.png", dpi=a.dpi)
         maps.add(map_name)
         n += 1
         print(f"  rendered {map_name}/{combo}")
