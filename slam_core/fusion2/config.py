@@ -58,6 +58,13 @@ class FusionV2Config:
     huber_scale: float = 10.0
     optimize_every_n_kf: int = 30
 
+    # --- loop closure on/off ---
+    # When False the runner does ONLY front-end local mapping (scan-matching /
+    # VO+local-BA odometry chained on the spine graph) — no loop propose/verify/
+    # constraint and no global optimize. Lets us measure how far a front-end alone
+    # carries (e.g. a small area may map well with no loop closure at all).
+    enable_loops: bool = True
+
     # --- loop proposing (proximity; bounded per Test-3 lessons) ---
     propose_every_n_kf: int = 5
     min_kf_separation: int = 30

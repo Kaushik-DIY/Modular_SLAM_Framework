@@ -32,6 +32,10 @@ MATRIX = {
     "orb_lidar_bnb": ["--mode", "orb_lidar", "--verifier", "bnb"],
     "orb_lidar_icp": ["--mode", "orb_lidar", "--verifier", "icp"],
     "orb":           ["--mode", "orb"],
+    # front-end-only (loop closure OFF): pure local mapping baselines
+    "s2s_frontend":  ["--mode", "lidar", "--lidar-frontend", "native_s2s", "--no-loops"],
+    "s2m_frontend":  ["--mode", "lidar", "--lidar-frontend", "native_s2m", "--no-loops"],
+    "vo_frontend":   ["--mode", "orb", "--no-loops"],
 }
 
 

@@ -38,6 +38,9 @@ MODE_LABEL = {
     "orb_lidar_bnb": "Visual VO + LiDAR-B&B verify",
     "orb_lidar_icp": "Visual VO + LiDAR-ICP verify",
     "orb":           "Visual VO + visual-PnP",
+    "s2s_frontend":  "LiDAR scan-to-submap · front-end only (no loops)",
+    "s2m_frontend":  "LiDAR scan-to-map · front-end only (no loops)",
+    "vo_frontend":   "Visual VO + local BA · front-end only (no loops)",
 }
 MAP_LABEL = {"lab_hybrid": "Two-room lab", "lab_hybrid_small": "Single-room lab"}
 

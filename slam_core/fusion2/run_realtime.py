@@ -230,6 +230,10 @@ class IngestEngine:
     # -- close loops + optimize for one keyframe ---------------------------
     def close_loops(self, kf_id, node_pose, sig, raw_scan):
         cfg, shared = self.cfg, self.shared
+        # Front-end-only mode: no propose/verify/loop-constraint and no global
+        # optimize — the map is the raw spine (scan-matching / VO+local-BA) chain.
+        if not cfg.enable_loops:
+            return False
         any_loop = False
         # dbow queries every keyframe (its index enforces separation); proximity
         # is gated to every Nth keyframe past the separation horizon.
@@ -722,6 +726,9 @@ def _parse_args():
     p.add_argument("--print-every", type=int, default=50)
     p.add_argument("--output", type=Path, default=Path("fusion2_outputs"))
     p.add_argument("--no-map", action="store_true")
+    p.add_argument("--no-loops", action="store_true",
+                   help="Front-end local mapping only: disable loop closure "
+                        "(no propose/verify/constraint, no global optimize).")
     return p.parse_args()
 
 
@@ -740,7 +747,7 @@ def main(argv=None):
     args = _parse_args()
     cfg = FusionV2Config(mode=args.mode, dataset=args.dataset, output_dir=args.output,
                          lidar_frontend=args.lidar_frontend, scan_verifier=args.verifier,
-                         max_scans=args.max_scans)
+                         max_scans=args.max_scans, enable_loops=not args.no_loops)
     start_sensor = SENSOR_OF_MODE[args.mode]
     proposer, verifier = _mode_defaults(args.mode, args.verifier)
     if args.proposer is not None:
@@ -790,7 +797,8 @@ def main(argv=None):
     print("=" * 60)
     print(f"Dataset   : {cfg.dataset}")
     print(f"Front-end : {sm.active_variant}  (mode {cfg.mode}, sensor {start_sensor})")
-    print(f"Verifier  : {verifier}   Proposer: {proposer}")
+    print(f"Verifier  : {verifier}   Proposer: {proposer}"
+          f"   Loops: {'ON' if cfg.enable_loops else 'OFF (front-end only)'}")
     print(f"Visual    : {'available' if visual_available else 'lean (scan only)'}"
           f"{'' if start_sensor == 'vo' else ' (LiDAR attach=%s)' % lidar_attach}")
     print(f"Playback  : {'real-time' if args.speed > 0 else 'max'} (speed={args.speed}x)")
@@ -908,9 +916,12 @@ def main(argv=None):
         if args.max_scans and active_events >= args.max_scans:
             break
 
-    # final optimize + outputs (+ auto-display the corrected fused map)
-    shared.graph.optimize()
-    eng.stats["optimize_calls"] += 1
+    # final optimize + outputs (+ auto-display the corrected fused map).
+    # Front-end-only runs skip it: with no loop edges the spine is already
+    # consistent, so the map stays the raw odometry chain.
+    if cfg.enable_loops:
+        shared.graph.optimize()
+        eng.stats["optimize_calls"] += 1
     if isinstance(sm.active, VoFEAdapter):
         eng.stats["reinits"] = sm.active.reinits
         eng.stats["fallbacks"] = 0
