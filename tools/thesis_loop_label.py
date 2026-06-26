@@ -75,9 +75,9 @@ def gather(root, map_name, bin_s=0.1):
     return pairs
 
 
-def build(root):
+def build(root, maps=("lab_hybrid_small", "lab_hybrid")):
     root = Path(root)
-    for map_name in ("lab_hybrid_small", "lab_hybrid"):
+    for map_name in maps:
         runs = glob.glob(f"{root}/{map_name}/*/verifications.csv")
         if not runs:
             print(f"  {map_name}: no runs yet, skipping"); continue
@@ -192,7 +192,7 @@ def _scan_scorer(map_name):
     return score
 
 
-def label(root, img_thresh=18, scan_thresh=0.55):
+def label(root, img_thresh=18, scan_thresh=0.55, maps=("lab_hybrid_small", "lab_hybrid")):
     """Auto-label every unique pair by PHYSICAL REVISIT = image OR scan overlap:
     TRUE if ORB+RANSAC inliers >= img_thresh OR B&B scan score >= scan_thresh.
     Writes labels_<map>.csv (pair_id,label,inliers,scan,evidence)."""
@@ -200,7 +200,7 @@ def label(root, img_thresh=18, scan_thresh=0.55):
     root = Path(root)
     orb = cv2.ORB_create(2000)
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
-    for map_name in ("lab_hybrid_small", "lab_hybrid"):
+    for map_name in maps:
         pf = root / f"pairs_{map_name}.csv"
         if not pf.exists():
             continue
@@ -232,15 +232,18 @@ def label(root, img_thresh=18, scan_thresh=0.55):
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
+    DEF = ["lab_hybrid_small", "lab_hybrid"]
     b = sub.add_parser("build"); b.add_argument("--root", required=True)
+    b.add_argument("--maps", nargs="+", default=DEF)
     lb = sub.add_parser("label"); lb.add_argument("--root", required=True)
     lb.add_argument("--img-thresh", type=int, default=18)
     lb.add_argument("--scan-thresh", type=float, default=0.40)
+    lb.add_argument("--maps", nargs="+", default=DEF)
     a = ap.parse_args()
     if a.cmd == "build":
-        build(a.root)
+        build(a.root, a.maps)
     elif a.cmd == "label":
-        label(a.root, a.img_thresh, a.scan_thresh)
+        label(a.root, a.img_thresh, a.scan_thresh, a.maps)
 
 
 if __name__ == "__main__":

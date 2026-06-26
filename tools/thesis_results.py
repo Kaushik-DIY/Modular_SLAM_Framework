@@ -97,9 +97,10 @@ def _md_table(rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
+    ap.add_argument("--maps", nargs="+", default=["lab_hybrid_small", "lab_hybrid"])
     a = ap.parse_args()
     root = Path(a.root)
-    for map_name in ("lab_hybrid_small", "lab_hybrid"):
+    for map_name in a.maps:
         if not (root / map_name).exists():
             continue
         labels = _labels(root, map_name)

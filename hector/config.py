@@ -481,6 +481,12 @@ _PROFILES: dict = {
 # IMU-bounded heading error) seen before the first closure.
 _PROFILES["lab_hybrid"] = dict(
     _PROFILES["lab_run_2"],
+    # scan-to-map global map is fixed-extent + centred on the start pose; 40 m
+    # (lab_run_2 default) only spans +-20 m, so a larger traverse (the lab_hybrid_3
+    # recordings reach ~26 m) crosses the boundary and s2m runs away. 80 m gives
+    # +-40 m of safe margin (4x memory of a 40 m grid, still small). s2s is
+    # unaffected (its submap is local + travels with the robot).
+    MAP_SIZE_METERS            = 80.0,
     PGO_LOOP_SEARCH_XY         = 3.5,   # 7.0 -> 3.5 m: ~4x smaller coarse search area
     PGO_LOOP_SEARCH_TH_DEG     = 15.0,  # 30 -> 15 deg: ~2x fewer angular perturbations (IMU yaw is reliable)
     PGO_SPATIAL_SEARCH_RADIUS  = 6.0,   # 8.0 -> 6.0 m: fewer candidate submaps per new node
