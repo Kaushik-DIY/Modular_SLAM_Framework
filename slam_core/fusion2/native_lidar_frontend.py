@@ -124,6 +124,7 @@ class NativeLidarFrontend:
             self._imu = []
 
         self.fallback_count = 0
+        self.last_score = float("nan")    # coarse match score of the most recent scan
         self.process_ms: List[float] = []
 
     def process(self, t: float, scan_xy: np.ndarray) -> Tuple[Pose2, np.ndarray, bool]:
@@ -137,6 +138,7 @@ class NativeLidarFrontend:
                              imu_samples=imu)
         if r.fallback:
             self.fallback_count += 1
+        self.last_score = float(r.score)
         self.process_ms.append(r.process_ms)
         pts = np.ascontiguousarray(self._fe.last_filtered_points(), dtype=np.float32)
         return Pose2(r.pose.x, r.pose.y, r.pose.theta), pts, bool(r.is_keyframe)

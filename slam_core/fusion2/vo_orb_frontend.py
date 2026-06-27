@@ -211,6 +211,11 @@ class NativeOrbFrontend:
         return self._last_result.track_ms if self._last_result else 0.0
 
     @property
+    def last_inliers(self) -> int:
+        """Inlier count of the most recent track() — VO health signal."""
+        return self._last_result.n_inliers if self._last_result else 0
+
+    @property
     def imu_calibration(self) -> dict:
         return dict(yaw_sign=self._yaw_sign,
                     up_axis=self._up.round(4).tolist())

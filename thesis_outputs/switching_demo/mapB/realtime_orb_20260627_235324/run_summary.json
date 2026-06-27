@@ -1,0 +1,61 @@
+{
+  "mode": "orb",
+  "frontend": "native_s2m",
+  "final_verifier": "icp",
+  "final_proposer": "proximity",
+  "blind_kfs": 37,
+  "switches": [
+    {
+      "k": 3080,
+      "kf": 179,
+      "stamp": 1781020320.635102,
+      "x": -0.9135,
+      "y": 10.7208,
+      "kind": "fe",
+      "frm": "visual_vo",
+      "to": "native_s2m",
+      "autofallback": false
+    },
+    {
+      "k": 6405,
+      "kf": 300,
+      "stamp": 1781020455.732922,
+      "x": -0.7552,
+      "y": 12.4226,
+      "kind": "verifier",
+      "frm": "pnp",
+      "to": "icp",
+      "autofallback": false
+    },
+    {
+      "k": 9010,
+      "kf": 390,
+      "stamp": 1781020561.599022,
+      "x": 0.0376,
+      "y": 4.6364,
+      "kind": "proposer",
+      "frm": "dbow",
+      "to": "proximity",
+      "autofallback": false
+    }
+  ],
+  "keyframes": 441,
+  "proposals": 34,
+  "verified": 34,
+  "loops_accepted": 32,
+  "rehearsal_merges": 6,
+  "optimize_calls": 31,
+  "reinits": 0,
+  "fallbacks": 1,
+  "realtime_lag_s": 0.0,
+  "late_pct": 0.0,
+  "events": 10615,
+  "slam_ms_mean": 23.613,
+  "loop_ms_mean": 0.226,
+  "draw_ms_mean": 15.103,
+  "peak_rss_gb": 0.96,
+  "map_payload_mb": 18.8,
+  "stm": 30,
+  "wm": 200,
+  "ltm": 205
+}

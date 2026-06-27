@@ -1,0 +1,4 @@
+k,kf,stamp,x,y,kind,frm,to,autofallback
+3080,179,1781020320.635102,-0.9135,10.7208,fe,visual_vo,native_s2m,False
+6405,300,1781020455.732922,-0.7552,12.4226,verifier,pnp,icp,False
+9010,390,1781020561.599022,0.0376,4.6364,proposer,dbow,proximity,False

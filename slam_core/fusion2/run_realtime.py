@@ -350,6 +350,11 @@ class LidarFEAdapter:
     def variant(self) -> str:
         return self.fem.active_kind
 
+    @property
+    def last_quality(self) -> float:
+        """Per-scan tracking quality: the active LiDAR matcher's coarse score."""
+        return float(getattr(self.fem.active, "last_score", float("nan")))
+
     def current_pose(self) -> Optional[fc.Pose2]:
         """The latest front-end pose estimate (for a cross-sensor flip baseline)."""
         return self._last_pose
@@ -413,6 +418,7 @@ class VoFEAdapter:
         self.K = self.fe.K
         self.reinits = 0
         self.variant = "visual_vo"
+        self.last_quality = float("nan")              # latest VO inlier count
         self._last_pose: Optional[fc.Pose2] = None    # latest tracked pose (any frame)
         self._baseline_override: Optional[fc.Pose2] = None
         # Loosely-coupled IMU spine-heading (Option A): online-learned sign of the
@@ -465,6 +471,7 @@ class VoFEAdapter:
             return None, None
         Twc, state, nkf = self.fe.track(rgb, depth, t)
         self._last_pose = _cam_to_se2(Twc)
+        self.last_quality = float(self.fe.last_inliers)
         if state == fc.VoState.REINIT:
             self.reinits += 1
         if nkf is None:
@@ -720,6 +727,11 @@ def _parse_args():
                    help="Cap on active-sensor keyframe-driving events (0 = all).")
     p.add_argument("--grace-scans", type=int, default=20,
                    help="Warm-up events for a front-end handoff (variant + cross-sensor).")
+    p.add_argument("--switch-schedule", type=str, default=None,
+                   help="Deterministic module switches keyed by keyframe count, e.g. "
+                        "\"180:proposer dbow;330:fe vo;470:verifier pnp\". Each entry is "
+                        "kf_threshold:<live-command>. Drives the same path as interactive "
+                        "commands; used to generate reproducible switching-demo runs.")
     p.add_argument("--speed", type=float, default=1.0,
                    help="1.0=real-time, 0=as-fast-as-possible.")
     p.add_argument("--draw-every", type=int, default=5)
@@ -811,6 +823,13 @@ def main(argv=None):
 
     switch_q: "queue.Queue" = queue.Queue()
     _start_switch_reader(switch_q)
+    schedule = _parse_switch_schedule(args.switch_schedule)
+    if schedule:
+        print("Schedule  : " + "  ".join(f"kf{kf}->[{cmd}]" for kf, cmd in schedule))
+    # switch + per-keyframe logging (attached to eng so _finalize can emit them).
+    eng.switch_events = []     # one row per applied switch (verifier/proposer/fe)
+    eng.timeline = []          # one row per keyframe (pose + active modules + quality)
+    _last_xy = [0.0, 0.0]      # latest graph pos, for annotating switch markers
 
     live = LiveView(f"fusion realtime — {cfg.mode}/{sm.active_variant}")
     timer = StageTimer()
@@ -835,8 +854,13 @@ def main(argv=None):
         sensor, t = ev[0], ev[1]
         ev_start = time.perf_counter()
 
+        # scheduled switches: inject the command when the keyframe count crosses
+        # the threshold (deterministic replay of the interactive path).
+        while schedule and eng.stats["keyframes"] >= schedule[0][0]:
+            switch_q.put(schedule[0][1]); schedule.pop(0)
         # drain live commands (main thread only)
-        if _apply_switches(switch_q, eng, sm, k):
+        if _apply_switches(switch_q, eng, sm, k, kf=eng.stats["keyframes"],
+                           stamp=t, xy=_last_xy, events=eng.switch_events):
             break
         if sensor == "__tick__":      # ros heartbeat: no sensor data this tick
             continue
@@ -844,6 +868,9 @@ def main(argv=None):
             t0_data, t0_wall = t, time.perf_counter()
 
         # route the event: pending FE warms up on its sensor, active FE drives.
+        # (capture the active variant BEFORE feed so a completed flip logs its
+        # true source — sm.active is already the new adapter afterwards.)
+        prev_variant = sm.active_variant
         t_a = time.perf_counter()
         kfd, fe_flip, sensor_flip = sm.feed(ev)
         timer.add("slam", time.perf_counter() - t_a)
@@ -858,10 +885,18 @@ def main(argv=None):
             print(f"[switch] >>> SENSOR now {sensor_flip['sensor']} "
                   f"({sm.active_variant}) at k={k} (graph continues from last "
                   f"pose).{extra}")
+            eng.switch_events.append(dict(
+                k=k, kf=eng.stats["keyframes"], stamp=round(t, 6),
+                x=round(_last_xy[0], 4), y=round(_last_xy[1], 4), kind="fe",
+                frm=prev_variant, to=sm.active_variant, autofallback=bool(fb)))
         if fe_flip is not None:
             cfg.lidar_frontend = sm.active_variant
             print(f"[switch] >>> front-end now {sm.active_variant} at k={k} "
                   f"(graph continues from last pose).")
+            eng.switch_events.append(dict(
+                k=k, kf=eng.stats["keyframes"], stamp=round(t, 6),
+                x=round(_last_xy[0], 4), y=round(_last_xy[1], 4), kind="fe",
+                frm=prev_variant, to=sm.active_variant, autofallback=False))
         if kfd is not None:
             active_events += 1
             scan = np.asarray(kfd.raw_scan, np.float64)
@@ -871,6 +906,14 @@ def main(argv=None):
             timer.add("loop", time.perf_counter() - t_b)
             kf_ids.append(kf_id)
             kf_scans.append(scan)
+            _last_xy[0], _last_xy[1] = node_pose.x, node_pose.y
+            # per-keyframe timeline (pose + active modules + tracking quality)
+            eng.timeline.append(dict(
+                kf=kf_id, stamp=round(t, 6),
+                x=round(node_pose.x, 4), y=round(node_pose.y, 4),
+                theta=round(node_pose.theta, 5), sensor=sm.active_sensor,
+                fe=sm.active_variant, verifier=eng.verifier, proposer=eng.proposer,
+                quality=round(float(sm.active.last_quality), 4)))
             if did_opt:
                 # LOOP CORRECTION applied live: rebuild the WHOLE displayed
                 # trajectory + cloud from the corrected graph at once.
@@ -986,16 +1029,33 @@ def _start_switch_reader(q):
     threading.Thread(target=_reader, name="switch-reader", daemon=True).start()
 
 
+def _parse_switch_schedule(spec: Optional[str]):
+    """Parse "180:proposer dbow;330:fe vo" -> [(180,'proposer dbow'),(330,'fe vo')],
+    sorted by keyframe threshold. Empty/None -> []."""
+    if not spec:
+        return []
+    out = []
+    for entry in spec.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        kf_str, cmd = entry.split(":", 1)
+        out.append((int(kf_str), cmd.strip().lower()))
+    return sorted(out, key=lambda e: e[0])
+
+
 _FE_ALIAS = {"s2s": "native_s2s", "s2m": "native_s2m",
              "native_s2s": "native_s2s", "native_s2m": "native_s2m",
              "vo": "visual_vo", "orb": "visual_vo", "visual": "visual_vo",
              "visual_vo": "visual_vo", "lidar": "native_s2s"}
 
 
-def _apply_switches(q, eng, sm, k) -> bool:
+def _apply_switches(q, eng, sm, k, kf=0, stamp=0.0, xy=(0.0, 0.0), events=None) -> bool:
     """Drain stdin commands on the MAIN thread. Returns True on quit. Switches:
     verifier (bnb|icp|pnp), proposer (proximity|dbow), and the front-end —
-    LiDAR variant s2s<->s2m AND cross-sensor visual<->LiDAR (V5.7)."""
+    LiDAR variant s2s<->s2m AND cross-sensor visual<->LiDAR (V5.7). Applied
+    verifier/proposer changes are appended to `events` (fe flips are logged at
+    their effective flip in the main loop, since they take effect after grace)."""
     visual_available = _visual_available(sm.active)
     while True:
         try:
@@ -1026,7 +1086,12 @@ def _apply_switches(q, eng, sm, k) -> bool:
                 print("[switch] pnp unavailable on the active front-end (no visual "
                       "payload). Switch to a visual front-end or run --attach-visual.")
             else:
+                old = eng.verifier
                 eng.verifier = v
+                if events is not None and v != old:
+                    events.append(dict(k=k, kf=kf, stamp=round(stamp, 6),
+                                       x=round(xy[0], 4), y=round(xy[1], 4),
+                                       kind="verifier", frm=old, to=v, autofallback=False))
                 print(f"[switch] verifier -> {v} (effective next proposal).")
             continue
         if head == "proposer" and len(parts) == 2:
@@ -1037,9 +1102,14 @@ def _apply_switches(q, eng, sm, k) -> bool:
                 print("[switch] dbow unavailable on the active front-end (no "
                       "descriptors). Switch to a visual front-end or run --attach-visual.")
             else:
+                old = eng.proposer
                 if pr == "dbow":
                     eng.ensure_appearance()
                 eng.proposer = pr
+                if events is not None and pr != old:
+                    events.append(dict(k=k, kf=kf, stamp=round(stamp, 6),
+                                       x=round(xy[0], 4), y=round(xy[1], 4),
+                                       kind="proposer", frm=old, to=pr, autofallback=False))
                 print(f"[switch] proposer -> {pr} (dbow only sees indexed keyframes).")
             continue
         if head == "fe" and len(parts) == 2:
@@ -1090,16 +1160,28 @@ def _finalize_and_show(shared, cfg, eng, adapter, args, live):
     eng.stats["stm"] = shared.memory.stm_count()
     eng.stats["wm"] = shared.memory.wm_count()
     eng.stats["ltm"] = shared.memory.ltm_count()
+    switch_events = getattr(eng, "switch_events", [])
+    timeline = getattr(eng, "timeline", [])
     with open(run_dir / "run_summary.json", "w") as f:
         json.dump(dict(mode=cfg.mode, frontend=adapter.variant,
                        final_verifier=eng.verifier, final_proposer=eng.proposer,
-                       blind_kfs=len(eng.blind_ids), **eng.stats), f, indent=2, default=str)
+                       blind_kfs=len(eng.blind_ids), switches=switch_events,
+                       **eng.stats), f, indent=2, default=str)
+    import csv as _csv
     # per-candidate loop log (for offline true/false analysis)
     if eng.verify_log:
-        import csv as _csv
         with open(run_dir / "verifications.csv", "w", newline="") as f:
             w = _csv.DictWriter(f, fieldnames=list(eng.verify_log[0].keys()))
             w.writeheader(); w.writerows(eng.verify_log)
+    # switching-demo logs: applied switches + per-keyframe timeline
+    if switch_events:
+        with open(run_dir / "switches.csv", "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=list(switch_events[0].keys()))
+            w.writeheader(); w.writerows(switch_events)
+    if timeline:
+        with open(run_dir / "timeline.csv", "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=list(timeline[0].keys()))
+            w.writeheader(); w.writerows(timeline)
 
     if args.no_map or not len(poses):
         print(f"\nWrote: {run_dir}")

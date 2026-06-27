@@ -242,3 +242,43 @@ increases tracking collapses 5×, degrading map sharpness even when early loop c
 final drift low. This reinforces the modular selector argument: in a large low-texture space at
 variable speed, a LiDAR front-end is the safe default; VO-led modes can survive fast traversal
 through dense loop closure but at the cost of a blurrier occupancy map.
+
+---
+
+## Real-time module switching (live reconfiguration)
+
+The fusion-layer runner hot-swaps any module **mid-run** — front-end (s2s / s2m / VO), loop
+proposer (proximity / DBoW), loop verifier (B&B / ICP / PnP) — via a grace-buffer handoff that
+warms the incoming front-end on the live stream before flipping, resets the relative-motion
+baseline to the new estimate (no teleport), and auto-falls-back any module the new front-end
+cannot feed. To present this deterministically, switches were driven by a keyframe-indexed
+schedule (`--switch-schedule`, replaying the same code path as the interactive commands); each
+applied switch and a per-keyframe timeline are logged (`switches.csv`, `timeline.csv`).
+
+Two demo runs on `lab_2` exercise, between them, **every module** (front-ends s2s/VO/s2m,
+proposers proximity/DBoW, verifiers B&B/PnP/ICP):
+
+| run | start → end config | switches (at keyframe) | kf | loops | reinits |
+|---|---|---|---|---|---|
+| **Demo A** (`switching_demo_mapA`) | s2s·prox·B&B → VO·DBoW·PnP | ①prox→DBoW @114 · ②**s2s→VO** @259 · ③B&B→PnP @304 | 473 | 13 | 29 |
+| **Demo B** (`switching_demo_mapB`) | VO·DBoW·PnP → s2m·prox·ICP | ①**VO→s2m** @179 · ②PnP→ICP @300 · ③DBoW→prox @390 | 441 | 32 | 0 |
+
+**Feature-aware switch placement.** The cross-sensor switches are the stability-critical ones, so
+they are scheduled by *content*, not just by time: a VO-reference pass supplies per-timestamp
+visual-feature richness (tracking inliers) and turning rate, and the switch **into** VO (Demo A,
+kf 259) is placed on a sustained textured, non-turning stretch (≥95 inliers vs a median of 43,
+≤4.6° turn across the warm-up window) rather than mid-turn in a bare corridor. The switch **out
+of** VO (Demo B, kf 179) leaves while VO is still healthy. The no-handoff switches
+(proposer/verifier) are feature-insensitive and stay near their fractional targets — the
+timeline is used efficiently instead of waiting for a perfect moment for every switch.
+
+**Stability finding (the claim).** Across all six switches the **keyframe-to-keyframe
+displacement stays spike-free** (Demo figures, top trend panel) — the handoff introduces no
+teleport — and the trajectory on the final map is continuous through every switch marker.
+Loop closures continue to be accepted in the post-switch segments (Demo B accepts 20 of its 32
+loops *after* the first switch, on the s2m/ICP segments), so the map keeps being corrected
+regardless of which modules are active. The result is that **the occupancy map stays a single
+consistent two-room map** end-to-end, demonstrating that live reconfiguration is functional and
+non-disruptive. Figures: `figures/switching_demo_mapA.{pdf,png}`,
+`figures/switching_demo_mapB.{pdf,png}` (annotated map + 3 trend panels: KF step-size,
+front-end tracking quality, cumulative loop closures, with the switch keyframes marked).
