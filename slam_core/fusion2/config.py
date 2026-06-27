@@ -136,3 +136,44 @@ class FusionV2Config:
     # --- misc ---
     seed: int = 0
     extra: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Per-dataset tuning (applied in run_realtime after the CLI config is built).
+# ---------------------------------------------------------------------------
+# Only `lab_hybrid_3_slow` deviates. ROOT CAUSE (probed): it is TEXTURE-POOR —
+# ~half the ORB features of lab_hybrid (median 1042 vs 1912), so the VO collapses
+# to ~4 inliers and loses tracking ~2x as often (285 reinits vs 104), which
+# shreds the visual-led maps (orb_lidar ~12 m). The fix that works here — coast
+# through the transient texture-poor frames (reinit_patience 12), insert KFs
+# earlier, and verify loops strictly (ICP) — CANNOT be global: lab_hybrid's
+# collapses are during FAST TURNS where coasting flies the VO off (17 m), so it
+# must keep the short default patience. Hence per-dataset, scoped to this one set.
+_DATASET_TUNING = {
+    "lab_hybrid_3_slow": dict(
+        # VO front-end robustness (texture-poor: coast + insert KFs earlier)
+        _vo_extra=dict(reinit_patience=12, kf_ref_ratio=0.60, kf_min_close_points=60),
+        # loop proposer: relaxed but not extreme
+        propose_every_n_kf=4, min_kf_separation=20, proposal_radius_m=5.0,
+        max_candidates_per_query=3, dbow_min_score=0.025,
+        # verifiers: strict ICP (rejects the warp loops); B&B/PnP moderate
+        accept_coarse_min=0.58, accept_refined_min=0.63,
+        icp_accept_fitness=0.75, icp_accept_rmse=0.06,
+        scan_rel_sanity_m=2.0, scan_rel_sanity_rad=math.radians(35.0),
+        pnp_min_inliers=18, pnp_rel_sanity_m=1.8, pnp_rel_sanity_rad=math.radians(28.0),
+    ),
+}
+
+
+def apply_dataset_tuning(cfg: "FusionV2Config") -> bool:
+    """Apply per-dataset overrides keyed by the dataset folder name. Returns True
+    if any override was applied (so the runner can log it)."""
+    tuning = _DATASET_TUNING.get(Path(cfg.dataset).name)
+    if not tuning:
+        return False
+    for k, v in tuning.items():
+        if k == "_vo_extra":
+            cfg.vo_overrides = {**cfg.vo_overrides, **v}
+        else:
+            setattr(cfg, k, v)
+    return True

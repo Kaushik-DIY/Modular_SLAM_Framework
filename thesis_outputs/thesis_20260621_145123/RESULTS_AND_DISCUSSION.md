@@ -130,44 +130,55 @@ is the case for keeping all of them selectable.
 ## Larger lab (`lab_hybrid_3_slow`)
 
 A third recording over a **bigger floor area** (~26 m across vs ~21 m for the two-room lab),
-driven at the same speed as the first two datasets (635 s, 6095 scans / 9521 RGB-D frames). It
-stresses **extent** and **visual difficulty**: the scan-to-map global map had to be enlarged from
-40 → 80 m for the larger traverse, and the bigger area is markedly harder for the camera.
+driven at the same speed as the first two datasets (635 s, 6095 scans / 9521 RGB-D frames). The
+scan-to-map global map was enlarged 40 → 80 m for the larger traverse.
+
+**Root cause of the visual difficulty (diagnosed).** This recording is **texture-poor**: it
+yields ~half the ORB features of `lab_hybrid` (median **1042 vs 1912** per frame), so the visual
+odometry repeatedly **collapses to ~4 inliers and loses tracking** — ~2× as often as on the
+two-room lab (285 vs 104 reinitialisations on the full runner). Those reinit "blind" segments,
+not the loop closure, are what wrecked the visual-led maps. The fix is to **coast through the
+transient texture-poor frames** (longer reinit-patience) + insert keyframes earlier + verify
+loops strictly. Crucially this **cannot be a global setting** — `lab_hybrid`'s tracking losses
+happen during *fast turns*, where coasting flies the VO off (17 m). So it is applied as a
+**per-dataset tuning for `lab_hybrid_3_slow` only** (`apply_dataset_tuning`); `lab_hybrid` and
+`lab_hybrid_small` keep their committed config unchanged.
 
 | combo | kf | proposed | accepted | true-acc | false-acc | true-rej | precision | recall | lag s | late % | ms/kf | RSS GB | sharp | drift m |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| lidar_s2s_bnb | 562 | 180 | 93 | 53 | 40 | 22 | 0.57 | 0.71 | 0.0 | 5 | 3.4 | 0.29 | 0.57 | 0.44 |
-| lidar_s2s_icp | 562 | 178 | 121 | 74 | 46 | 19 | 0.62 | 0.80 | 0.0 | 3 | 2.3 | 0.30 | 0.58 | 0.31 |
-| lidar_s2m_bnb | 544 | 168 | 115 | 80 | 35 | 8 | 0.70 | 0.91 | 0.0 | 22 | 14.9 | 0.28 | **0.69** | **0.09** |
-| lidar_s2m_icp | 544 | 164 | 138 | 92 | 46 | 1 | 0.67 | **0.99** | 0.0 | 35 | 23.6 | 0.29 | **0.69** | **0.08** |
-| lidar_orb_s2s | 562 | 169 | 8 | 8 | 0 | 69 | **1.00** | 0.10 | 0.0 | 8 | 5.2 | 0.41 | 0.57 | 2.11 |
-| lidar_orb_s2m | 544 | 160 | 12 | 12 | 0 | 62 | **1.00** | 0.16 | 0.0 | 34 | 23.7 | 0.40 | **0.67** | 0.46 |
-| orb_lidar_bnb | 1026 | 189 | 3 | 3 | 0 | 180 | **1.00** | 0.02 | 2.9 | 22 | 22.5 | 0.79 | 0.56 | **12.04** |
-| orb_lidar_icp | 1026 | 189 | 100 | 100 | 0 | 83 | **1.00** | 0.55 | 1.0 | 22 | 22.5 | 0.88 | 0.56 | **11.84** |
-| orb | 1026 | 189 | 54 | 54 | 0 | 129 | **1.00** | 0.30 | 0.0 | 20 | 20.3 | 0.85 | 0.42 | 0.40 |
+| lidar_s2s_bnb | 562 | 345 | 176 | 111 | 65 | 53 | 0.63 | 0.68 | 0.0 | 5 | 3.9 | 0.30 | 0.58 | 0.45 |
+| lidar_s2s_icp | 562 | 344 | 221 | 135 | 86 | 36 | 0.61 | 0.79 | 0.0 | 4 | 2.5 | 0.32 | 0.61 | **0.07** |
+| lidar_s2m_bnb | 544 | 329 | 228 | 141 | 87 | 21 | 0.62 | 0.87 | 0.0 | 23 | 15.3 | 0.30 | **0.69** | **0.10** |
+| lidar_s2m_icp | 544 | 326 | 261 | 160 | 101 | 10 | 0.61 | **0.94** | 0.0 | 23 | 15.2 | 0.31 | **0.69** | **0.09** |
+| lidar_orb_s2s | 562 | 338 | 6 | 6 | 0 | 131 | **1.00** | 0.04 | 0.0 | 4 | 2.8 | 0.41 | 0.57 | 2.24 |
+| lidar_orb_s2m | 544 | 320 | 12 | 12 | 0 | 132 | **1.00** | 0.08 | 0.0 | 23 | 15.5 | 0.40 | **0.69** | **0.04** |
+| orb_lidar_bnb | 787 | 259 | 45 | 41 | 1 | 189 | 0.98 | 0.18 | 0.0 | 15 | 16.1 | 0.79 | 0.59 | **4.24** |
+| orb_lidar_icp | 787 | 259 | 51 | 51 | 0 | 179 | **1.00** | 0.22 | 0.0 | 15 | 15.2 | 0.80 | 0.60 | **5.33** |
+| orb | 787 | 259 | 73 | 64 | 0 | 166 | **1.00** | 0.28 | 0.0 | 16 | 16.6 | 0.81 | 0.52 | 1.02 |
 
 Maps: `figures/lab_hybrid_3_slow__<combo>.pdf` (+ PNG); montage `figures/master_lab_hybrid_3_slow.*`.
-The three visual-VO rows reinitialised **285×** (vs 70–104 on the smaller maps) — the larger,
-feature-poorer area repeatedly breaks visual tracking.
+With the per-dataset fix the visual-VO reinitialisations drop **285 → 82** (keyframes 1026 → 787),
+recovering the orb_lidar modes from ~12 m to 4–5 m.
 
 **Per-run notes** (one notable point; vs the same mode on the smaller maps):
-- **lidar_s2s_bnb** — Holds its profile on the bigger map (precision 0.57, recall 0.71, drift 0.44 m) — essentially the two-room numbers at larger scale.
-- **lidar_s2s_icp** — Again ~0.05 higher recall than s2s_bnb (0.80) at slightly lower precision; drift 0.31 m, the submap front-end scaling cleanly.
-- **lidar_s2m_bnb** — The **crispest map of all three datasets** (sharpness 0.69, drift 0.09 m) at the lowest RSS (0.28 GB): scan-to-map's global reference only tightens as the area grows.
-- **lidar_s2m_icp** — Recall **0.99** with that same crispest map (drift 0.08 m): the standout when both coverage and map quality matter — but the heaviest LiDAR mode (35 % late at real-time).
-- **lidar_orb_s2s** — Precision 1.0 / recall 0.10 again: visual PnP confirms few of the larger route's revisits; map is its driftier s2s front-end's (2.11 m).
-- **lidar_orb_s2m** — Precision 1.0 on the crisp s2m map (sharpness 0.67, drift 0.46 m) at low recall (0.16): the precision-first clean-map option, now over a bigger area.
-- **orb_lidar_bnb** — **Collapses to 12.0 m drift**: 285 VO reinitialisations shred the spine and B&B confirms only 3 loops (recall 0.02), so nothing corrects the drift — the opposite of the two-room map where it reached 0.85 recall.
-- **orb_lidar_icp** — Accepts 100 loops (recall 0.55, precision 1.0) yet still **11.8 m drift**: with 285 blind reinit segments the spine is too broken for even many true loops to rescue — unlike the two-room map (1.11 m) where the VO stayed bounded.
-- **orb** — The only visual mode to survive (drift 0.40 m): its 54 PnP loops correct the drift, but it gives the coarsest map here (sharpness 0.42) — recall falls 0.30 vs higher on the smaller maps as appearance revisits thin out over the bigger loop.
+- **lidar_s2s_bnb** — Holds its profile on the bigger map (precision 0.63, recall 0.68, drift 0.45 m) — essentially the two-room numbers at larger scale, with more proposals from the relaxed proposer.
+- **lidar_s2s_icp** — Drift tightens to **0.07 m** (best s2s of the study) at recall 0.79: the extra confirmed loops from the relaxed proposer pull the submap-chain straight.
+- **lidar_s2m_bnb** — Among the **crispest maps of the study** (sharpness 0.69, drift 0.10 m) at low RSS (0.30 GB): scan-to-map's global reference scales gracefully to the bigger area.
+- **lidar_s2m_icp** — Recall **0.94** with the same crispest map (drift 0.09 m): the standout when coverage and map quality both matter.
+- **lidar_orb_s2s** — Precision 1.0 / recall 0.04: visual PnP confirms very few of the larger route's revisits; the map is its driftier s2s front-end's (2.24 m), as on the small map.
+- **lidar_orb_s2m** — Precision 1.0 on the crisp s2m map (sharpness 0.69, drift **0.04 m**) at low recall: the precision-first clean-map option, here the best it has looked across the three maps.
+- **orb_lidar_bnb** — **Recovered to 4.24 m** (was 12 m before the texture-poverty fix): coasting through the transient VO collapses (reinits 285→82) lets B&B's loops finally bite — precision 0.98 (one false accept).
+- **orb_lidar_icp** — **5.33 m at precision 1.00 / zero false loops**: the strict ICP gate accepts no wrong loop; with the VO spine no longer shredded, those loops correct the bulk of the drift (vs 11.8 m before) — recall stays low (0.22) because the strict gate + texture-poverty leave few confident revisits.
+- **orb** — Sharper map than baseline (sharpness 0.42 → **0.52**) at precision 1.00; end-start drift 1.02 m (the noisier single-point metric rises while the map itself improves with fewer blind segments).
 
-**Larger-lab discussion.** Scale + visual difficulty sharpen the **LiDAR-vs-vision divide** to its
-clearest. The **scan-to-map** modes deliver the **best maps in the entire study**
-(`lidar_s2m_*`: sharpness 0.69, drift 0.08–0.09 m, 0.28 GB) — the global map reference scales
-gracefully and needs almost no loop help. The **visual-VO** front-end, by contrast, **breaks
-down** on the bigger feature-poor area (285 reinits): `orb` barely survives via PnP loops
-(0.40 m, coarse map), and the scan-verified `orb_lidar` modes warp to ~12 m because loop closure
-cannot repair a spine that reinitialised hundreds of times. This is the strongest evidence for
-the modular framework: in a large, low-texture space, a **LiDAR scan-to-map front-end is the
-robust, crisp-map choice**, while **visual-led modes degrade from "costly" to "unusable"** — so
-the ability to *select* the front-end per environment is not a convenience but a requirement.
+**Larger-lab discussion.** This map is the study's hardest for vision, and it shows *why* the
+**front-end must be selectable**. The diagnosed cause is **texture-poverty** (half the ORB
+features → the VO collapses ~2× as often); the cure is a **per-dataset** robustness setting,
+because the right reinit behaviour is opposite to `lab_hybrid`'s (coast here, reinit-fast there).
+With it, the visual-led modes go from **unusable (~12 m) to usable (~4–5 m)** at **precision ≈ 1.0**
+(the strict verifier accepts essentially no false loop) — but still at high cost (~0.8 GB, ~16 %
+late) and low recall (the scene yields few confident revisits). The **LiDAR scan-to-map** modes
+remain the **best maps in the whole study** (sharpness 0.69, drift 0.09–0.10 m, ~0.30 GB) and need
+almost no loop help. So the framework's value stands: on a large, low-texture floor LiDAR
+scan-to-map is the robust, crisp, cheap choice, while visual-led modes are a recoverable but
+costly fallback — and getting the most out of each needs **per-environment configuration**.

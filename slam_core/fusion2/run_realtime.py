@@ -44,7 +44,7 @@ import numpy as np
 import fusion_core as fc
 from slam_core.fusion.signature import (CAMERA_GROUND_TRANSFORM,
                                         project_pose3d_to_pose2)
-from slam_core.fusion2.config import FusionV2Config
+from slam_core.fusion2.config import FusionV2Config, apply_dataset_tuning
 from slam_core.fusion2.dataset import LabHybridStream
 from slam_core.fusion2.lidar_frontend import make_lidar_frontend
 from slam_core.fusion2.runner import (_rel, _rel_sane, build_shared_map,
@@ -748,6 +748,7 @@ def main(argv=None):
     cfg = FusionV2Config(mode=args.mode, dataset=args.dataset, output_dir=args.output,
                          lidar_frontend=args.lidar_frontend, scan_verifier=args.verifier,
                          max_scans=args.max_scans, enable_loops=not args.no_loops)
+    _tuned = apply_dataset_tuning(cfg)   # per-dataset overrides (texture-poor sets)
     start_sensor = SENSOR_OF_MODE[args.mode]
     proposer, verifier = _mode_defaults(args.mode, args.verifier)
     if args.proposer is not None:
@@ -799,6 +800,8 @@ def main(argv=None):
     print(f"Front-end : {sm.active_variant}  (mode {cfg.mode}, sensor {start_sensor})")
     print(f"Verifier  : {verifier}   Proposer: {proposer}"
           f"   Loops: {'ON' if cfg.enable_loops else 'OFF (front-end only)'}")
+    if _tuned:
+        print(f"Tuning    : per-dataset overrides applied for {Path(cfg.dataset).name}")
     print(f"Visual    : {'available' if visual_available else 'lean (scan only)'}"
           f"{'' if start_sensor == 'vo' else ' (LiDAR attach=%s)' % lidar_attach}")
     print(f"Playback  : {'real-time' if args.speed > 0 else 'max'} (speed={args.speed}x)")
