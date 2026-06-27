@@ -803,7 +803,13 @@ def main(argv=None):
     shared = build_shared_map(cfg)
     eng = IngestEngine(shared, cfg, K=K, verifier=verifier, proposer=proposer)
     eng.set_active_sensor(start_sensor)
-    if proposer == "dbow":
+    # Build the DBoW appearance index from kf 0 whenever visual descriptors will
+    # exist (VO start, or --attach-visual LiDAR), not only when dbow starts active.
+    # index_descriptors() then populates it every ingest, so a mid-run switch to
+    # dbow can propose against keyframes seen BEFORE the switch (the append-only
+    # index is never pruned). Without this the pre-switch keyframes are never
+    # indexed and dbow finds no candidates for revisits to them.
+    if proposer == "dbow" or start_visual:
         eng.ensure_appearance()
     visual_available = _visual_available(sm.active)
 

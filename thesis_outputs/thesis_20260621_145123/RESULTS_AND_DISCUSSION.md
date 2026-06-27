@@ -258,10 +258,10 @@ applied switch and a per-keyframe timeline are logged (`switches.csv`, `timeline
 Two demo runs on `lab_2` exercise, between them, **every module** (front-ends s2s/VO/s2m,
 proposers proximity/DBoW, verifiers B&B/PnP/ICP):
 
-| run | start → end config | switches (at keyframe) | kf | loops | reinits |
-|---|---|---|---|---|---|
-| **Demo A** (`switching_demo_mapA`) | s2s·prox·B&B → VO·DBoW·PnP | ①prox→DBoW @114 · ②**s2s→VO** @259 · ③B&B→PnP @304 | 473 | 13 | 29 |
-| **Demo B** (`switching_demo_mapB`) | VO·DBoW·PnP → s2m·prox·ICP | ①**VO→s2m** @179 · ②PnP→ICP @300 · ③DBoW→prox @390 | 441 | 32 | 0 |
+| run | start → end config | switches (at keyframe) | kf | proposed | accepted | reinits |
+|---|---|---|---|---|---|---|
+| **Demo A** (`switching_demo_mapA`) | s2s·prox·B&B → VO·DBoW·PnP | ①prox→DBoW @114 · ②**s2s→VO** @259 · ③B&B→PnP @304 | 473 | 50 | 33 | 29 |
+| **Demo B** (`switching_demo_mapB`) | VO·DBoW·PnP → s2m·prox·ICP | ①**VO→s2m** @179 · ②PnP→ICP @300 · ③DBoW→prox @390 | 441 | 34 | 32 | 0 |
 
 **Feature-aware switch placement.** The cross-sensor switches are the stability-critical ones, so
 they are scheduled by *content*, not just by time: a VO-reference pass supplies per-timestamp
@@ -273,12 +273,29 @@ of** VO (Demo B, kf 179) leaves while VO is still healthy. The no-handoff switch
 timeline is used efficiently instead of waiting for a perfect moment for every switch.
 
 **Stability finding (the claim).** Across all six switches the **keyframe-to-keyframe
-displacement stays spike-free** (Demo figures, top trend panel) — the handoff introduces no
-teleport — and the trajectory on the final map is continuous through every switch marker.
-Loop closures continue to be accepted in the post-switch segments (Demo B accepts 20 of its 32
-loops *after* the first switch, on the s2m/ICP segments), so the map keeps being corrected
-regardless of which modules are active. The result is that **the occupancy map stays a single
-consistent two-room map** end-to-end, demonstrating that live reconfiguration is functional and
-non-disruptive. Figures: `figures/switching_demo_mapA.{pdf,png}`,
-`figures/switching_demo_mapB.{pdf,png}` (annotated map + 3 trend panels: KF step-size,
-front-end tracking quality, cumulative loop closures, with the switch keyframes marked).
+displacement stays spike-free** (the `_displacement` figure) — the handoff introduces no
+teleport — and the trajectory on the final map is continuous through every switch marker. The
+**loop closure events** panel (`_loops`) shows *proposed* and *accepted* candidates; acceptances
+continue across switches (e.g. Demo A keeps closing loops through the proposer switch ①, the
+s2s→VO switch ②, and into the VO segment), so the map keeps being corrected regardless of which
+modules are active. The result is that **the occupancy map stays a single consistent two-room
+map** end-to-end, demonstrating that live reconfiguration is functional and non-disruptive.
+
+**Loop-closure behaviour (clustering).** Loop closures are *not* uniform over a run — they
+cluster where the trajectory makes a short-range re-pass of an already-mapped place
+(candidate "age" is bounded below by `min_kf_separation = 30`), so a run's flat stretches are
+simply non-revisiting route, not a switching failure. Two notes on the memory/loop path: (i) the
+STM/WM/LTM memory **does** reactivate LTM neighbours of a candidate back into WM during
+verification (`MemoryManager::reactivate` via `retrieve_neighborhood`); (ii) a bug was found and
+fixed during this study — the DBoW appearance index was built lazily only when the `dbow`
+proposer first became active, so a *mid-run* switch to DBoW could not propose against keyframes
+seen before the switch (this is why Demo A's VO segment originally showed 0 proposals). The fix
+builds the appearance index from the first keyframe whenever visual descriptors exist, so a
+mid-run DBoW switch proposes against the full history (Demo A: 28→50 proposed, 13→33 accepted).
+**Documented limitation (deferred):** the *proximity* proposer queries Working Memory only, so a
+revisit to a place that has aged into LTM is not proposed by proximity (reactivation runs only
+during verification of an already-proposed candidate) — long-loop closures therefore rely on the
+appearance (DBoW) proposer.
+
+Figures (separate, paper-grade PDF+PNG, per run): `figures/switching_demo_map{A,B}_map`,
+`…_displacement`, `…_tracking`, `…_loops`.
