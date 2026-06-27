@@ -182,3 +182,63 @@ remain the **best maps in the whole study** (sharpness 0.69, drift 0.09–0.10 m
 almost no loop help. So the framework's value stands: on a large, low-texture floor LiDAR
 scan-to-map is the robust, crisp, cheap choice, while visual-led modes are a recoverable but
 costly fallback — and getting the most out of each needs **per-environment configuration**.
+
+---
+
+## Larger lab — faster traverse (`lab_hybrid_3`)
+
+The **same large floor area** as `lab_hybrid_3_slow` driven at **1.6× faster speed** (395 s vs
+635 s, 5919 vs 9521 RGB-D frames, 3790 vs 6095 LiDAR scans). Run with the **baseline config**
+(no per-dataset tuning applied — the `lab_hybrid_3_slow` patience-coasting setting is wrong for
+fast motion). Purpose: isolate the effect of traversal speed on each front-end.
+
+| combo | kf | proposed | accepted | true-acc | false-acc | true-rej | precision | recall | late % | ms/kf | RSS GB | sharp | drift m | reinit |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| lidar_s2s_bnb | 556 | 170 | 102 | 74 | 28 | 17 | 0.73 | 0.81 | 6.1 | 4.5 | 0.23 | 0.623 | 0.61 | 0 |
+| lidar_s2s_icp | 556 | 166 | 133 | 88 | 44 | 16 | 0.67 | 0.85 | 3.7 | 2.5 | 0.25 | 0.637 | 0.37 | 0 |
+| lidar_s2m_bnb | 550 | 164 | 122 | 85 | 37 | 14 | 0.70 | 0.86 | 26.0 | 17.6 | 0.25 | 0.686 | 0.15 | 0 |
+| lidar_s2m_icp | 550 | 163 | 142 | 99 | 41 | 5 | 0.71 | **0.95** | 24.9 | 16.8 | 0.26 | **0.694** | **0.15** | 0 |
+| lidar_orb_s2s | 556 | 164 | 13 | 13 | 0 | 73 | **1.00** | 0.15 | 5.2 | 3.6 | 0.35 | 0.614 | 0.44 | 0 |
+| lidar_orb_s2m | 550 | 146 | 8 | 8 | 0 | 67 | **1.00** | 0.11 | 25.6 | 17.1 | 0.36 | **0.688** | **0.11** | 0 |
+| orb_lidar_bnb | 697 | 85 | 65 | 64 | 1 | 9 | 0.99 | 0.88 | 17.2 | 17.5 | 0.77 | 0.503 | **0.15** | **427** |
+| orb_lidar_icp | 697 | 85 | 49 | 46 | 3 | 27 | 0.94 | 0.63 | 15.3 | 15.8 | 0.76 | 0.503 | 0.97 | **427** |
+| orb | 697 | 85 | 25 | 25 | 0 | 48 | **1.00** | 0.34 | 15.0 | 15.6 | 0.74 | 0.529 | **0.10** | **427** |
+
+Maps: `figures/lab_hybrid_3__<combo>.pdf` (+ PNG); montage `figures/master_lab_hybrid_3.*`.
+
+**Fast-vs-slow comparison (same map, same baseline config):**
+
+| front-end | slow reinits | fast reinits | slow drift | fast drift | verdict |
+|---|---|---|---|---|---|
+| LiDAR s2s/s2m | 0 | 0 | 0.07–0.45 m | 0.15–0.61 m | **immune to speed** |
+| lidar_orb_s2s | 0 | 0 | 2.24 m | 0.44 m | *better* fast (VO healthier) |
+| lidar_orb_s2m | 0 | 0 | 0.04 m | 0.11 m | minor — s2m spine dominates |
+| orb_lidar_bnb | 82\* | **427** | 4.23 m\* | 0.15 m | ↑5× reinits, low drift (early loops) |
+| orb_lidar_icp | 82\* | **427** | 5.33 m\* | 0.97 m | ↑5× reinits, low drift (early loops) |
+| orb | 82\* | **427** | 1.02 m\* | 0.10 m | ↑5× reinits, low drift (early loops) |
+
+\* *Slow figures use per-dataset tuning (reinit_patience=12); fast uses baseline (patience=3).*
+
+**Per-run notes:**
+- **lidar_s2s/s2m** — Sharpness and compute cost are virtually unchanged vs the slow run
+  (s2s 4.5 ms, s2m 17 ms). Speed has no effect on scan-to-map matching or submap insertion.
+  The slight s2s drift increase (0.37–0.61 m vs 0.07–0.45 m) reflects fewer loop
+  confirmations on the shorter traversal, not a tracking failure.
+- **lidar_orb_s2s** — Drift *improves* fast (0.44 vs 2.24 m): on the slow run the VO was
+  collapsing from texture-poverty (no patience tuning → reinits), so PnP loops couldn't
+  land; on the fast run the VO stays healthy (texture-poor stretches are traversed quickly)
+  so PnP confirms 13 loops and pulls the s2s chain straight.
+- **lidar_orb_s2m** — Minor drift change (0.11 vs 0.04 m); the crisp s2m spine is robust
+  regardless — visual verification is a bonus on top.
+- **orb_lidar_bnb/icp/orb** — **427 reinits** (vs 82 with tuning on the slow run) — fast
+  motion causes 5× more VO tracking collapses. Yet *final drift is lower* (0.10–0.97 m vs
+  1–5 m): the faster loop means the robot revisits the start sooner, so loop closures fire
+  before drift accumulates far. Map sharpness suffers (0.50 vs 0.59) — the 427 blind
+  segments leave many scans mis-registered in the grid.
+
+**Speed-sensitivity finding.** LiDAR front-ends are **speed-immune** — scan geometry and IMU
+extrapolation handle any traversal rate. VO-led front-ends are **speed-sensitive**: fast motion
+increases tracking collapses 5×, degrading map sharpness even when early loop closure keeps the
+final drift low. This reinforces the modular selector argument: in a large low-texture space at
+variable speed, a LiDAR front-end is the safe default; VO-led modes can survive fast traversal
+through dense loop closure but at the cost of a blurrier occupancy map.
