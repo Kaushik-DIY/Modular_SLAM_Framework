@@ -260,8 +260,8 @@ proposers proximity/DBoW, verifiers B&B/PnP/ICP):
 
 | run | start → end config | switches (at keyframe) | kf | proposed | accepted | reinits |
 |---|---|---|---|---|---|---|
-| **Demo A** (`switching_demo_mapA`) | s2s·prox·B&B → VO·DBoW·PnP | ①prox→DBoW @114 · ②**s2s→VO** @259 · ③B&B→PnP @304 | 473 | 50 | 33 | 29 |
-| **Demo B** (`switching_demo_mapB`) | VO·DBoW·PnP → s2m·prox·ICP | ①**VO→s2m** @179 · ②PnP→ICP @300 · ③DBoW→prox @390 | 441 | 34 | 32 | 0 |
+| **Demo A** (`switching_demo_mapA`) | s2s·prox·B&B → VO·DBoW·PnP | ①prox→DBoW @114 · ②**s2s→VO** @259 · ③B&B→PnP @304 | 473 | 52 | 33 | 29 |
+| **Demo B** (`switching_demo_mapB`) | VO·DBoW·PnP → s2m·prox·ICP | ①**VO→s2m** @179 · ②PnP→ICP @300 · ③DBoW→prox @390 | 441 | 42 | 35 | 0 |
 
 **Feature-aware switch placement.** The cross-sensor switches are the stability-critical ones, so
 they are scheduled by *content*, not just by time: a VO-reference pass supplies per-timestamp
@@ -282,20 +282,29 @@ modules are active. The result is that **the occupancy map stays a single consis
 map** end-to-end, demonstrating that live reconfiguration is functional and non-disruptive.
 
 **Loop-closure behaviour (clustering).** Loop closures are *not* uniform over a run — they
-cluster where the trajectory makes a short-range re-pass of an already-mapped place
-(candidate "age" is bounded below by `min_kf_separation = 30`), so a run's flat stretches are
-simply non-revisiting route, not a switching failure. Two notes on the memory/loop path: (i) the
-STM/WM/LTM memory **does** reactivate LTM neighbours of a candidate back into WM during
-verification (`MemoryManager::reactivate` via `retrieve_neighborhood`); (ii) a bug was found and
-fixed during this study — the DBoW appearance index was built lazily only when the `dbow`
-proposer first became active, so a *mid-run* switch to DBoW could not propose against keyframes
-seen before the switch (this is why Demo A's VO segment originally showed 0 proposals). The fix
-builds the appearance index from the first keyframe whenever visual descriptors exist, so a
-mid-run DBoW switch proposes against the full history (Demo A: 28→50 proposed, 13→33 accepted).
-**Documented limitation (deferred):** the *proximity* proposer queries Working Memory only, so a
-revisit to a place that has aged into LTM is not proposed by proximity (reactivation runs only
-during verification of an already-proposed candidate) — long-loop closures therefore rely on the
-appearance (DBoW) proposer.
+cluster where the trajectory re-passes an already-mapped place (candidate "age" is bounded below
+by `min_kf_separation = 30`), so a run's flat stretches are simply non-revisiting route, not a
+switching failure. Two memory/loop-path issues were found and fixed during this study:
+
+1. **Lazy appearance index (fixed).** The DBoW index was built only when the `dbow` proposer
+   first became active, so a *mid-run* switch to DBoW could not propose against keyframes seen
+   before the switch (why Demo A's VO segment originally showed 0 proposals). It now builds from
+   the first keyframe whenever visual descriptors exist (Demo A: 28→52 proposed, 13→33 accepted).
+
+2. **Proximity proposer reaches LTM — global loops (fixed, RTAB-faithful).** The proximity
+   proposer originally searched **Working Memory only**, so a revisit to a place that had aged
+   into LTM was never proposed — only the appearance (DBoW) proposer could attempt it, and DBoW
+   fails on *reverse-direction* returns (the camera images a different field of view, so the
+   bag-of-words does not match — ORB's in-plane rotation invariance does not help a viewpoint
+   change). The fix implements RTAB-Map's **"proximity detection with retrieval"**: the pose
+   graph retains every node (transfer to LTM does not drop its pose), so the proposer searches
+   the whole graph within `proposal_radius_m` and **reactivates** any chosen LTM node (+graph
+   neighbours) back into WM for verification — bounded by radius + `max_candidates_per_query`, so
+   it stays real-time and WM stays capped. Result on Demo B: the literal **start↔end loop now
+   closes** (e.g. query kf 425 ↔ candidate kf 13, age 412), with **11 loops of age > 200** that
+   had aged into LTM; WM held at its 200 cap throughout (LTM 205). Loop acceptances now continue
+   to the very end of the run (`_loops` panel). A geometric (pose) proposer is view-invariant and
+   so closes these reverse-direction global loops that appearance cannot.
 
 Figures (separate, paper-grade PDF+PNG, per run): `figures/switching_demo_map{A,B}_map`,
 `…_displacement`, `…_tracking`, `…_loops`.
