@@ -43,6 +43,20 @@ MODE_LABEL = {
     "vo_frontend":   "Visual VO + local BA · front-end only (no loops)",
 }
 
+# Standardised config label for the master montages: front-end · proposer · verifier.
+# (s2s/s2m/vo) · (proximity/dbow) · (bnb/icp/pnp) — one consistent pattern per panel.
+COMBO_CONFIG = {
+    "lidar_s2s_bnb": "s2s · proximity · bnb",
+    "lidar_s2s_icp": "s2s · proximity · icp",
+    "lidar_s2m_bnb": "s2m · proximity · bnb",
+    "lidar_s2m_icp": "s2m · proximity · icp",
+    "lidar_orb_s2s": "s2s · proximity · pnp",
+    "lidar_orb_s2m": "s2m · proximity · pnp",
+    "orb_lidar_bnb": "vo · dbow · bnb",
+    "orb_lidar_icp": "vo · dbow · icp",
+    "orb":           "vo · dbow · pnp",
+}
+
 # Standardised short labels used in both individual figure titles and master suptitles.
 MAP_LABEL = {
     "lab_hybrid_small":  "lab_1 (single room)",
@@ -150,7 +164,7 @@ def master(root: Path, figdir: Path, map_name: str, dpi: int = 300):
         ax.set_xticks([]); ax.set_yticks([])
         for sp in ax.spines.values():
             sp.set_edgecolor("#999"); sp.set_linewidth(0.5)
-        ax.set_title(MODE_LABEL.get(c, c), fontsize=11)
+        ax.set_title(COMBO_CONFIG.get(c, MODE_LABEL.get(c, c)), fontsize=11)
 
     label = MAP_LABEL.get(map_name, map_name)
     fig.suptitle(f"{label} — all 9 modes (final map)", fontsize=16, y=1.00)
