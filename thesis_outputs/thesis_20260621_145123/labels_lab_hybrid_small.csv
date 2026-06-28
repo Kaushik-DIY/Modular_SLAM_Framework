@@ -105,7 +105,6 @@ pair_id,label,inliers,scan,evidence
 103,T,10,0.711,scan
 104,T,444,0.908,img+scan
 105,T,550,0.953,img+scan
-106,T,583,0.895,img+scan
+106,T,618,0.88,img+scan
 107,T,637,0.96,img+scan
-108,T,280,0.922,img+scan
-109,T,769,0.0,img
+108,T,769,0.0,img
