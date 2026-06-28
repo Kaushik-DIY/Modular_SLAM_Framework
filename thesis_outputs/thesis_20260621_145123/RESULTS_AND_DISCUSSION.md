@@ -73,7 +73,7 @@ Maps: `figures/lab_hybrid_small__<combo>.png`.
 - **lidar_s2s_icp** — Lowest precision (0.50): standalone ICP's looser fitness admits a few more aliased loops than B&B on the same s2s front-end; map quality is identical to s2s_bnb.
 - **lidar_s2m_bnb** — Crispest scan map (sharpness 0.63, drift 0.03 m): the growing global scan-to-map reference tightens geometry, giving a near-drift-free single room at the lowest memory (0.12 GB).
 - **lidar_s2m_icp** — Recall 1.00 with the same crisp s2m map (drift 0.02 m): ICP accepts every real revisit here; the standout when both recall and map quality matter.
-- **lidar_orb_s2s** — Precision 1.00 but recall only 0.38: visual PnP confirms only loops the camera also saw, missing the heading-divergent revisits; the map is its s2s front-end's (driftier, 0.44 m).
+- **lidar_orb_s2s** — Precision 1.00 but recall only 0.33: visual PnP confirms only loops the camera also saw, missing the heading-divergent revisits; the map is its s2s front-end's (driftier, 0.44 m).
 - **lidar_orb_s2m** — Precision 1.00 on the crisp s2m map (sharpness 0.64, drift 0.03 m) at the lowest recall (0.30): the precision-first, clean-map option.
 - **orb_lidar_bnb** — Only 1 loop accepted (recall 0.11): VO drifts little over the short single room, so almost no revisit registers a graph offset for B&B to confirm.
 - **orb_lidar_icp** — Recall 0.78 (vs B&B's 0.11) on the same VO front-end: with the IMU-corrected heading seeding it, standalone ICP recovers most revisits at precision 1.00 even over the short room — the same map that, two-room, was its catastrophic case before the heading fix.
