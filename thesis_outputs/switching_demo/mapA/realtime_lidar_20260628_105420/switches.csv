@@ -1,4 +1,0 @@
-k,kf,stamp,x,y,kind,frm,to,autofallback
-3033,114,1781020318.701308,11.39,0.0493,proposer,proximity,dbow,False
-7027,259,1781020481.006403,9.9591,-1.2416,fe,native_s2s,visual_vo,False
-7662,304,1781020506.822109,10.0961,-0.4383,verifier,bnb,pnp,False
