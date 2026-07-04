@@ -295,8 +295,8 @@ needs_lab = pytest.mark.skipif(not _LAB.exists(), reason="lab_hybrid not present
 
 
 def _run_frontends(kind_native: str, kind_legacy: str, n_scans: int = 300):
-    from slam_core.fusion2.dataset import LabHybridStream
-    from slam_core.fusion2.lidar_frontend import make_lidar_frontend
+    from slam_core.fusion2.Dependencies.dataset import LabHybridStream
+    from slam_core.fusion2.Front_End.lidar_frontend import make_lidar_frontend
 
     stream = LabHybridStream(_LAB, 0.05)
     imu = str(_LAB / "imu.csv")

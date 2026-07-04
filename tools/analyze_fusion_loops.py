@@ -32,7 +32,7 @@ from scipy.spatial import cKDTree
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from slam_core.fusion2.dataset import LabHybridStream
+from slam_core.fusion2.Dependencies.dataset import LabHybridStream
 
 
 # --- thresholds (defensible defaults; all CLI-overridable) ------------------

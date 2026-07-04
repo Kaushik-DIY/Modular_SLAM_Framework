@@ -29,8 +29,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-matplotlib.rcParams.update({"pdf.fonttype": 42, "ps.fonttype": 42,
-                            "savefig.bbox": "tight"})
+matplotlib.rcParams.update({"pdf.fonttype": 42, "ps.fonttype": 42})
 
 # Distinct colours for the active-config segments (cycled).
 SEG_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
@@ -165,7 +164,7 @@ def draw_displacement(R: _Run, ax):
     step = np.hypot(np.diff(R.px), np.diff(R.py))
     ax.plot(R.kf[1:], step, "-", lw=0.9, color="#1f77b4")
     ax.set_ylabel("KF step [m]"); ax.set_xlabel("keyframe")
-    ax.set_title("keyframe-to-keyframe displacement", fontsize=12)
+    ax.set_title("keyframe-to-keyframe displacement", fontsize=12, pad=16)
     ax.grid(alpha=0.2)
     R.switch_lines(ax)
 
@@ -182,7 +181,7 @@ def draw_tracking(R: _Run, ax):
     axb.set_ylabel("LiDAR match score", color="#2ca02c")
     ax.tick_params(axis="y", colors="#9467bd"); axb.tick_params(axis="y", colors="#2ca02c")
     ax.set_xlabel("keyframe")
-    ax.set_title("Front-end tracking quality per segment", fontsize=12)
+    ax.set_title("Front-end tracking quality per segment", fontsize=12, pad=16)
     ax.grid(alpha=0.2)
     R.switch_lines(ax)
 
@@ -198,16 +197,17 @@ def draw_loops(R: _Run, ax):
         ax.step(acc, np.arange(1, len(acc) + 1), where="post",
                 color="#d62728", lw=1.6, label=f"accepted ({len(acc)})")
     ax.set_ylabel("count (cumulative)"); ax.set_xlabel("keyframe")
-    ax.set_title("loop closure events", fontsize=12)
+    ax.set_title("loop closure events", fontsize=12, pad=16)
     ax.grid(alpha=0.2)
     ax.legend(loc="upper left", fontsize=9, framealpha=0.85)
     R.switch_lines(ax)
 
 
-def _save(fig, base: Path, dpi):
+def _save(fig, base: Path, dpi, tight=True):
     base.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(base.with_suffix(".png"), dpi=dpi, bbox_inches="tight")
-    fig.savefig(base.with_suffix(".pdf"), dpi=dpi, bbox_inches="tight")
+    bbox = "tight" if tight else None
+    fig.savefig(base.with_suffix(".png"), dpi=dpi, bbox_inches=bbox)
+    fig.savefig(base.with_suffix(".pdf"), dpi=dpi, bbox_inches=bbox)
     plt.close(fig)
 
 
@@ -218,11 +218,19 @@ def render(run_dir: Path, out_base: Path, dpi: int = 600, combined: bool = False
     # separate files
     fig, ax = plt.subplots(figsize=(11, 7)); draw_map(R, ax)
     _save(fig, Path(f"{out_base}_map"), dpi)
-    for name, fn, h in [("displacement", draw_displacement, 3.0),
-                        ("tracking", draw_tracking, 3.0),
-                        ("loops", draw_loops, 3.0)]:
-        fig, ax = plt.subplots(figsize=(11, h)); fn(R, ax)
-        fig.tight_layout(); _save(fig, Path(f"{out_base}_{name}"), dpi)
+    # Three stacked panels: identical figure size AND an identical explicit axes
+    # rectangle so the keyframe x-axis lines up column-for-column across all three
+    # (the middle panel's twin y-axis for the LiDAR score would otherwise squeeze
+    # its data box under bbox="tight"). The right margin is reserved in EVERY panel
+    # so the data box width is the same whether or not a panel draws a twin axis.
+    PANEL_RECT = (0.075, 0.20, 0.84, 0.64)   # [left, bottom, width, height] fig-fraction
+    for name, fn in [("displacement", draw_displacement),
+                     ("tracking", draw_tracking),
+                     ("loops", draw_loops)]:
+        fig = plt.figure(figsize=(11, 3.0))
+        ax = fig.add_axes(PANEL_RECT)
+        fn(R, ax)
+        _save(fig, Path(f"{out_base}_{name}"), dpi, tight=False)
 
     if combined:
         fig = plt.figure(figsize=(13, 15))

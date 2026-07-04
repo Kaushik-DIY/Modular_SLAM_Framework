@@ -120,8 +120,8 @@ def run_vo(dataset, max_frames):
     """Collect (t, world_R_cam, ok) per RGB-D frame from the native VO."""
     import cv2
 
-    from slam_core.fusion2.dataset import LabHybridStream
-    from slam_core.fusion2.vo_orb_frontend import NativeOrbFrontend
+    from slam_core.fusion2.Dependencies.dataset import LabHybridStream
+    from slam_core.fusion2.Front_End.vo_orb_frontend import NativeOrbFrontend
     import fusion_core as fc
 
     stream = LabHybridStream(dataset, 0.05)

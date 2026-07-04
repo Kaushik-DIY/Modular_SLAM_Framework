@@ -24,6 +24,7 @@ from slam_core.dataio.imu_csv import read_imu_csv
 def _config_from_hector_profile(dataset_name: str, matcher_kind: str,
                                 kf_min_dist_m: float, kf_min_angle_rad: float,
                                 kf_min_dt_s: float) -> "fc.LidarFrontendConfig":
+    # Copy the active hector profile into the C++ front-end config.
     hcfg._apply_profile(dataset_name)
     c = hcfg
     cfg = fc.LidarFrontendConfig()
@@ -54,6 +55,7 @@ def _config_from_hector_profile(dataset_name: str, matcher_kind: str,
     cfg.submap_builder.l_max = float(c.L_MAX)
 
     sm = cfg.submap_matcher
+    # Scan-to-submap search and refinement parameters.
     sm.min_score = float(c.SUBMAP_MIN_SCORE)
     sm.min_valid = int(c.SUBMAP_MIN_VALID)
     sm.precomp_levels = int(c.SUBMAP_PRECOMP_LEVELS)
@@ -78,6 +80,7 @@ def _config_from_hector_profile(dataset_name: str, matcher_kind: str,
     sm.fine.level = int(c.SUBMAP_FINE_LEVEL)
 
     mm = cfg.map_matcher
+    # Scan-to-map occupancy pyramid and correspondence parameters.
     mm.base_res = float(c.MAP_RESOLUTION)
     mm.size_m = float(c.MAP_SIZE_METERS)
     mm.num_levels = int(c.PYRAMID_LEVELS)
@@ -103,6 +106,8 @@ def _config_from_hector_profile(dataset_name: str, matcher_kind: str,
 
 
 class NativeLidarFrontend:
+    """Thin Python adapter around fusion_core.NativeLidarFrontend."""
+
     def __init__(self, kind: str = "native_s2s", dataset_name: str = "lab_hybrid",
                  imu_path: Optional[str] = None, kf_min_dist_m: float = 0.25,
                  kf_min_angle_rad: float = math.radians(12.0),
@@ -128,6 +133,7 @@ class NativeLidarFrontend:
         self.process_ms: List[float] = []
 
     def process(self, t: float, scan_xy: np.ndarray) -> Tuple[Pose2, np.ndarray, bool]:
+        """Track one scan and expose the same return contract as LidarFrontend."""
         batch = []
         while self._imu_idx < len(self._imu) and self._imu[self._imu_idx][0] <= t:
             batch.append(self._imu[self._imu_idx])
@@ -140,5 +146,6 @@ class NativeLidarFrontend:
             self.fallback_count += 1
         self.last_score = float(r.score)
         self.process_ms.append(r.process_ms)
+        # Return filtered points for diagnostics; raw scans are stored by callers.
         pts = np.ascontiguousarray(self._fe.last_filtered_points(), dtype=np.float32)
         return Pose2(r.pose.x, r.pose.y, r.pose.theta), pts, bool(r.is_keyframe)

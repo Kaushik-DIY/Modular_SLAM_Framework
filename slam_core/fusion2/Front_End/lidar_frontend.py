@@ -47,6 +47,7 @@ class LidarFrontend:
             raise ValueError(f"unknown matcher_kind {matcher_kind!r}")
         self.matcher_kind = matcher_kind
 
+        # Shared preprocessing keeps the matcher input consistent across variants.
         self.point_processor = PointCloudProcessor(
             PointCloudProcessorConfig(
                 fixed_voxel_size=cfg.VOXEL_FIXED_SIZE,
@@ -60,6 +61,7 @@ class LidarFrontend:
             matcher = self._build_s2s_matcher(cfg, use_vectorized_search)
         else:
             matcher = self._build_s2m_matcher(cfg)
+        # MatcherManager allows the hector adapter contract without global SLAM.
         manager = MatcherManager(
             active_matcher=matcher,
             rolling_buffer_size=cfg.ROLLING_BUFFER_SIZE,
@@ -101,6 +103,7 @@ class LidarFrontend:
         self.fallback_count = 0   # scans where matching failed -> IMU/CV prediction
 
     def _build_s2s_matcher(self, cfg, use_vectorized_search: bool):
+        # Build rolling submaps and correlate the current scan against them.
         self.submaps = SubmapBuilder2D(
             submap_size_m=cfg.SUBMAP_SIZE_METERS,
             resolution=cfg.SUBMAP_RESOLUTION,
@@ -144,6 +147,7 @@ class LidarFrontend:
         # Mirrors hector/run_local_slam_new.py's scan_to_map wiring.
         from slam_core.matching.scan_to_map import ScanToMapMatcher
         self.submaps = None
+        # Occupancy pyramid parameters for scan-to-map matching.
         map_params = dict(
             base_res=cfg.MAP_RESOLUTION,
             size_m=cfg.MAP_SIZE_METERS,
@@ -152,6 +156,7 @@ class LidarFrontend:
             l_free=cfg.L_FREE, l_occ=cfg.L_OCC,
             ray_steps=cfg.RAY_STEPS,
         )
+        # Gauss-Newton correspondence refinement parameters.
         corr_params = dict(
             gn_iters_per_level=cfg.GN_ITERS_PER_LEVEL,
             gn_damping=cfg.GN_DAMPING,
@@ -172,6 +177,7 @@ class LidarFrontend:
             self.extrap.add_imu(ts_i, wz_i, yaw_i)
             self._imu_idx += 1
 
+        # The front end matches filtered points; the backend stores raw scans.
         pts, _ = self.point_processor.process(np.asarray(scan_xy, dtype=float))
         pose, _result, _do_insert, _did = self.adapter.process_scan(
             k=self._k, t=t, scan_points_local=pts,
@@ -185,6 +191,7 @@ class LidarFrontend:
         if self._last_kf_pose is None:
             is_kf = True
         else:
+            # Motion filter: insert when translation, rotation, or time exceeds a gate.
             dx = pose.x - self._last_kf_pose.x
             dy = pose.y - self._last_kf_pose.y
             dth = abs(math.atan2(math.sin(pose.theta - self._last_kf_pose.theta),
@@ -212,11 +219,13 @@ def make_lidar_frontend(kind: str, dataset_name: str = "lab_hybrid",
     kf = dict(kf_min_dist_m=kf_min_dist_m, kf_min_angle_rad=kf_min_angle_rad,
               kf_min_dt_s=kf_min_dt_s)
     if kind in ("legacy_s2s", "legacy_s2m"):
+        # Legacy path keeps the Python hector implementation available for parity.
         matcher_kind = "scan_to_submap" if kind == "legacy_s2s" else "scan_to_map"
         return LidarFrontend(dataset_name=dataset_name, imu_path=imu_path,
                              matcher_kind=matcher_kind, imu_samples=imu_samples, **kf)
     if kind in ("native_s2s", "native_s2m"):
-        from slam_core.fusion2.native_lidar_frontend import NativeLidarFrontend
+        # Native path runs the same contract inside fusion_core.
+        from slam_core.fusion2.Front_End.native_lidar_frontend import NativeLidarFrontend
         return NativeLidarFrontend(kind=kind, dataset_name=dataset_name,
                                    imu_path=imu_path, imu_samples=imu_samples, **kf)
     raise ValueError(f"unknown lidar front-end kind {kind!r} "

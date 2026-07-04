@@ -60,6 +60,7 @@ fusion_outputs/
 
 # AI-assistant / tooling files (local reference only, never pushed)
 .claude/
+.codex
 .codex/
 CLAUDE.md
 
@@ -79,7 +80,14 @@ TWELVE_FPS_HANDOFF.md
 fusion2_outputs/
 visual_slam_outputs/
 baseline_snapshots/
+thesis_outputs/
 effective_run_config.json
 **/reference_audit/
 **/build_verify/
 thesis_outputs/*/figures/loops/
+
+# Local instruction notes
+instruction.txt
+instructions.txt
+**/instruction.txt
+**/instructions.txt

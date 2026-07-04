@@ -45,19 +45,20 @@ import fusion_core as fc
 from slam_core.fusion.signature import (CAMERA_GROUND_TRANSFORM,
                                         project_pose3d_to_pose2)
 from slam_core.fusion2.config import FusionV2Config, apply_dataset_tuning
-from slam_core.fusion2.dataset import LabHybridStream
-from slam_core.fusion2.lidar_frontend import make_lidar_frontend
-from slam_core.fusion2.runner import (_rel, _rel_sane, build_shared_map,
-                                      propose_candidates,
-                                      verify_candidate_bnb, verify_candidate_icp)
-from slam_core.fusion2.visual_features import BASE_T_CAM
+from slam_core.fusion2.Dependencies.dataset import LabHybridStream
+from slam_core.fusion2.Dependencies.pose_utils import _rel, _rel_sane
+from slam_core.fusion2.Dependencies.visual_features import BASE_T_CAM
+from slam_core.fusion2.Front_End.lidar_frontend import make_lidar_frontend
+from slam_core.fusion2.backend import build_shared_map
+from slam_core.fusion2.Loop_Proposer.proximity import propose_candidates
+from slam_core.fusion2.Loop_Verifier.bnb import verify_candidate_bnb
+from slam_core.fusion2.Loop_Verifier.icp import verify_candidate_icp
 
 VO_MODES = ("orb", "orb_lidar")
 SENSOR_OF_MODE = {"lidar": "lidar", "lidar_orb": "lidar", "orb": "vo", "orb_lidar": "vo"}
 
 
-# SE(2) node poses MUST be REP-103 (x-forward) — the same frame the PnP loop
-# edges (cam_rel_to_base_se2) and LiDAR scans live in (the v3.6 frame fix).
+# Convert VO camera poses into the same REP-103 base frame as LiDAR scans.
 def _cam_to_se2(Twc) -> fc.Pose2:
     p = project_pose3d_to_pose2(Twc, base_T_cam=BASE_T_CAM,
                                 world_transform=CAMERA_GROUND_TRANSFORM)
@@ -106,17 +107,15 @@ class IngestEngine:
 
     # -- modality configuration -------------------------------------------
     def set_active_sensor(self, sensor: str):
-        """Widen the B&B angular search window for visual-led scan verification
-        (orb_lidar): VO heading drift needs the ±45° window vs the LiDAR-led
-        ±30°. (ICP is standalone/prediction-seeded and needs no per-sensor
-        config -- see verify_candidate_icp.)"""
+        """Apply sensor-specific scan-search settings."""
         self.shared.bnb_cfg.angular_search_window = (
             self.cfg.orb_bnb_window_th if sensor == "vo" else self.cfg.bnb_window_th)
 
     # -- appearance index (only needed for the dbow proposer) --------------
     def ensure_appearance(self):
         if self._appearance is None:
-            from slam_core.fusion2.appearance_index import AppearanceIndex
+            # Build lazily so scan-only runs do not require DBoW.
+            from slam_core.fusion2.Loop_Proposer.dbow import AppearanceIndex
             self._appearance = AppearanceIndex(
                 min_score=self.cfg.dbow_min_score,
                 min_separation=self.cfg.min_kf_separation,
@@ -138,10 +137,10 @@ class IngestEngine:
         kf_id = self.kf_id
         self.kf_stamps[kf_id] = kfd.t
         if kfd.rel is None:
-            # very first KF -> front-end pose; first KF after a switch -> continue
-            # from the last graph pose (no spine edge across the gap).
+            # First KF, or first KF after a handoff: continue from graph anchor.
             node_pose = self.last_graph_pose if self.last_graph_pose is not None else kfd.fe_pose
         else:
+            # Normal case: apply front-end relative motion to the optimized graph pose.
             node_pose = self.last_graph_pose.compose(kfd.rel)
 
         scan = kfd.raw_scan if kfd.raw_scan is not None else np.zeros((0, 2), np.float32)
@@ -154,6 +153,7 @@ class IngestEngine:
             sig = fc.Signature(kf_id, kfd.t, scan_xy=scan)
         sig.pose = node_pose
 
+        # Memory owns payload residency; graph owns the optimized pose.
         res = shared.memory.insert(sig, similarity=kfd.similarity)
         if res.rehearsal_merged:
             self.stats["rehearsal_merges"] += 1
@@ -163,6 +163,7 @@ class IngestEngine:
         if kfd.rel is not None:
             tw = cfg.blind_spine_weight if kfd.blind else cfg.spine_trans_weight
             rw = cfg.blind_spine_weight if kfd.blind else cfg.spine_rot_weight
+            # Blind visual keyframes keep a soft odometry edge for later correction.
             sig.add_link(kf_id - 1, fc.LinkType.NEIGHBOR, kfd.rel, tw, rw)
             shared.graph.add_spine_edge(kf_id - 1, kf_id, kfd.rel, tw, rw)
         self.last_graph_pose = node_pose
@@ -175,6 +176,7 @@ class IngestEngine:
         if self.proposer == "dbow":
             idx = self.ensure_appearance()
             if sig.has_visual:
+                # DBoW returns appearance candidates; separation is enforced inside.
                 return [c for c, _ in idx.query(kf_id, np.asarray(sig.des, np.uint8))]
             return []
         return propose_candidates(self.shared, self.cfg, kf_id, node_pose)
@@ -184,8 +186,8 @@ class IngestEngine:
         """Returns (accepted, rel_pose|None)."""
         cfg, shared = self.cfg, self.shared
         if self.verifier == "pnp":
-            from slam_core.fusion2.visual_features import (cam_rel_to_base_se2,
-                                                           pnp_verify)
+            from slam_core.fusion2.Dependencies.visual_features import cam_rel_to_base_se2
+            from slam_core.fusion2.Loop_Verifier.pnp import pnp_verify
             cand_sig = shared.memory.get(cand)
             if cand_sig is None or not cand_sig.has_visual or not sig.has_visual:
                 return False, None
@@ -199,12 +201,13 @@ class IngestEngine:
             rx, ry, rth = cam_rel_to_base_se2(T_tq)
             rel = fc.Pose2(rx, ry, rth)
             pred = _rel(shared.graph.get_pose(cand), node_pose)
+            # PnP must be plausible unless it has enough inliers to bootstrap drift.
             if _rel_sane(rel, pred, cfg.pnp_rel_sanity_m, cfg.pnp_rel_sanity_rad) \
                     or n_in >= cfg.pnp_strong_inliers:
                 return True, rel
             return False, None
 
-        # scan verifiers (bnb / icp) — ICP is standalone, prediction-seeded
+        # Scan verifiers return an absolute corrected query pose.
         if self.verifier == "icp":
             r = verify_candidate_icp(shared, cfg, kf_id, raw_scan, node_pose, cand)
         else:
@@ -223,20 +226,20 @@ class IngestEngine:
         cand_pose = shared.graph.get_pose(cand)
         rel = _rel(cand_pose, r.pose)
         pred = _rel(cand_pose, node_pose)
-        if not _rel_sane(rel, pred, cfg.scan_rel_sanity_m, cfg.scan_rel_sanity_rad):
+        # Convert corrected absolute pose to cand->query loop edge and gate it.
+        if not _rel_sane(rel, pred, cfg.scan_rel_sanity_m, cfg.scan_rel_sanity_rad,
+                         cfg.scan_abs_max_m):
             return False, None
         return True, rel
 
     # -- close loops + optimize for one keyframe ---------------------------
     def close_loops(self, kf_id, node_pose, sig, raw_scan):
         cfg, shared = self.cfg, self.shared
-        # Front-end-only mode: no propose/verify/loop-constraint and no global
-        # optimize — the map is the raw spine (scan-matching / VO+local-BA) chain.
+        # Front-end-only mode keeps the raw odometry spine without loop closure.
         if not cfg.enable_loops:
             return False
         any_loop = False
-        # dbow queries every keyframe (its index enforces separation); proximity
-        # is gated to every Nth keyframe past the separation horizon.
+        # DBoW runs every KF; proximity is cadence-gated.
         propose = (self.proposer == "dbow") or \
                   (kf_id % cfg.propose_every_n_kf == 0 and kf_id > cfg.min_kf_separation)
         if propose:
@@ -256,11 +259,7 @@ class IngestEngine:
                     shared.memory.on_loop_confirmed(kf_id, cand)
                     self.stats["loops_accepted"] += 1
                     any_loop = True
-        # Online SLAM: optimize IMMEDIATELY on an accepted loop (so the robot's
-        # corrected localization is available at the moment of closure), as well
-        # as on the periodic cadence. The expensive fused-map render stays at the
-        # end; only the cheap pose-graph solve runs live. Returns True if the
-        # graph was re-optimized this keyframe (-> caller refreshes the display).
+        # Online mode optimizes immediately after a loop and periodically otherwise.
         did_opt = False
         if (any_loop and kf_id > 0) or (kf_id > 0 and kf_id % cfg.optimize_every_n_kf == 0):
             shared.graph.optimize()
@@ -271,14 +270,9 @@ class IngestEngine:
 
 
 # ---------------------------------------------------------------------------
-# LiDAR front-end manager with grace-buffer handoff (V5.3, s2s<->s2m).
+# LiDAR front-end manager with grace-buffer handoff (s2s <-> s2m).
 #
-# On a switch request the ORIGINAL front-end keeps driving the graph while a
-# fresh target front-end warms up on the SAME incoming scans for `grace_scans`
-# scans, then takes over. The new front-end starts from its own origin (no state
-# transfer); continuity is preserved by resetting the relative-motion baseline to
-# the new front-end's pose at the flip. Mirrors MatcherManager.request_switch
-# from hector/run_realtime_viz.py.
+# Active FE drives the graph while the target FE warms up on the same scans.
 # ---------------------------------------------------------------------------
 class FrontEndManager:
     def __init__(self, make_fe, initial_kind: str, grace_scans: int = 15):
@@ -307,13 +301,14 @@ class FrontEndManager:
         out = self.active.process(t, scan)
         flip = None
         if self._pending is not None:
-            warm = self._pending.process(t, scan)   # warm up (output ignored)
+            warm = self._pending.process(t, scan)   # warm-up output is not inserted
             self._grace -= 1
             if self._grace <= 0:
                 self.active = self._pending
                 self.active_kind = self._pending_kind
                 self._pending = self._pending_kind = None
                 wp = warm[0]
+                # Flip pose becomes the new baseline for relative motion.
                 flip = fc.Pose2(float(wp.x), float(wp.y), float(wp.theta))
         return (*out, flip)
 
@@ -371,8 +366,7 @@ class LidarFEAdapter:
         self._last_pose = fc.Pose2(float(fe_pose_py.x), float(fe_pose_py.y),
                                    float(fe_pose_py.theta))
         if flip is not None:
-            # handoff complete: reset the relative-motion baseline to the new
-            # front-end's frame so chaining continues seamlessly (no jump).
+            # Same-sensor handoff: reset baseline to avoid a graph jump.
             self.last_fe_pose = flip
         if not is_kf:
             return None, flip
@@ -382,6 +376,7 @@ class LidarFEAdapter:
             stationary = False
         else:
             rel = _rel(self.last_fe_pose, fe_pose)
+            # Stationary inserts may rehearse; moving scans stay separate.
             stationary = math.hypot(rel.x, rel.y) < 0.05 and abs(rel.theta) < math.radians(2.0)
         visual = _extract_visual(self.stream, t, self.K) if self.attach_visual else None
         self.last_fe_pose = fe_pose
@@ -405,7 +400,7 @@ class VoFEAdapter:
     sensor = "vo"
 
     def __init__(self, cfg, stream, imu=None):
-        from slam_core.fusion2.vo_orb_frontend import NativeOrbFrontend
+        from slam_core.fusion2.Front_End.vo_orb_frontend import NativeOrbFrontend
         self.cfg = cfg
         self.stream = stream
         self.fe = NativeOrbFrontend(cfg.dataset,
@@ -421,8 +416,7 @@ class VoFEAdapter:
         self.last_quality = float("nan")              # latest VO inlier count
         self._last_pose: Optional[fc.Pose2] = None    # latest tracked pose (any frame)
         self._baseline_override: Optional[fc.Pose2] = None
-        # Loosely-coupled IMU spine-heading (Option A): online-learned sign of the
-        # IMU yaw vs the SE(2) graph frame, and the previous keyframe's IMU yaw.
+        # Online sign calibration for replacing VO relative yaw with IMU yaw.
         self._imu_yaw_sign = 0.0
         self._imu_sign_corr = 0.0
         self._imu_sign_energy = 0.0
@@ -451,6 +445,7 @@ class VoFEAdapter:
         dyaw_vo = rel.theta
         if self._imu_yaw_sign == 0.0:
             if abs(dyaw_vo) < 0.5 and abs(dyaw_imu) < 0.5:
+                # Accumulate correlation until the IMU yaw sign is reliable.
                 self._imu_sign_corr += dyaw_vo * dyaw_imu
                 self._imu_sign_energy += abs(dyaw_vo * dyaw_imu)
                 if self._imu_sign_energy > 0.05 and \
@@ -480,8 +475,7 @@ class VoFEAdapter:
         blind = nkf.state == fc.VoState.REINIT
         spine_from_prev = False
         if self._baseline_override is not None:
-            # first keyframe after a cross-sensor handoff: chain from the flip
-            # baseline, then resume the BA-refined prev_Twc spine.
+            # First VO keyframe after handoff chains from the flip baseline.
             rel = _rel(self._baseline_override, fe_pose)
             self._baseline_override = None
         elif nkf.prev_Twc is None:
@@ -489,8 +483,7 @@ class VoFEAdapter:
         else:
             rel = _rel(_cam_to_se2(nkf.prev_Twc), fe_pose)
             spine_from_prev = True
-        # Loosely-coupled IMU heading (Option A): on a normal prev->cur spine,
-        # swap the drifting VO relative yaw for the drift-free IMU relative yaw.
+        # On normal visual spine edges, optionally replace yaw with IMU delta.
         imu_y = self.fe.imu_yaw_at(t)
         if spine_from_prev and self.cfg.vo_imu_spine_heading:
             rel = self._imu_correct_yaw(rel, imu_y)
@@ -520,16 +513,9 @@ SENSOR_OF_EVENT = {"lidar": "lidar", "rgbd": "vo"}    # merged-timeline tag -> s
 
 
 # ---------------------------------------------------------------------------
-# SensorManager — orchestrates CROSS-sensor (visual VO <-> LiDAR) front-end
-# switches on top of the per-sensor adapters (V5.7). Same-sensor LiDAR variant
-# switches (s2s<->s2m) delegate to the LiDAR adapter's own FrontEndManager.
+# SensorManager orchestrates cross-sensor switches above per-sensor adapters.
 #
-# On a cross-sensor request a fresh target adapter is built and warmed up on ITS
-# sensor's events for `grace_scans` events while the active adapter keeps driving
-# the graph. At the flip the target becomes active and its relative-motion
-# baseline is reset to its own pose at that instant, so the first post-flip
-# keyframe continues from the last graph pose (valid because both adapters emit
-# REP-103 base poses).
+# Target adapter warms up on its own events, then resets its baseline at flip.
 # ---------------------------------------------------------------------------
 class SensorManager:
     def __init__(self, make_adapter_fn, initial_adapter, grace_scans: int = 20):
@@ -574,7 +560,7 @@ class SensorManager:
         sensor_flip = None
         just_flipped = False
         if self.pending is not None and sensor == self.pending.sensor:
-            self.pending.feed(ev)                  # warm up (output discarded)
+            self.pending.feed(ev)                  # warm-up output is not inserted
             self._grace -= 1
             if self._grace <= 0:
                 pk = self.pending_kind
@@ -582,6 +568,7 @@ class SensorManager:
                 self.pending = self.pending_kind = None
                 base = self.active.current_pose()
                 if base is not None:
+                    # Anchor target relative motion at its current pose.
                     self.active.reset_baseline(base)
                 sensor_flip = dict(kind=pk, sensor=self.active.sensor)
                 just_flipped = True
@@ -651,6 +638,8 @@ class LiveView:
 
 
 class StageTimer:
+    """Accumulates live-loop timing by stage for real-time diagnostics."""
+
     STAGES = ("preprocess", "slam", "loop", "draw", "sleep")
 
     def __init__(self):
@@ -723,6 +712,9 @@ def _parse_args():
     p.add_argument("--attach-visual", action="store_true",
                    help="Extract+store ORB on every LiDAR keyframe so pnp/dbow are "
                         "available live (~78 KB/keyframe).")
+    p.add_argument("--no-dataset-tuning", action="store_true",
+                   help="Skip per-dataset config overrides (apply_dataset_tuning); run the "
+                        "committed baseline config, as used for the untuned datasets.")
     p.add_argument("--max-scans", type=int, default=0,
                    help="Cap on active-sensor keyframe-driving events (0 = all).")
     p.add_argument("--grace-scans", type=int, default=20,
@@ -760,16 +752,13 @@ def main(argv=None):
     cfg = FusionV2Config(mode=args.mode, dataset=args.dataset, output_dir=args.output,
                          lidar_frontend=args.lidar_frontend, scan_verifier=args.verifier,
                          max_scans=args.max_scans, enable_loops=not args.no_loops)
-    _tuned = apply_dataset_tuning(cfg)   # per-dataset overrides (texture-poor sets)
+    _tuned = (not args.no_dataset_tuning) and apply_dataset_tuning(cfg)  # per-dataset overrides (texture-poor sets)
     start_sensor = SENSOR_OF_MODE[args.mode]
     proposer, verifier = _mode_defaults(args.mode, args.verifier)
     if args.proposer is not None:
         proposer = args.proposer
 
-    # LiDAR adapters attach the visual payload (so pnp/dbow survive a switch TO
-    # LiDAR) iff the user opted in (--attach-visual) or started in lidar_orb.
-    # VO adapters are always visual. This holds for the initial AND any pending
-    # (cross-sensor) adapter, so capability is consistent across switches.
+    # Visual payload availability decides whether PnP/DBoW can run after switches.
     lidar_attach = bool(args.attach_visual) or args.mode == "lidar_orb"
     start_visual = True if start_sensor == "vo" else lidar_attach
     if verifier == "pnp" and not start_visual:
@@ -778,9 +767,9 @@ def main(argv=None):
     if proposer == "dbow" and not start_visual:
         raise SystemExit("--proposer dbow needs descriptors: add --attach-visual.")
 
-    # data source: offline disk replay, or a LIVE ROS-fed event stream + IMU.
+    # Data source: offline disk replay or live ROS-fed event stream.
     if args.source == "ros":
-        from slam_core.fusion2.ros_source import RosEventSource
+        from slam_core.fusion2.Dependencies.ros_source import RosEventSource
         live_src = RosEventSource(args.ros_socket, sync_tol=cfg.sync_tolerance_s).start()
         stream, imu = live_src, live_src.imu
         print(f"[ros] waiting for the bridge on {args.ros_socket} ...")
@@ -788,8 +777,7 @@ def main(argv=None):
         live_src = None
         stream, imu = LabHybridStream(cfg.dataset, cfg.sync_tolerance_s), None
 
-    # camera intrinsics — needed by any visual-attaching adapter (PnP / dbow).
-    # (static calibration; read from the config dir even in ros mode.)
+    # Camera intrinsics are needed for visual payload extraction and PnP.
     import yaml
     sc = yaml.safe_load(open(Path(cfg.dataset) / "sensor_config.yaml"))["camera"]
     K = np.array([[sc["fx"], 0, sc["cx"]], [0, sc["fy"], sc["cy"]], [0, 0, 1]])
@@ -803,12 +791,7 @@ def main(argv=None):
     shared = build_shared_map(cfg)
     eng = IngestEngine(shared, cfg, K=K, verifier=verifier, proposer=proposer)
     eng.set_active_sensor(start_sensor)
-    # Build the DBoW appearance index from kf 0 whenever visual descriptors will
-    # exist (VO start, or --attach-visual LiDAR), not only when dbow starts active.
-    # index_descriptors() then populates it every ingest, so a mid-run switch to
-    # dbow can propose against keyframes seen BEFORE the switch (the append-only
-    # index is never pruned). Without this the pre-switch keyframes are never
-    # indexed and dbow finds no candidates for revisits to them.
+    # Build DBoW early when descriptors exist, so later dbow switches see old KFs.
     if proposer == "dbow" or start_visual:
         eng.ensure_appearance()
     visual_available = _visual_available(sm.active)
@@ -832,9 +815,10 @@ def main(argv=None):
     schedule = _parse_switch_schedule(args.switch_schedule)
     if schedule:
         print("Schedule  : " + "  ".join(f"kf{kf}->[{cmd}]" for kf, cmd in schedule))
-    # switch + per-keyframe logging (attached to eng so _finalize can emit them).
+    # Switch/timeline logs are attached to the engine for final CSV output.
     eng.switch_events = []     # one row per applied switch (verifier/proposer/fe)
     eng.timeline = []          # one row per keyframe (pose + active modules + quality)
+    eng.loop_snaps = []        # (kf_count, full graph poses) captured at each loop correction
     _last_xy = [0.0, 0.0]      # latest graph pos, for annotating switch markers
 
     live = LiveView(f"fusion realtime — {cfg.mode}/{sm.active_variant}")
@@ -846,8 +830,7 @@ def main(argv=None):
     lag = 0.0
     active_events = 0
 
-    # event iterator: a materialised disk list (with real-time pacing) OR the
-    # LIVE ROS generator (arrives in real time; no pacing).
+    # Event iterator: paced disk replay or naturally paced live ROS stream.
     if args.source == "ros":
         events, n_events, paced = None, None, False
         event_iter = enumerate(live_src.live_events())
@@ -860,8 +843,7 @@ def main(argv=None):
         sensor, t = ev[0], ev[1]
         ev_start = time.perf_counter()
 
-        # scheduled switches: inject the command when the keyframe count crosses
-        # the threshold (deterministic replay of the interactive path).
+        # Scheduled switches replay the same path as stdin commands.
         while schedule and eng.stats["keyframes"] >= schedule[0][0]:
             switch_q.put(schedule[0][1]); schedule.pop(0)
         # drain live commands (main thread only)
@@ -873,16 +855,13 @@ def main(argv=None):
         if t0_data is None:
             t0_data, t0_wall = t, time.perf_counter()
 
-        # route the event: pending FE warms up on its sensor, active FE drives.
-        # (capture the active variant BEFORE feed so a completed flip logs its
-        # true source — sm.active is already the new adapter afterwards.)
+        # Route event: pending FE warms up, active FE may emit a graph keyframe.
         prev_variant = sm.active_variant
         t_a = time.perf_counter()
         kfd, fe_flip, sensor_flip = sm.feed(ev)
         timer.add("slam", time.perf_counter() - t_a)
         if sensor_flip is not None:
-            # cross-sensor flip: re-tune scan verification for the new modality
-            # and auto-fall-back any module the new front-end cannot feed.
+            # Retune scan verification and fallback modules after sensor flip.
             eng.set_active_sensor(sensor_flip["sensor"])
             fb = _autofallback(eng, sm.active)
             visual_available = _visual_available(sm.active)
@@ -913,7 +892,7 @@ def main(argv=None):
             kf_ids.append(kf_id)
             kf_scans.append(scan)
             _last_xy[0], _last_xy[1] = node_pose.x, node_pose.y
-            # per-keyframe timeline (pose + active modules + tracking quality)
+            # Record pose, active modules, and tracking quality for this keyframe.
             eng.timeline.append(dict(
                 kf=kf_id, stamp=round(t, 6),
                 x=round(node_pose.x, 4), y=round(node_pose.y, 4),
@@ -921,9 +900,11 @@ def main(argv=None):
                 fe=sm.active_variant, verifier=eng.verifier, proposer=eng.proposer,
                 quality=round(float(sm.active.last_quality), 4)))
             if did_opt:
-                # LOOP CORRECTION applied live: rebuild the WHOLE displayed
-                # trajectory + cloud from the corrected graph at once.
+                # Rebuild display from corrected graph after a live loop closure.
                 xs, ys, cloud_chunks = _rebuild_display(shared, kf_ids, kf_scans)
+                # Save graph snapshot for offline switch-demo video generation.
+                eng.loop_snaps.append((eng.stats["keyframes"],
+                                       np.asarray(shared.graph.poses()).copy()))
             else:
                 gp = shared.graph.get_pose(kf_id)
                 xs.append(gp.x); ys.append(gp.y)
@@ -945,7 +926,7 @@ def main(argv=None):
                               f"loops={eng.stats['loops_accepted']}")
         timer.add("draw", time.perf_counter() - t_c)
 
-        # real-time pacing — dataset replay only (ROS already arrives in real time)
+        # Real-time pacing applies only to disk replay.
         if paced:
             period = (events[k + 1][1] - t) if (k + 1) < n_events else 0.0
             if period > 0 and (time.perf_counter() - ev_start) > period:
@@ -968,9 +949,7 @@ def main(argv=None):
         if args.max_scans and active_events >= args.max_scans:
             break
 
-    # final optimize + outputs (+ auto-display the corrected fused map).
-    # Front-end-only runs skip it: with no loop edges the spine is already
-    # consistent, so the map stays the raw odometry chain.
+    # Final solve is skipped for front-end-only runs with no loop edges.
     if cfg.enable_loops:
         shared.graph.optimize()
         eng.stats["optimize_calls"] += 1
@@ -986,6 +965,7 @@ def main(argv=None):
     for s in ("slam", "loop", "draw"):
         eng.stats[f"{s}_ms_mean"] = round(timer.total[s] / max(1, timer.n) * 1e3, 3)
     timer.summary(lag)
+    eng.kf_ids, eng.kf_scans = kf_ids, kf_scans   # per-keyframe scans for offline video
     _finalize_and_show(shared, cfg, eng, sm.active, args, live)
 
 
@@ -1013,7 +993,7 @@ def _autofallback(eng, new_adapter) -> list:
 # ---- helpers --------------------------------------------------------------
 def _extract_visual(stream, t, K):
     import cv2
-    from slam_core.fusion2.visual_features import extract_orb_rgbd
+    from slam_core.fusion2.Dependencies.visual_features import extract_orb_rgbd
     pair = stream.nearest_rgbd(t)   # (path,path) disk OR (rgb_arr,depth_arr) online
     if pair is None:
         return None
@@ -1150,7 +1130,7 @@ def _finalize_and_show(shared, cfg, eng, adapter, args, live):
     second command). Uses the live interactive backend when available, else Agg."""
     import json
 
-    from slam_core.fusion2.runner import _anchor_poses
+    from slam_core.fusion2.Dependencies.outputs import _anchor_poses
     run_dir = Path(args.output) / f"realtime_{cfg.mode}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     poses = _anchor_poses(np.asarray(shared.graph.poses()))
@@ -1160,7 +1140,7 @@ def _finalize_and_show(shared, cfg, eng, adapter, args, live):
             qz, qw = math.sin(th / 2.0), math.cos(th / 2.0)
             f.write(f"{t:.6f} {x:.6f} {y:.6f} 0.0 0.0 0.0 {qz:.9f} {qw:.9f}\n")
     # memory footprint + tier counts for the run summary
-    from slam_core.fusion2.runner import _rss_gb
+    from slam_core.fusion2.Dependencies.outputs import _rss_gb
     eng.stats["peak_rss_gb"] = round(_rss_gb(), 2)
     eng.stats["map_payload_mb"] = round(shared.memory.payload_bytes() / 1e6, 1)
     eng.stats["stm"] = shared.memory.stm_count()
@@ -1216,6 +1196,26 @@ def _finalize_and_show(shared, cfg, eng, adapter, args, live):
         json.dump(dict(origin_x=grid.origin_x, origin_y=grid.origin_y,
                        resolution=grid.resolution, width=grid.width,
                        height=grid.height, extent=extent), f, indent=2)
+
+    # per-keyframe scans + per-loop deformed-graph snapshots, for the offline
+    # switching video (tools/thesis_switch_video.py). Empty on a normal run.
+    kf_ids = list(getattr(eng, "kf_ids", []))
+    kf_scans = list(getattr(eng, "kf_scans", []))
+    if kf_ids and kf_scans:
+        snaps = getattr(eng, "loop_snaps", [])
+        np.savez(
+            run_dir / "frames.npz",
+            kf_ids=np.asarray(kf_ids, dtype=np.int64),
+            stamps=np.asarray([eng.kf_stamps.get(int(i), 0.0) for i in kf_ids],
+                              dtype=np.float64),
+            scans=np.array([np.asarray(s, np.float32) for s in kf_scans], dtype=object),
+            snap_kfcounts=np.asarray([int(c) for c, _ in snaps], dtype=np.int64),
+            snap_poses=np.array([np.asarray(p, np.float64) for _, p in snaps],
+                                dtype=object),
+            final_poses=np.asarray(poses, dtype=np.float64),
+            extent=np.asarray(extent, dtype=np.float64),
+            resolution=np.float64(grid.resolution),
+        )
 
     import matplotlib
     if not live.ok:

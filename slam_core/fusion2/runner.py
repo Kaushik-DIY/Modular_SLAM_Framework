@@ -17,7 +17,6 @@ import argparse
 import json
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -27,341 +26,15 @@ import fusion_core as fc
 
 from slam_core.common.types import Pose2 as PyPose2
 from slam_core.fusion2.config import FusionV2Config
-from slam_core.fusion2.dataset import LabHybridStream
-
-
-# ---------------------------------------------------------------------------
-# SE(2) helpers on fusion_core.Pose2
-# ---------------------------------------------------------------------------
-
-def _rel(a: fc.Pose2, b: fc.Pose2) -> fc.Pose2:
-    """T_a^{-1} ∘ T_b."""
-    return a.inverse().compose(b)
-
-
-def _fc_pose(p) -> fc.Pose2:
-    return fc.Pose2(float(p.x), float(p.y), float(p.theta))
-
-
-def _rel_sane(rel: fc.Pose2, pred: fc.Pose2, max_m: float, max_rad: float) -> bool:
-    """Loop-edge sanity: verified rel pose must roughly agree with the graph
-    prediction. Rejects rotational-ambiguity false positives that score well
-    on the matcher but disagree wildly with the (drift-bounded) odometry."""
-    return (math.hypot(rel.x - pred.x, rel.y - pred.y) <= max_m
-            and abs(math.atan2(math.sin(rel.theta - pred.theta),
-                               math.cos(rel.theta - pred.theta))) <= max_rad)
-
-
-# ---------------------------------------------------------------------------
-# Shared map assembly
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SharedMap:
-    memory: "fc.MemoryManager"
-    store: "fc.InRamLtmStore"
-    graph: "fc.FusionGraph2D"
-    grid_cfg: "fc.GridConfig"
-    bnb_cfg: "fc.BnbConfig"
-
-
-def build_shared_map(cfg: FusionV2Config) -> SharedMap:
-    mc = fc.MemoryConfig()
-    mc.stm_size = cfg.stm_size
-    mc.wm_cap = cfg.wm_cap
-    mc.rehearsal_similarity = cfg.rehearsal_similarity
-    store = fc.InRamLtmStore()
-    memory = fc.MemoryManager(mc, store)
-
-    gc = fc.GraphConfig()
-    gc.huber_scale = cfg.huber_scale
-    gc.spine_trans_weight = cfg.spine_trans_weight
-    gc.spine_rot_weight = cfg.spine_rot_weight
-    graph = fc.FusionGraph2D(gc)
-
-    grid_cfg = fc.GridConfig()
-    grid_cfg.resolution = cfg.grid_resolution
-    grid_cfg.l_occ = cfg.grid_l_occ
-    grid_cfg.l_free = cfg.grid_l_free
-
-    bnb = fc.BnbConfig()
-    bnb.linear_search_window = cfg.bnb_window_xy
-    bnb.angular_search_window = cfg.bnb_window_th
-    bnb.depth = cfg.bnb_depth
-    return SharedMap(memory, store, graph, grid_cfg, bnb)
-
-
-# ---------------------------------------------------------------------------
-# Proximity loop proposer + candidate-local B&B verification (LiDAR side)
-# ---------------------------------------------------------------------------
-
-def propose_candidates(shared: SharedMap, cfg: FusionV2Config, query_id: int,
-                       query_pose: fc.Pose2) -> List[int]:
-    """Bounded pose-driven proximity proposer (RTAB-Map "proximity detection with
-    retrieval").
-
-    Searches resident WM AND the relevant slice of LTM: the pose graph retains
-    EVERY node (transfer to LTM does not remove its graph pose), so we find the
-    nodes within proposal_radius of the current pose over the whole graph, then
-    REACTIVATE any chosen node that has aged into LTM (+graph neighbours) back into
-    WM so the verifier can load its scan/visual payload. This is the retrieval half
-    of RTAB's memory design — without it the WM-only search could never propose a
-    GLOBAL loop to a place that had been transferred out of WM. STM (the most
-    recent locations) is hidden; the whole step stays bounded by proposal_radius
-    and max_candidates_per_query, so it remains real-time."""
-    poses = np.asarray(shared.graph.poses())            # (N,4): id,x,y,theta (incl LTM)
-    if len(poses) == 0:
-        return []
-    ids = poses[:, 0].astype(np.int64)
-    d = np.hypot(poses[:, 1] - query_pose.x, poses[:, 2] - query_pose.y)
-    mask = (d <= cfg.proposal_radius_m) & (np.abs(query_id - ids) >= cfg.min_kf_separation)
-    if not mask.any():
-        return []
-    cand_ids = ids[mask]
-    order = np.argsort(d[mask])                          # nearest first
-    chosen: List[int] = []
-    for idx in order:
-        cid = int(cand_ids[idx])
-        tier = shared.memory.tier(cid)
-        if tier == fc.Tier.STM:                         # hide STM (most-recent) per RTAB
-            continue
-        if tier == fc.Tier.LTM:                         # retrieve the aged-out place
-            shared.memory.reactivate(cid)               # back into WM (+neighbours)
-        chosen.append(cid)
-        if len(chosen) >= cfg.max_candidates_per_query:
-            break
-    return chosen
-
-
-def _candidate_neighborhood(shared: SharedMap, cfg: FusionV2Config, query_id: int,
-                            cand_id: int):
-    """Scans grouped around the candidate, query's temporal trail excluded."""
-    nb = fc.retrieve_neighborhood(shared.memory, shared.graph, cand_id,
-                                  graph_depth=cfg.retrieval_graph_depth,
-                                  metric_radius=cfg.retrieval_metric_radius,
-                                  scans_only=True)
-    sigs, poses = [], []
-    for s, p in zip(nb.signatures, nb.poses):
-        if abs(s.id - query_id) < cfg.min_kf_separation:
-            continue  # never let the query (or its recent trail) verify itself
-        sigs.append(s)
-        poses.append(p)
-    return sigs, poses
-
-
-def verify_candidate_bnb(shared: SharedMap, cfg: FusionV2Config, query_id: int,
-                         query_scan: np.ndarray, query_pose: fc.Pose2,
-                         cand_id: int):
-    """Candidate-local B&B: grid from scans grouped around the candidate
-    (query's own temporal neighborhood excluded), then bounded search."""
-    sigs, poses = _candidate_neighborhood(shared, cfg, query_id, cand_id)
-    if len(sigs) < 2:
-        return None
-    grid = fc.assemble_local_grid(sigs, poses, shared.grid_cfg)
-    return fc.bnb_match(grid, query_scan, query_pose, shared.bnb_cfg)
-
-
-def verify_candidate_icp(shared: SharedMap, cfg: FusionV2Config, query_id: int,
-                         query_scan: np.ndarray, query_pose: fc.Pose2,
-                         cand_id: int):
-    """Standalone ICP loop verifier (small_gicp), RTAB-Map RegistrationIcp style
-    and INDEPENDENT of B&B. Align the query scan against the candidate-local
-    neighbourhood cloud, seeded ONLY by the graph-predicted relative pose (the
-    "guess from odometry" RTAB uses), and accept on the ICP's OWN quality
-    metrics: the correspondence ratio (fraction of query points with a target
-    neighbour within icp_fitness_dist) and the inlier RMSE. Returns a
-    BnbResult-shaped object with coarse_score=correspondence_ratio,
-    refined_score=inlier_rmse (metres, LOWER is better).
-
-    No B&B coarse seed and no occupancy-grid cross-check. The "result must stay
-    near the guess" slide-lock guard is RTAB's max-translation/rotation bound,
-    applied by the caller as the rel-sanity gate. Consequence by design: ICP
-    needs a good initial guess, so high-drift front-ends (e.g. visual-led
-    orb_lidar, where VO drift exceeds GICP's convergence basin) will verify
-    fewer/no loops with ICP than with B&B — that is a property of metric ICP to
-    be studied comparatively, not a fault to be patched with a B&B seed."""
-    import small_gicp
-
-    sigs, poses = _candidate_neighborhood(shared, cfg, query_id, cand_id)
-    if len(sigs) < 2:
-        return None
-
-    tgt_pts = []
-    for s, p in zip(sigs, poses):
-        sc = np.asarray(s.scan_xy, dtype=np.float64)
-        c, sn = math.cos(p.theta), math.sin(p.theta)
-        tgt_pts.append(sc @ np.array([[c, sn], [-sn, c]]) + [p.x, p.y])
-    tgt3 = np.c_[np.vstack(tgt_pts), np.zeros(sum(len(t) for t in tgt_pts))]
-
-    # seed = graph-predicted pose (RTAB's odometry guess); NO coarse pre-search.
-    seed_pose = query_pose
-    q = np.asarray(query_scan, dtype=np.float64)
-    c, sn = math.cos(seed_pose.theta), math.sin(seed_pose.theta)
-    q_world = q @ np.array([[c, sn], [-sn, c]]) + [seed_pose.x, seed_pose.y]
-    src3 = np.c_[q_world, np.zeros(len(q_world))]
-
-    res = small_gicp.align(tgt3, src3, registration_type="GICP",
-                           max_correspondence_distance=cfg.icp_max_corr_dist,
-                           num_threads=2)
-    T = np.asarray(res.T_target_source)
-    dx, dy = float(T[0, 3]), float(T[1, 3])
-    dth = float(math.atan2(T[1, 0], T[0, 0]))
-
-    # ICP-native quality: correspondence ratio + inlier RMSE over the aligned
-    # query (RTAB's correspondencesRatio and inlier residual).
-    corr = (src3 @ T[:3, :3].T) + T[:3, 3]
-    tree = small_gicp.KdTree(tgt3)
-    d = np.sqrt(np.array([tree.nearest_neighbor_search(p)[2] for p in corr]))
-    inl = d < cfg.icp_fitness_dist
-    corr_ratio = float(inl.mean())
-    inlier_rmse = float(np.sqrt(np.mean(d[inl] ** 2))) if inl.any() else cfg.icp_max_corr_dist
-
-    cx = T[0, 0] * seed_pose.x + T[0, 1] * seed_pose.y + dx
-    cy = T[1, 0] * seed_pose.x + T[1, 1] * seed_pose.y + dy
-    corrected_pose = fc.Pose2(cx, cy, seed_pose.theta + dth)
-
-    class _R:  # BnbResult-compatible shape
-        success = bool(res.converged)
-        coarse_score = corr_ratio       # gated by icp_accept_fitness (>=)
-        refined_score = inlier_rmse     # gated by icp_accept_rmse (<=), metres
-        pose = corrected_pose
-        refined = True
-    return _R()
-
-
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
-
-def _anchor_poses(poses: np.ndarray) -> np.ndarray:
-    """Express every node pose in the robot-START frame so EVERY mode renders
-    in the same standard convention: the first keyframe sits at the origin
-    facing +x. Without this the VO front-end starts at heading 90° (the
-    BASE_T_CAM ∘ CAMERA_GROUND_TRANSFORM projection of identity), rotating the
-    orb maps 90° vs the LiDAR maps. A pure rigid re-frame — map/trajectory
-    geometry is unchanged, only the global orientation is normalized.
-    `poses` columns: [nid, x, y, theta], assumed nid-sorted (gauge = row 0)."""
-    if len(poses) == 0:
-        return poses
-    ax, ay, ath = float(poses[0, 1]), float(poses[0, 2]), float(poses[0, 3])
-    c, s = math.cos(ath), math.sin(ath)
-    out = poses.copy()
-    dx = poses[:, 1] - ax
-    dy = poses[:, 2] - ay
-    out[:, 1] = c * dx + s * dy          # R(-ath) @ (p - anchor)
-    out[:, 2] = -s * dx + c * dy
-    out[:, 3] = np.arctan2(np.sin(poses[:, 3] - ath), np.cos(poses[:, 3] - ath))
-    return out
-
-
-def render_fused_occupancy(render_sigs, render_poses, traj_xyt, grid_cfg, out_png,
-                           title, npy_path=None, meta_path=None):
-    """Fuse the given signatures' scans (at their optimized poses) into ONE
-    log-odds occupancy grid (C++ assemble_local_grid) and render it grayscale
-    with the trajectory overlay. Shared by the batch runner (write_outputs) and
-    the real-time runner (V5) so the map convention is identical. `traj_xyt` is
-    an (N,3) x/y/theta array for the blue path + start/end markers. Returns
-    (prob, extent) or (None, None) if there is nothing with scans to render."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    if not render_sigs:
-        return None, None
-    grid = fc.assemble_local_grid(render_sigs, render_poses, grid_cfg)
-    prob = np.asarray(grid.probability())
-    extent = [grid.origin_x, grid.origin_x + grid.width * grid.resolution,
-              grid.origin_y, grid.origin_y + grid.height * grid.resolution]
-    if npy_path is not None:
-        np.save(npy_path, prob)
-    if meta_path is not None:
-        with open(meta_path, "w") as f:
-            json.dump(dict(origin_x=grid.origin_x, origin_y=grid.origin_y,
-                           resolution=grid.resolution, width=grid.width,
-                           height=grid.height, extent=extent), f, indent=2)
-    traj = np.asarray(traj_xyt, dtype=float)
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.imshow(prob, cmap="gray_r", vmin=0.0, vmax=1.0, origin="lower",
-              extent=extent, interpolation="nearest")
-    if len(traj):
-        ax.plot(traj[:, 0], traj[:, 1], "-", lw=1.0, color="tab:blue", alpha=0.9)
-        ax.scatter(traj[0, 0], traj[0, 1], c="g", s=50, zorder=5, label="start")
-        ax.scatter(traj[-1, 0], traj[-1, 1], c="r", s=50, zorder=5, label="end")
-    ax.set_title(title)
-    ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
-    ax.grid(alpha=0.15); ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_png, dpi=200)
-    plt.close(fig)
-    return prob, extent
-
-
-def write_outputs(shared: SharedMap, cfg: FusionV2Config, run_dir: Path,
-                  kf_stamps: dict, stats: dict,
-                  skip_scan_ids: Optional[set] = None) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    poses = _anchor_poses(np.asarray(shared.graph.poses()))
-
-    with open(run_dir / "trajectory.tum", "w") as f:
-        for nid, x, y, th in poses:
-            t = kf_stamps.get(int(nid), float(nid))
-            qz, qw = math.sin(th / 2.0), math.cos(th / 2.0)
-            f.write(f"{t:.6f} {x:.6f} {y:.6f} 0.0 0.0 0.0 {qz:.9f} {qw:.9f}\n")
-
-    # Collect renderable signatures (scans at optimized poses).
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    render_sigs, render_poses, pts_all = [], [], []
-    for nid, x, y, th in poses:
-        if skip_scan_ids and int(nid) in skip_scan_ids:
-            continue   # blind-pose keyframes (REINIT) must not paint the map
-        sig = shared.memory.get(int(nid))
-        if sig is None or not sig.has_scan:
-            continue
-        render_sigs.append(sig)
-        render_poses.append(fc.Pose2(float(x), float(y), float(th)))
-        sc = np.asarray(sig.scan_xy, dtype=np.float64)
-        c, s = math.cos(th), math.sin(th)
-        pts_all.append(sc @ np.array([[c, -s], [s, c]]).T + [x, y])
-
-    title = (f"fusion2 --mode {cfg.mode}: {len(poses)} keyframes, "
-             f"{stats.get('loops_accepted', 0)} loops "
-             f"(STM {shared.memory.stm_count()} / WM {shared.memory.wm_count()} / "
-             f"LTM {shared.memory.ltm_count()})")
-
-    # Primary output: FUSED log-odds occupancy grid (V4.2, thesis-grade).
-    # Reuses the same C++ integration the B&B verifier trusts; overlapping
-    # observations reinforce walls instead of smearing as a scatter band.
-    render_fused_occupancy(
-        render_sigs, render_poses, poses[:, 1:4] if len(poses) else np.zeros((0, 3)),
-        shared.grid_cfg, run_dir / "occupancy.png", title,
-        npy_path=run_dir / "map.npy", meta_path=run_dir / "map_meta.json")
-
-    # Secondary debug output: raw scan scatter (the pre-V4.2 rendering).
-    fig, ax = plt.subplots(figsize=(12, 7))
-    if pts_all:
-        P = np.vstack(pts_all)
-        ax.scatter(P[:, 0], P[:, 1], s=0.2, c="k", alpha=0.25, linewidths=0)
-    ax.plot(poses[:, 1], poses[:, 2], "-", lw=0.8, color="tab:blue", alpha=0.9)
-    ax.scatter(poses[0, 1], poses[0, 2], c="g", s=50, zorder=5, label="start")
-    ax.scatter(poses[-1, 1], poses[-1, 2], c="r", s=50, zorder=5, label="end")
-    ax.set_title(title)
-    ax.axis("equal"); ax.grid(alpha=0.2); ax.legend()
-    fig.tight_layout()
-    fig.savefig(run_dir / "scan_overlay.png", dpi=110)
-    plt.close(fig)
-
-    with open(run_dir / "run_summary.json", "w") as f:
-        json.dump(stats, f, indent=2, default=str)
-
-
-def _rss_gb() -> float:
-    import os
-    with open(f"/proc/{os.getpid()}/status") as f:
-        for line in f:
-            if line.startswith("VmRSS"):
-                return int(line.split()[1]) / 1024.0 / 1024.0
-    return -1.0
+from slam_core.fusion2.Dependencies.dataset import LabHybridStream
+from slam_core.fusion2.Dependencies.pose_utils import _rel, _fc_pose, _rel_sane
+from slam_core.fusion2.Dependencies.outputs import (_anchor_poses,
+                                                    render_fused_occupancy,
+                                                    write_outputs, _rss_gb)
+from slam_core.fusion2.backend import SharedMap, build_shared_map
+from slam_core.fusion2.Loop_Proposer.proximity import propose_candidates
+from slam_core.fusion2.Loop_Verifier.bnb import verify_candidate_bnb
+from slam_core.fusion2.Loop_Verifier.icp import verify_candidate_icp
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +46,15 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
     verification of proximity proposals)."""
     import cv2
 
-    from slam_core.fusion2.lidar_frontend import make_lidar_frontend
-    from slam_core.fusion2.visual_features import (cam_rel_to_base_se2,
-                                                   extract_orb_rgbd, pnp_verify)
+    from slam_core.fusion2.Front_End.lidar_frontend import make_lidar_frontend
+    from slam_core.fusion2.Dependencies.visual_features import (cam_rel_to_base_se2,
+                                                                extract_orb_rgbd)
+    from slam_core.fusion2.Loop_Verifier.pnp import pnp_verify
 
     visual_backend = cfg.mode == "lidar_orb"
     K = None
     if visual_backend:
+        # PnP verification needs camera intrinsics for LiDAR-attached RGB-D frames.
         import yaml
         sc = yaml.safe_load(open(Path(cfg.dataset) / "sensor_config.yaml"))["camera"]
         K = np.array([[sc["fx"], 0, sc["cx"]], [0, sc["fy"], sc["cy"]], [0, 0, 1]])
@@ -414,24 +89,19 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
         if not is_kf:
             continue
         fe_pose = _fc_pose(fe_pose_py)
-        # Signatures carry the RAW scan (plan §8): ~560 valid beams give
-        # contiguous walls in candidate-local grids; the voxel-filtered `pts`
-        # stay the front-end's matching diet. B&B subsamples the query itself.
+        # Store raw scans for mapping; filtered points are only for matching.
         raw_scan = scan
 
         kf_id += 1
         kf_stamps[kf_id] = t
-        # Initialize the node in the OPTIMIZED frame: continue from the last
-        # graph pose using the front-end's relative motion (so global loop
-        # corrections never fight new odometry).
+        # Chain new odometry from the last optimized graph pose.
         if last_fe_pose is None:
             node_pose = fe_pose
         else:
             node_pose = last_graph_pose.compose(_rel(last_fe_pose, fe_pose))
 
         if visual_backend:
-            # lidar_orb: signatures additionally carry the synced visual payload
-            # so loop candidates can be verified by ORB matching + PnP.
+            # LiDAR-led tracking, visual loop verification.
             kpts = des = pts3d = None
             pair = stream.nearest_rgbd(t)
             if pair is not None:
@@ -448,10 +118,7 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
         else:
             sig = fc.Signature(kf_id, t, scan_xy=raw_scan)
         sig.pose = node_pose
-        # Rehearsal gate: keyframes here are ALREADY motion-filtered, so only a
-        # stationary (time-triggered) keyframe may rehearsal-merge with its
-        # predecessor (RTAB collapses repeated observations of the SAME spot;
-        # consecutive moving scans in a room overlap ~85% and must NOT merge).
+        # Rehearsal merges only stationary repeated observations.
         if last_fe_pose is not None:
             d = _rel(last_fe_pose, fe_pose)
             stationary = math.hypot(d.x, d.y) < 0.05 and abs(d.theta) < math.radians(2.0)
@@ -460,10 +127,10 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
         res = shared.memory.insert(sig, similarity=-1.0 if stationary else 0.0)
         if res.rehearsal_merged:
             stats["rehearsal_merges"] += 1
-            # The merged predecessor's graph node remains (full trajectory kept);
-            # only its payload is deduplicated out of memory.
+            # Graph node remains; only duplicate payload is merged in memory.
         shared.graph.add_node(kf_id, node_pose)
         if last_fe_pose is not None:
+            # The odometry spine is always consecutive keyframe relative motion.
             sig.add_link(kf_id - 1, fc.LinkType.NEIGHBOR, _rel(last_fe_pose, fe_pose),
                          cfg.spine_trans_weight, cfg.spine_rot_weight)
             shared.graph.add_spine_edge(kf_id - 1, kf_id, _rel(last_fe_pose, fe_pose))
@@ -471,7 +138,7 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
         last_graph_pose = node_pose
         stats["keyframes"] += 1
 
-        # ---- loop closure: propose (bounded proximity) -> verify per mode:
+        # Loop closure: propose by proximity, then verify by the selected modality.
         #   lidar:     candidate-local B&B (or --verifier icp) on scans
         #   lidar_orb: ORB descriptor match + PnP RANSAC on visual payloads
         if kf_id % cfg.propose_every_n_kf == 0 and kf_id > cfg.min_kf_separation:
@@ -496,7 +163,7 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
                     if ok:
                         rx, ry, rth = cam_rel_to_base_se2(T_tq)
                         rel = fc.Pose2(rx, ry, rth)
-                        # sanity vs predicted relative pose (drift-bounded gate)
+                        # Gate visual loop against the graph-predicted relative pose.
                         pred = _rel(shared.graph.get_pose(cand), node_pose)
                         if (math.hypot(rel.x - pred.x, rel.y - pred.y)
                                 <= cfg.pnp_rel_sanity_m
@@ -529,20 +196,19 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
                                dy=round(r.pose.y - node_pose.y, 3),
                                dth=round(r.pose.theta - node_pose.theta, 4))
                     if accepted:
-                        # V4.1: rel-sanity gate (see run_orb_mode_native note)
                         cand_pose = shared.graph.get_pose(cand)
                         rel = _rel(cand_pose, r.pose)
                         pred = _rel(cand_pose, node_pose)
                         if not _rel_sane(rel, pred, cfg.scan_rel_sanity_m,
-                                         cfg.scan_rel_sanity_rad):
+                                         cfg.scan_rel_sanity_rad,
+                                         cfg.scan_abs_max_m):
                             accepted = False
                             rel = None
                 verify_ms.append((time.perf_counter() - t0) * 1000)
                 row["accepted"] = accepted
                 verify_log.append(row)
                 if accepted and rel is not None:
-                    # measured loop transform (cand->query), for offline true/false
-                    # loop analysis (tools/analyze_fusion_loops.py)
+                    # Store measured cand->query transform for loop analysis.
                     row.update(rx=round(rel.x, 4), ry=round(rel.y, 4),
                                rth=round(rel.theta, 5))
                     shared.graph.add_loop_edge(cand, kf_id, rel,
@@ -554,6 +220,7 @@ def run_lidar_mode(cfg: FusionV2Config) -> dict:
                     stats["loops_accepted"] += 1
 
         if kf_id > 0 and kf_id % cfg.optimize_every_n_kf == 0:
+            # Periodic graph solve keeps odometry chaining near the corrected graph.
             shared.graph.optimize()
             stats["optimize_calls"] += 1
             last_graph_pose = shared.graph.get_pose(kf_id)
@@ -602,13 +269,14 @@ def run_orb_mode(cfg: FusionV2Config) -> dict:
     from visual_slam.orbslam.io.rgbd_dataset import make_rgbd_camera
 
     from slam_core.fusion.adapters.orb_loop_proposer import OrbLoopProposer
-    from slam_core.fusion2.visual_features import cam_rel_to_base_se2, pnp_verify
+    from slam_core.fusion2.Dependencies.visual_features import cam_rel_to_base_se2
+    from slam_core.fusion2.Loop_Verifier.pnp import pnp_verify
 
     stream = LabHybridStream(cfg.dataset, cfg.sync_tolerance_s)
     camera = make_rgbd_camera(cfg.dataset)
     fe = OrbSlamFrontendBackend(camera)
     shared = build_shared_map(cfg)
-    # DBoW appearance proposer — propose-only (v1 adapter; no ORB source edits).
+    # Legacy visual mode uses the v1 ORB loop proposer as a propose-only source.
     proposer = OrbLoopProposer(fe.make_loop_detector(),
                                min_index_separation=cfg.min_kf_separation)
     K = np.array([[camera.fx, 0, camera.cx], [0, camera.fy, camera.cy], [0, 0, 1]],
@@ -633,21 +301,19 @@ def run_orb_mode(cfg: FusionV2Config) -> dict:
         if okf is None:
             continue
 
-        # REP-103 node frame (base_T_cam) so PnP loop-edge translations live in
-        # the same body frame as the spine — see the note in run_orb_mode_native.
-        from slam_core.fusion2.visual_features import BASE_T_CAM as _B
+        # Convert camera pose to the planar base frame used by the graph.
+        from slam_core.fusion2.Dependencies.visual_features import BASE_T_CAM as _B
         p2 = project_pose3d_to_pose2(okf.pose, base_T_cam=_B,
                                      world_transform=CAMERA_GROUND_TRANSFORM)
         node_pose = fc.Pose2(p2.x, p2.y, p2.theta)
         kf_id += 1
         kf_stamps[kf_id] = t
-        # Key by the ORB keyframe 'kid' — that is what the DBoW detector's
-        # candidate_idxs contain (falls back to frame id).
+        # DBoW candidates are reported in ORB keyframe ids; map them to fusion ids.
         orb_to_fusion[int(getattr(okf.source, 'kid', okf.id))] = kf_id
 
         kpts = np.ascontiguousarray(okf.keypoints, dtype=np.float32)
         des = okf.descriptors if okf.descriptors is not None else None
-        # Per-keypoint camera-frame 3D from the ORB KF's depths (for PnP):
+        # Back-project ORB keypoint depths for visual PnP verification.
         pts3d = np.zeros((0, 3), np.float32)
         kf_depths = np.asarray(getattr(okf.source, "depths", np.zeros(0)), np.float32)
         if des is not None and len(kf_depths) == len(kpts):
@@ -672,7 +338,7 @@ def run_orb_mode(cfg: FusionV2Config) -> dict:
         last_pose = node_pose
         stats["keyframes"] += 1
 
-        # ---- loop closure: DBoW propose (appearance) -> verify per mode:
+        # Loop closure: DBoW proposes, then PnP or scan verification confirms.
         #   orb:       ORB descriptor match + PnP RANSAC (visual/visual)
         #   orb_lidar: candidate-local B&B (or ICP) on the synced scans
         proposer.register(okf.source)
@@ -704,14 +370,13 @@ def run_orb_mode(cfg: FusionV2Config) -> dict:
                         row.update(coarse=round(r.coarse_score, 4),
                                    refined=round(r.refined_score, 4))
                         if accepted:
-                            # V4.1: scan verifiers need the same rel-sanity gate
-                            # as PnP — high-scoring wrong-rotation alignments
-                            # otherwise warp the graph at full loop weight.
+                            # Reject scan matches that disagree with graph prediction.
                             cand_pose = shared.graph.get_pose(cand)
                             rel_lp = _rel(cand_pose, r.pose)
                             pred = _rel(cand_pose, node_pose)
                             if not _rel_sane(rel_lp, pred, cfg.scan_rel_sanity_m,
-                                             cfg.scan_rel_sanity_rad):
+                                             cfg.scan_rel_sanity_rad,
+                                             cfg.scan_abs_max_m):
                                 accepted = False
                                 rel_lp = None
             else:
@@ -733,8 +398,7 @@ def run_orb_mode(cfg: FusionV2Config) -> dict:
                                     math.sin(rel_lp.theta - pred.theta),
                                     math.cos(rel_lp.theta - pred.theta)))
                                 <= cfg.pnp_rel_sanity_rad)
-                        # strong PnP is self-validating (bootstrap loops happen
-                        # exactly when drift breaks the sanity prediction)
+                        # Strong PnP may bootstrap through large pre-loop drift.
                         accepted = sane or n_in >= cfg.pnp_strong_inliers
             verify_ms.append((time.perf_counter() - t0) * 1000)
             row["accepted"] = accepted
@@ -791,17 +455,13 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
 
     from slam_core.fusion.signature import (CAMERA_GROUND_TRANSFORM,
                                             project_pose3d_to_pose2)
-    from slam_core.fusion2.appearance_index import AppearanceIndex
-    from slam_core.fusion2.visual_features import (BASE_T_CAM,
-                                                   cam_rel_to_base_se2,
-                                                   pnp_verify)
-    from slam_core.fusion2.vo_orb_frontend import NativeOrbFrontend
+    from slam_core.fusion2.Loop_Proposer.dbow import AppearanceIndex
+    from slam_core.fusion2.Dependencies.visual_features import (BASE_T_CAM,
+                                                                cam_rel_to_base_se2)
+    from slam_core.fusion2.Loop_Verifier.pnp import pnp_verify
+    from slam_core.fusion2.Front_End.vo_orb_frontend import NativeOrbFrontend
 
-    # SE(2) node poses MUST be REP-103 (x-forward) — the same frame the PnP
-    # loop edges (cam_rel_to_base_se2) and LiDAR scans live in. Projecting
-    # with world_transform alone leaves the heading on the camera RIGHT axis:
-    # loop-edge translations then disagree with spine edges by a 90° body
-    # rotation and the optimizer warps the trajectory (the v3.4 orb defect).
+    # Convert camera poses to REP-103 planar base poses for graph consistency.
     def cam_to_se2(Twc) -> fc.Pose2:
         p = project_pose3d_to_pose2(Twc, base_T_cam=BASE_T_CAM,
                                     world_transform=CAMERA_GROUND_TRANSFORM)
@@ -851,16 +511,11 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
         fe_pose = cam_to_se2(nkf.Twc)
         kf_id += 1
         kf_stamps[kf_id] = t
-        # A REINIT keyframe's pose is dead-reckoning, not measurement: its
-        # spine edge must be SOFT so accepted loops can bend the blind segment
-        # back, and its scan must not paint the occupancy map.
+        # REINIT pose is dead-reckoned, so it gets a soft edge and no map painting.
         blind = nkf.state == fc.VoState.REINIT
         if blind:
             blind_ids.add(kf_id)
-        # Spine = the local-BA-refined relative motion between consecutive
-        # keyframes (both poses from the SAME BA epoch). This is the fix for the
-        # smeared map: motion-only odometry was not drift-bounded; the windowed
-        # BA now ties consecutive keyframe poses through co-observed points.
+        # Use local-BA-refined relative motion between consecutive visual KFs.
         if nkf.prev_Twc is None:
             node_pose = fe_pose
             rel = None
@@ -883,7 +538,7 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
         last_graph_pose = node_pose
         stats["keyframes"] += 1
 
-        # appearance propose (query BEFORE adding self) -> verify per mode
+        # Query DBoW before inserting the current descriptors to avoid self-match.
         cands = index.query(kf_id, nkf.des)
         index.add(kf_id, nkf.des)
         any_loop_this_kf = False
@@ -896,10 +551,7 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
                        rx=None, ry=None, rth=None)
             if scan_backend:
                 if sig.has_scan:
-                    # Standalone ICP (RTAB-style): seeded only by the graph
-                    # prediction. Visual-led VO drift can exceed GICP's basin, so
-                    # orb_lidar+icp may verify fewer loops than +bnb -- an accepted
-                    # comparative property, not a defect (see verify_candidate_icp).
+                    # ICP is prediction-seeded; B&B performs a bounded scan search.
                     if cfg.scan_verifier == "icp":
                         r = verify_candidate_icp(shared, cfg, kf_id,
                                                  np.asarray(sig.scan_xy),
@@ -921,14 +573,13 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
                         row.update(coarse=round(r.coarse_score, 4),
                                    refined=round(r.refined_score, 4))
                         if accepted:
-                            # V4.1: scan verifiers need the same rel-sanity gate
-                            # as PnP — high-scoring wrong-rotation alignments
-                            # otherwise warp the graph at full loop weight.
+                            # Reject scan matches that disagree with graph prediction.
                             cand_pose = shared.graph.get_pose(cand)
                             rel_lp = _rel(cand_pose, r.pose)
                             pred = _rel(cand_pose, node_pose)
                             if not _rel_sane(rel_lp, pred, cfg.scan_rel_sanity_m,
-                                             cfg.scan_rel_sanity_rad):
+                                             cfg.scan_rel_sanity_rad,
+                                             cfg.scan_abs_max_m):
                                 accepted = False
                                 rel_lp = None
             else:
@@ -950,8 +601,7 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
                                     math.sin(rel_lp.theta - pred.theta),
                                     math.cos(rel_lp.theta - pred.theta)))
                                 <= cfg.pnp_rel_sanity_rad)
-                        # strong PnP is self-validating (bootstrap loops happen
-                        # exactly when drift breaks the sanity prediction)
+                        # Strong PnP may bootstrap through large pre-loop drift.
                         accepted = sane or n_in >= cfg.pnp_strong_inliers
             verify_ms.append((time.perf_counter() - t0) * 1000)
             row["accepted"] = accepted
@@ -967,8 +617,7 @@ def run_orb_mode_native(cfg: FusionV2Config) -> dict:
                 stats["loops_accepted"] += 1
                 any_loop_this_kf = True
 
-        # optimize immediately on accepted loops (snaps blind segments back —
-        # effective relocalization), else on the periodic cadence.
+        # Optimize on accepted loops immediately; otherwise follow the cadence.
         if (any_loop_this_kf and kf_id > 0) or \
                 (kf_id > 0 and kf_id % cfg.optimize_every_n_kf == 0):
             shared.graph.optimize()
@@ -1032,12 +681,12 @@ def main(argv=None):
                          "comes from FusionV2Config.lidar_frontend")
     args = ap.parse_args(argv)
 
-    # Mode x option validity (V4.3): fail fast with a clear message.
+    # Validate module choices before building the selected pipeline.
     if args.mode in ("orb", "orb_lidar") and args.lidar_frontend is not None:
         raise SystemExit(f"--lidar-frontend is not applicable to mode {args.mode} "
                          "(its front-end is the visual one; use --frontend)")
     if args.mode in ("orb", "lidar_orb") and args.verifier != "bnb":
-        # default is "bnb"; an explicit icp here signals a misunderstanding
+        # Default "bnb" is ignored here; explicit ICP would be misleading.
         import sys
         if "--verifier" in (argv or sys.argv):
             raise SystemExit(f"--verifier is not applicable to mode {args.mode} "

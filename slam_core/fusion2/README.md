@@ -27,9 +27,8 @@ memory**, **85× faster loop verification (26 ms vs 2.2 s)**, full-lab runs in
 - `--lidar-frontend` (modes lidar/lidar_orb): native C++ scan_to_submap (default,
   ~11 ms/scan) or scan_to_map (~15 ms/scan); legacy_* = the Python hector stack
   kept for parity/debugging.
-- `--verifier` (modes lidar/orb_lidar): candidate-local B&B (default) or GICP
-  with the occupancy-grid cross-check (orb_lidar additionally seeds GICP from
-  the B&B coarse pose — VO drift exceeds GICP's convergence basin).
+- `--verifier` (modes lidar/orb_lidar): candidate-local B&B (default) or
+  standalone GICP seeded by the graph prediction.
 - ALL tunables live in `slam_core/fusion2/config.py` (FusionV2Config); LiDAR
   matcher profiles come from `hector/config.py` per-dataset profiles.
 - IMU is always active as the pose-prior fallback (extrapolator gyro+yaw in
@@ -44,9 +43,9 @@ Outputs land in `fusion2_outputs/<mode>_<timestamp>/`: `trajectory.tum`,
 | Mode | Front-end (odometry/keyframes) | Loop proposing | Loop verification |
 |---|---|---|---|
 | `orb` | ORB-SLAM (loop closing disabled, propose-only) | DBoW appearance | ORB descriptor match + PnP RANSAC |
-| `lidar` | hector scan_to_submap (PGO disabled) | proximity (WM-only) | **candidate-local C++ B&B** (or `--verifier icp`) |
+| `lidar` | hector scan_to_submap (PGO disabled) | proximity + LTM retrieval | **candidate-local C++ B&B** (or `--verifier icp`) |
 | `orb_lidar` | ORB-SLAM | DBoW appearance | candidate-local C++ B&B on synced scans |
-| `lidar_orb` | hector scan_to_submap | proximity (WM-only) | ORB match + PnP on synced visual payloads |
+| `lidar_orb` | hector scan_to_submap | proximity + LTM retrieval | ORB match + PnP on synced visual payloads |
 
 "Candidate-local" is the core idea: scans are retrieved from the shared map
 *around the proposed candidate* (graph BFS + metric radius, with RTAB-style LTM

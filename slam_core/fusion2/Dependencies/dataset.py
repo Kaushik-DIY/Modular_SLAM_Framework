@@ -25,13 +25,14 @@ LAB_RANGE_MAX = 16.0
 
 
 class LabHybridStream:
+    """Disk-backed LabHybrid reader with LiDAR/RGB-D soft synchronization."""
+
     def __init__(self, dataset: Path, sync_tolerance_s: float = 0.05):
         self.root = Path(dataset)
         self.sync_tol = float(sync_tolerance_s)
         self._scans = read_lab_hybrid_lidar_csv(str(self.root / "lidar" / "scans.csv"))
         self._scan_ts = np.array([s["t"] for s in self._scans])
-        # LiDAR geometry from the dataset itself (V4.3 portability); falls back
-        # to the lab constants for dataset copies without a lidar section.
+        # Prefer dataset calibration; keep lab constants for older dataset copies.
         self.angle_min, self.angle_inc = LAB_ANGLE_MIN, LAB_ANGLE_INC
         self.range_min, self.range_max = LAB_RANGE_MIN, LAB_RANGE_MAX
         sc_path = self.root / "sensor_config.yaml"
@@ -48,11 +49,13 @@ class LabHybridStream:
         return len(self._scans)
 
     def scan_points(self, idx: int) -> np.ndarray:
+        # Convert one polar scan row into local-frame Cartesian points.
         pts = ranges_to_points(self._scans[idx]["ranges"], self.angle_min,
                                self.angle_inc, self.range_min, self.range_max)
         return np.ascontiguousarray(pts, dtype=np.float32)
 
     def lidar_stream(self, max_scans: int = 0) -> Iterator[Tuple[float, np.ndarray]]:
+        # Yield timestamped scan clouds for LiDAR-led modes.
         n = len(self._scans) if max_scans <= 0 else min(max_scans, len(self._scans))
         for i in range(n):
             yield float(self._scans[i]["t"]), self.scan_points(i)
@@ -72,6 +75,7 @@ class LabHybridStream:
         """Scan within the sync window of t, or None (CLAUDE.md §2.12 soft sync)."""
         i = int(np.searchsorted(self._scan_ts, t))
         best, best_dt = -1, self.sync_tol
+        # Only the two neighbours around the insertion point can be closest.
         for j in (i - 1, i):
             if 0 <= j < len(self._scan_ts):
                 dt = abs(float(self._scan_ts[j]) - t)
@@ -80,6 +84,7 @@ class LabHybridStream:
         return self.scan_points(best) if best >= 0 else None
 
     def rgbd_stream(self, max_frames: int = 0):
+        # Yield RGB-D frames plus the nearest LiDAR scan when it falls in tolerance.
         entries = self.rgbd_entries()
         if max_frames > 0:
             entries = entries[:max_frames]
@@ -89,6 +94,7 @@ class LabHybridStream:
     def nearest_rgbd(self, t: float):
         """(rgb_path, depth_path) within the sync window of t, or None."""
         if not hasattr(self, "_rgbd_cache"):
+            # Lazy cache avoids parsing the association file in LiDAR-only runs.
             self._rgbd_cache = self.rgbd_entries()
             self._rgbd_ts = np.array([e[0] for e in self._rgbd_cache])
         i = int(np.searchsorted(self._rgbd_ts, t))

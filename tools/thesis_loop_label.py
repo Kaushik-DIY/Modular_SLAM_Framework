@@ -166,7 +166,7 @@ def _scan_scorer(map_name):
     camera can miss. Returns a callable (t_query, t_cand) -> coarse_score in [0,1]."""
     import fusion_core as fc
     from scipy.spatial import cKDTree
-    from slam_core.fusion2.dataset import LabHybridStream
+    from slam_core.fusion2.Dependencies.dataset import LabHybridStream
     stream = LabHybridStream(Path(f"datasets/{map_name}"), 0.15)
     gc = fc.GridConfig(); gc.resolution = 0.05; gc.l_occ = 0.4; gc.l_free = -0.1
     bnb = fc.BnbConfig(); bnb.linear_search_window = 3.0

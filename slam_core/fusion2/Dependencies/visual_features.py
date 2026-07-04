@@ -1,15 +1,16 @@
-"""Visual payload extraction + PnP verification for fusion v2 cross-modal modes.
+"""Visual payload extraction + camera/base frame helpers for fusion v2.
 
 - extract_orb_rgbd(): standalone ORB + depth backprojection for frames that are
   NOT driven through the full ORB-SLAM front-end (lidar_orb mode signatures).
-- pnp_verify(): ORB ratio-match + PnP RANSAC between two signatures' visual
-  payloads -> planar relative pose. Port of the v1 VisualLoopVerifier core
-  (slam_core/fusion/visual_verifier.py) operating directly on payload arrays.
+- cam_rel_to_base_se2(): conjugate a relative camera transform into SE(2).
+
+The PnP loop verifier that consumes these lives in
+``slam_core/fusion2/Loop_Verifier/pnp.py``.
 """
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import cv2
 import numpy as np
@@ -47,53 +48,11 @@ def extract_orb_rgbd(rgb, depth, K: np.ndarray, depth_factor: float = 1000.0,
     vs = np.clip(kpts[:, 1].astype(int), 0, h - 1)
     z = depth[vs, us].astype(np.float32) / float(depth_factor)
     valid = z > 0.05
+    # Back-project valid depth samples into the optical camera frame.
     pts3d[valid, 0] = (kpts[valid, 0] - cx) / fx * z[valid]
     pts3d[valid, 1] = (kpts[valid, 1] - cy) / fy * z[valid]
     pts3d[valid, 2] = z[valid]
     return kpts, np.asarray(des, dtype=np.uint8), pts3d
-
-
-_BF = cv2.BFMatcher(cv2.NORM_HAMMING)
-
-
-def pnp_verify(q_kpts: np.ndarray, q_des: np.ndarray,
-               t_des: np.ndarray, t_pts3d: np.ndarray, K: np.ndarray,
-               nndr: float = 0.7, min_inliers: int = 15,
-               reproj_error: float = 3.0
-               ) -> Tuple[bool, Optional[np.ndarray], int, float]:
-    """Match query descriptors to target, solve PnP (target 3D vs query 2D).
-
-    Returns (ok, T_target_query 4x4 camera-frame, n_inliers, inlier_ratio).
-    """
-    if q_des is None or t_des is None or len(q_des) < 2 or len(t_des) < 2:
-        return False, None, 0, 0.0
-    knn = _BF.knnMatch(np.asarray(q_des, np.uint8), np.asarray(t_des, np.uint8), k=2)
-    obj, img = [], []
-    for pair in knn:
-        if len(pair) < 2:
-            continue
-        m, n = pair
-        if m.distance < nndr * n.distance:
-            p3 = t_pts3d[m.trainIdx]
-            if not np.isfinite(p3).all():
-                continue
-            obj.append(p3)
-            img.append(q_kpts[m.queryIdx])
-    if len(obj) < min_inliers:
-        return False, None, len(obj), 0.0
-    ok, rvec, tvec, inliers = cv2.solvePnPRansac(
-        np.asarray(obj, np.float64).reshape(-1, 1, 3),
-        np.asarray(img, np.float64).reshape(-1, 1, 2),
-        np.asarray(K, np.float64), None,
-        reprojectionError=reproj_error, flags=cv2.SOLVEPNP_ITERATIVE)
-    n_in = 0 if inliers is None else int(len(inliers))
-    if not ok or n_in < min_inliers:
-        return False, None, n_in, 0.0
-    R, _ = cv2.Rodrigues(rvec)
-    T_query_target = np.eye(4)
-    T_query_target[:3, :3] = R
-    T_query_target[:3, 3] = tvec.ravel()
-    return True, np.linalg.inv(T_query_target), n_in, n_in / max(len(obj), 1)
 
 
 def cam_rel_to_base_se2(T_cam_rel: np.ndarray) -> Tuple[float, float, float]:

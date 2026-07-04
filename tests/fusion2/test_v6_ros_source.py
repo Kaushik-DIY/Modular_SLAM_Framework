@@ -20,7 +20,7 @@ import pytest
 fusion_core = pytest.importorskip("fusion_core")
 
 import slam_core.fusion2.run_realtime as R
-import slam_core.fusion2.ros_source as S
+import slam_core.fusion2.Dependencies.ros_source as S
 from slam_core.fusion2.config import FusionV2Config
 from slam_core.fusion2.runner import build_shared_map, _anchor_poses
 

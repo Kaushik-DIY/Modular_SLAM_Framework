@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import fusion_core as fc
-from slam_core.fusion2.dataset import LabHybridStream
+from slam_core.fusion2.Dependencies.dataset import LabHybridStream
 
 
 def main():

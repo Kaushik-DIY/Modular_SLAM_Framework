@@ -18,7 +18,7 @@ fusion_core = pytest.importorskip("fusion_core")
 
 import slam_core.fusion2.run_realtime as R
 from slam_core.fusion2.config import FusionV2Config
-from slam_core.fusion2.dataset import LabHybridStream
+from slam_core.fusion2.Dependencies.dataset import LabHybridStream
 from slam_core.fusion2.runner import build_shared_map
 
 _DS = Path("datasets/lab_hybrid_small")

@@ -53,6 +53,7 @@ class NativeOrbFrontend:
                  n_features: int = 2000, depth_max: float = 4.0,
                  imu_dropout: bool = True, vo_overrides: Optional[dict] = None,
                  imu_buffer=None):
+        # Camera calibration supplies projection and depth scaling for VO.
         sc = yaml.safe_load(open(Path(dataset) / "sensor_config.yaml"))["camera"]
         cfg = fc.VoConfig()
         cfg.fx, cfg.fy = float(sc["fx"]), float(sc["fy"])
@@ -103,6 +104,7 @@ class NativeOrbFrontend:
             return None
         f /= n
         if self._e1 is None:
+            # First valid heading establishes the ground-plane bearing basis.
             self._e1 = f.copy()
             self._e2 = np.cross(self._up, self._e1)
         return math.atan2(float(f @ self._e2), float(f @ self._e1))
@@ -115,6 +117,7 @@ class NativeOrbFrontend:
             dvo = math.atan2(math.sin(h - h0), math.cos(h - h0))
             dimu = math.atan2(math.sin(imu_yaw - y0), math.cos(imu_yaw - y0))
             if abs(dvo) < 0.3 and abs(dimu) < 0.3:   # same-frame-pair deltas only
+                # Correlation decides whether IMU yaw has the same or opposite sign.
                 self._sign_corr += dvo * dimu
                 self._sign_energy += abs(dvo * dimu)
         if imu_yaw is not None and h is not None:
@@ -138,6 +141,7 @@ class NativeOrbFrontend:
         u = V[:, 0]                                # smallest-variance direction
         if u @ np.array([0.0, -1.0, 0.0]) < 0:
             u = -u
+        # Re-estimate gravity-up from the driven plane.
         self._up = u / np.linalg.norm(u)
         self._e1 = None                            # rebasis heading on new up
 
@@ -155,8 +159,10 @@ class NativeOrbFrontend:
         dpsi = self._yaw_sign * math.atan2(math.sin(yaw_now - yaw_a),
                                            math.cos(yaw_now - yaw_a))
         prior = np.eye(4)
+        # Rotate from the last good pose using measured IMU yaw.
         prior[:3, :3] = _rot_about_axis(self._up, dpsi) @ Twc_a[:3, :3]
         n_frames = max(1.0, round((t - t_a) * 15.0))
+        # Translation coasts with the last visual velocity during dropout.
         prior[:3, 3] = Twc_a[:3, 3] + self._vel_t * n_frames
         return prior
 
@@ -186,6 +192,7 @@ class NativeOrbFrontend:
                         or (res.state == fc.VoState.OK
                             and res.n_inliers >= self.cfg.min_inliers_reinit))
         if well_tracked:
+            # Last reliable frame becomes the anchor for future dropout priors.
             self._anchor = (t, Twc.copy(),
                             self._imu.yaw_at(t) if self._imu is not None else None)
             self._update_calibration(t, Twc)
@@ -197,6 +204,7 @@ class NativeOrbFrontend:
         if res.new_keyframe:
             payload = self.vo.keyframe_payload(res.kf_id)
             if payload is not None:
+                # The payload is stored in fusion signatures for DBoW/PnP loops.
                 kpts, des, pts3d = payload
                 prev = np.asarray(res.prev_Twc) if res.has_prev else None
                 kf = NativeKeyframe(id=res.kf_id, stamp=t, Twc=Twc,

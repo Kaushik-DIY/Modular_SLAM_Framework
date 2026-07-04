@@ -1,11 +1,4 @@
-"""DBoW3 appearance index over Signature descriptors (fusion v3).
-
-Replaces the legacy KeyFrameDatabase (which requires live ORB-SLAM KeyFrame
-objects) for native-front-end runs: raw (N,32) uint8 descriptors go straight
-into a pydbow3.Database via addFeatures/query. Mirrors OrbLoopProposer's
-propose-only contract: candidates above min_score, outside the index-separation
-window, capped per query.
-"""
+"""DBoW appearance loop proposer used by visual and visual-attached modes."""
 from __future__ import annotations
 
 from typing import List, Tuple
@@ -16,6 +9,8 @@ from visual_slam.orbslam.slam.bow import DBoW3Vocabulary
 
 
 class AppearanceIndex:
+    """Append-only descriptor index mapping DBoW database entries to fusion KFs."""
+
     def __init__(self, min_score: float = 0.05, min_separation: int = 30,
                  max_candidates: int = 2):
         self.min_score = float(min_score)
@@ -29,6 +24,7 @@ class AppearanceIndex:
         self._entry_to_kf: List[int] = []   # DBoW entry id -> fusion kf_id
 
     def add(self, kf_id: int, des: np.ndarray) -> None:
+        # DBoW expects uint8 ORB descriptors in contiguous memory.
         self._db.addFeatures(np.ascontiguousarray(des, dtype=np.uint8))
         self._entry_to_kf.append(int(kf_id))
 
@@ -46,6 +42,7 @@ class AppearanceIndex:
             cand = self._entry_to_kf[entry]
             if abs(kf_id - cand) < self.min_separation:
                 continue
+            # Return fusion keyframe ids, not internal DBoW entry ids.
             out.append((cand, score))
             if len(out) >= self.max_candidates:
                 break
