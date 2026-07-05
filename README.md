@@ -4,10 +4,10 @@ This repository contains a modular SLAM thesis framework built around a shared
 fusion layer. The main idea is that a user can choose a front end, loop proposer,
 and loop verifier, then run that combination through the same shared SE(2) map.
 
-The current main runner is:
+The current main runner is the fusion2 batch module:
 
 ```bash
-.venv/bin/python run_fusion.py
+.venv/bin/python -m slam_core.fusion2.runner
 ```
 
 Run all commands from the repository root:
@@ -63,7 +63,7 @@ Important submodules:
 The batch runner executes one fixed SLAM configuration end to end:
 
 ```bash
-.venv/bin/python run_fusion.py \
+.venv/bin/python -m slam_core.fusion2.runner \
   --dataset datasets/lab_hybrid \
   --mode lidar \
   --lidar-frontend native_s2s \
@@ -71,18 +71,10 @@ The batch runner executes one fixed SLAM configuration end to end:
   --output fusion2_outputs
 ```
 
-Equivalent module form:
-
-```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
-  --mode lidar
-```
-
 Show all options:
 
 ```bash
-.venv/bin/python run_fusion.py --help
+.venv/bin/python -m slam_core.fusion2.runner --help
 ```
 
 ## Available Modes
@@ -164,7 +156,7 @@ or:
 ### LiDAR SLAM, native scan-to-submap, B&B verifier
 
 ```bash
-.venv/bin/python run_fusion.py \
+.venv/bin/python -m slam_core.fusion2.runner \
   --dataset datasets/lab_hybrid \
   --mode lidar \
   --lidar-frontend native_s2s \
@@ -175,7 +167,7 @@ or:
 ### LiDAR SLAM, native scan-to-map, ICP verifier
 
 ```bash
-.venv/bin/python run_fusion.py \
+.venv/bin/python -m slam_core.fusion2.runner \
   --dataset datasets/lab_hybrid \
   --mode lidar \
   --lidar-frontend native_s2m \
@@ -186,7 +178,7 @@ or:
 ### Visual SLAM, native visual front end, PnP verifier
 
 ```bash
-.venv/bin/python run_fusion.py \
+.venv/bin/python -m slam_core.fusion2.runner \
   --dataset datasets/lab_hybrid \
   --mode orb \
   --frontend native \
@@ -196,7 +188,7 @@ or:
 ### Visual-led SLAM with LiDAR scan verification
 
 ```bash
-.venv/bin/python run_fusion.py \
+.venv/bin/python -m slam_core.fusion2.runner \
   --dataset datasets/lab_hybrid \
   --mode orb_lidar \
   --frontend native \
@@ -207,7 +199,7 @@ or:
 ### LiDAR-led SLAM with visual PnP verification
 
 ```bash
-.venv/bin/python run_fusion.py \
+.venv/bin/python -m slam_core.fusion2.runner \
   --dataset datasets/lab_hybrid \
   --mode lidar_orb \
   --lidar-frontend native_s2s \
@@ -219,7 +211,7 @@ or:
 Limit the number of scans/frames:
 
 ```bash
-.venv/bin/python run_fusion.py \
+.venv/bin/python -m slam_core.fusion2.runner \
   --dataset datasets/lab_hybrid \
   --mode lidar \
   --max-scans 500
@@ -231,7 +223,7 @@ The real-time runner supports live module switching while keeping the same share
 map alive:
 
 ```bash
-.venv/bin/python run_fusion_realtime.py \
+.venv/bin/python -m slam_core.fusion2.run_realtime \
   --dataset datasets/lab_hybrid \
   --mode lidar \
   --lidar-frontend native_s2s \
@@ -265,7 +257,7 @@ Notes:
 Deterministic switching schedule example:
 
 ```bash
-.venv/bin/python run_fusion_realtime.py \
+.venv/bin/python -m slam_core.fusion2.run_realtime \
   --dataset datasets/lab_hybrid \
   --mode lidar \
   --lidar-frontend native_s2s \
@@ -309,7 +301,7 @@ datasets/lab_hybrid_3_slow
 Example:
 
 ```bash
-.venv/bin/python run_fusion.py --dataset datasets/lab_hybrid --mode lidar
+.venv/bin/python -m slam_core.fusion2.runner --dataset datasets/lab_hybrid --mode lidar
 ```
 
 ## Configuration
@@ -345,4 +337,3 @@ Run the fusion2 test suite:
 ```bash
 .venv/bin/python -m pytest tests/fusion2
 ```
-
