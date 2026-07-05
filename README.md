@@ -5,6 +5,10 @@ different SLAM layer combinations. The fusion layer lets you choose modules for
 tracking, loop proposal, and loop verification while all modes write into the
 same shared SE(2) map.
 
+## Demo Result
+
+Example result from the real-time modular switching pipeline:
+
 ![Fusion switching demo](docs/images/switching_demo_presentation.png)
 
 ## Main Idea
