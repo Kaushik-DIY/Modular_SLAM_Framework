@@ -1,51 +1,25 @@
 # Modular SLAM Framework
 
-This repository contains a modular SLAM thesis framework built around a shared
-fusion layer. The main idea is that a user can choose a front end, loop proposer,
-and loop verifier, then run that combination through the same shared SE(2) map.
+This repository contains a modular SLAM framework for experimenting with
+different SLAM layer combinations. The fusion layer lets you choose modules for
+tracking, loop proposal, and loop verification while all modes write into the
+same shared SE(2) map.
 
-The current main runner is the fusion2 batch module:
+![Fusion switching demo](docs/images/switching_demo_presentation.png)
 
-```bash
-.venv/bin/python -m slam_core.fusion2.runner
-```
-
-Run all commands from the repository root:
-
-```bash
-cd /home/kaushik/slam_ws
-```
-
-Use the project virtual environment for every command:
-
-```bash
-.venv/bin/python ...
-```
-
-## Architecture
-
-All fusion2 modes write keyframes into one shared C++ backend:
+## Main Idea
 
 ```text
 Front End -> Loop Proposer -> Loop Verifier -> Shared SE(2) Map
 ```
 
-The shared map is implemented through `fusion_core` and contains:
-
-- Signature storage
-- STM / WM / LTM memory tiers
-- SE(2) pose graph
-- Candidate neighbourhood retrieval
-- Occupancy grid assembly
-- Scan-based branch-and-bound verification
-
-The Python fusion layer lives in:
+The fusion2 implementation is under:
 
 ```text
 slam_core/fusion2/
 ```
 
-Important submodules:
+Main folders:
 
 | Folder | Purpose |
 |---|---|
@@ -54,185 +28,190 @@ Important submodules:
 | `Loop_Verifier/` | Loop verification modules |
 | `Dependencies/` | Dataset, ROS, pose, visual feature, and output helpers |
 | `backend.py` | Shared map construction |
-| `runner.py` | Batch runner implementation |
-| `run_realtime.py` | Real-time switching runner implementation |
-| `config.py` | Central fusion configuration |
+| `runner.py` | Batch runner |
+| `run_realtime.py` | Real-time switching runner |
+| `config.py` | Fusion configuration |
 
-## Runner Script
+## Setup
 
-The batch runner executes one fixed SLAM configuration end to end:
+Create your own Python environment. The repository does not include a virtual
+environment.
+
+Example:
 
 ```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.lock.txt
+```
+
+Depending on your platform, you may also need to build the native C++ extensions
+used by the SLAM back end.
+
+Run commands from the repository root:
+
+```bash
+cd <path-to-this-repository>
+```
+
+If you do not use a virtual environment, replace `python` with the Python
+interpreter configured for your system.
+
+## Dataset
+
+Datasets are not included in this repository. Provide your own dataset directory
+and pass it with `--dataset`.
+
+Example layout expected by the current Lab/RGB-D loader:
+
+```text
+your_dataset/
+  sensor_config.yaml
+  associations_rgbd.txt
+  imu.csv
+  lidar/
+    scans.csv
+```
+
+Use any dataset path that matches your loader/configuration:
+
+```bash
+--dataset <path-to-dataset>
+```
+
+## Batch Runner
+
+The batch runner executes one fixed SLAM configuration from start to finish:
+
+```bash
+python -m slam_core.fusion2.runner \
+  --dataset <path-to-dataset> \
   --mode lidar \
   --lidar-frontend native_s2s \
   --verifier bnb \
-  --output fusion2_outputs
+  --output <output-directory>
 ```
 
-Show all options:
+Show all runner options:
 
 ```bash
-.venv/bin/python -m slam_core.fusion2.runner --help
+python -m slam_core.fusion2.runner --help
 ```
 
 ## Available Modes
 
-Mode names describe the tracking front end and the verification modality.
+| Mode | Tracking Front End | Loop Proposer | Loop Verifier |
+|---|---|---|---|
+| `lidar` | LiDAR | Proximity | B&B or ICP on LiDAR scans |
+| `orb` | Visual VO / ORB | DBoW | PnP on visual features |
+| `orb_lidar` | Visual VO / ORB | DBoW | B&B or ICP on synced LiDAR scans |
+| `lidar_orb` | LiDAR | Proximity | PnP on synced visual features |
 
-| Mode | Tracking Front End | Loop Proposer | Loop Verifier | Typical Use |
-|---|---|---|---|---|
-| `lidar` | LiDAR | Proximity | B&B or ICP on scans | LiDAR-only SLAM |
-| `orb` | Visual VO / ORB | DBoW | PnP on visual features | Visual-only SLAM |
-| `orb_lidar` | Visual VO / ORB | DBoW | B&B or ICP on synced LiDAR scans | Visual-led, scan-verified SLAM |
-| `lidar_orb` | LiDAR | Proximity | PnP on synced visual features | LiDAR-led, visual-verified SLAM |
+## Module Options
 
-## Module Choices
+### Front End
 
-### Front End Modules
-
-For LiDAR-led modes:
+LiDAR front-end options:
 
 | Option | Description |
 |---|---|
-| `native_s2s` | Native C++ scan-to-submap LiDAR front end. Default. |
-| `native_s2m` | Native C++ scan-to-map LiDAR front end. |
-| `legacy_s2s` | Python Hector scan-to-submap front end. Debug/parity path. |
-| `legacy_s2m` | Python Hector scan-to-map front end. Debug/parity path. |
+| `native_s2s` | Native C++ scan-to-submap front end |
+| `native_s2m` | Native C++ scan-to-map front end |
+| `legacy_s2s` | Python scan-to-submap front end |
+| `legacy_s2m` | Python scan-to-map front end |
 
-Use with:
-
-```bash
---lidar-frontend native_s2s
-```
-
-For visual-led modes:
+Visual front-end options:
 
 | Option | Description |
 |---|---|
-| `native` | Native C++ windowed RGB-D visual odometry. Default. |
-| `legacy` | Legacy Python ORB-SLAM based front end. |
+| `native` | Native C++ RGB-D visual odometry |
+| `legacy` | Legacy Python ORB-SLAM based front end |
 
-Use with:
+### Loop Proposer
 
-```bash
---frontend native
-```
+| Proposer | Description |
+|---|---|
+| `proximity` | Proposes nearby graph poses and can retrieve old places from long-term memory |
+| `dbow` | Proposes visually similar places using ORB descriptors |
 
-### Loop Proposer Modules
+The batch runner chooses the proposer from the selected mode.
 
-| Proposer | Used By | Description |
-|---|---|---|
-| `proximity` | `lidar`, `lidar_orb` | Uses graph pose proximity and retrieves old places from LTM when needed. |
-| `dbow` | `orb`, `orb_lidar` | Uses DBoW appearance matching over ORB descriptors. |
+### Loop Verifier
 
-The batch runner selects the proposer automatically from `--mode`.
+| Verifier | Description |
+|---|---|
+| `bnb` | Branch-and-bound scan verification |
+| `icp` | ICP/GICP scan verification |
+| `pnp` | Visual feature matching with PnP RANSAC |
 
-### Loop Verifier Modules
-
-| Verifier | Used By | Description |
-|---|---|---|
-| `bnb` | `lidar`, `orb_lidar` | Candidate-local branch-and-bound scan matching. Default scan verifier. |
-| `icp` | `lidar`, `orb_lidar` | Standalone GICP scan matching seeded by graph prediction. |
-| `pnp` | `orb`, `lidar_orb` | ORB descriptor matching plus PnP RANSAC. Selected automatically. |
-
-Use scan verifier with:
+Use `--verifier bnb` or `--verifier icp` for scan-verified modes:
 
 ```bash
 --verifier bnb
 ```
 
-or:
+`pnp` is selected automatically by visual-verified modes.
+
+## Example Commands
+
+LiDAR-only SLAM:
 
 ```bash
---verifier icp
-```
-
-`--verifier` applies only to scan-verified modes (`lidar`, `orb_lidar`).
-
-## Common Batch Runs
-
-### LiDAR SLAM, native scan-to-submap, B&B verifier
-
-```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
+python -m slam_core.fusion2.runner \
+  --dataset <path-to-dataset> \
   --mode lidar \
   --lidar-frontend native_s2s \
   --verifier bnb \
-  --output fusion2_outputs/lab_lidar_s2s_bnb
+  --output <output-directory>
 ```
 
-### LiDAR SLAM, native scan-to-map, ICP verifier
+Visual-only SLAM:
 
 ```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
-  --mode lidar \
-  --lidar-frontend native_s2m \
-  --verifier icp \
-  --output fusion2_outputs/lab_lidar_s2m_icp
-```
-
-### Visual SLAM, native visual front end, PnP verifier
-
-```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
+python -m slam_core.fusion2.runner \
+  --dataset <path-to-dataset> \
   --mode orb \
   --frontend native \
-  --output fusion2_outputs/lab_orb
+  --output <output-directory>
 ```
 
-### Visual-led SLAM with LiDAR scan verification
+Visual-led SLAM with LiDAR scan verification:
 
 ```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
+python -m slam_core.fusion2.runner \
+  --dataset <path-to-dataset> \
   --mode orb_lidar \
   --frontend native \
   --verifier bnb \
-  --output fusion2_outputs/lab_orb_lidar_bnb
+  --output <output-directory>
 ```
 
-### LiDAR-led SLAM with visual PnP verification
+LiDAR-led SLAM with visual verification:
 
 ```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
+python -m slam_core.fusion2.runner \
+  --dataset <path-to-dataset> \
   --mode lidar_orb \
   --lidar-frontend native_s2s \
-  --output fusion2_outputs/lab_lidar_orb
-```
-
-### Quick smoke run
-
-Limit the number of scans/frames:
-
-```bash
-.venv/bin/python -m slam_core.fusion2.runner \
-  --dataset datasets/lab_hybrid \
-  --mode lidar \
-  --max-scans 500
+  --output <output-directory>
 ```
 
 ## Real-Time Runner
 
 The real-time runner supports live module switching while keeping the same shared
-map alive:
+map active:
 
 ```bash
-.venv/bin/python -m slam_core.fusion2.run_realtime \
-  --dataset datasets/lab_hybrid \
+python -m slam_core.fusion2.run_realtime \
+  --dataset <path-to-dataset> \
   --mode lidar \
   --lidar-frontend native_s2s \
   --verifier bnb \
   --proposer proximity \
-  --attach-visual
+  --output <output-directory>
 ```
 
-Live commands typed into the terminal:
+Live commands:
 
 ```text
 verifier bnb
@@ -250,30 +229,15 @@ quit
 Notes:
 
 - `pnp` and `dbow` require visual descriptors.
-- LiDAR keyframes carry visual descriptors only when using `--attach-visual` or
-  starting from `--mode lidar_orb`.
+- LiDAR keyframes carry visual descriptors only when enabled by the selected mode
+  or runtime options.
 - Visual front-end keyframes always carry visual descriptors.
-
-Deterministic switching schedule example:
-
-```bash
-.venv/bin/python -m slam_core.fusion2.run_realtime \
-  --dataset datasets/lab_hybrid \
-  --mode lidar \
-  --lidar-frontend native_s2s \
-  --verifier bnb \
-  --proposer proximity \
-  --attach-visual \
-  --switch-schedule "180:proposer dbow;330:fe vo;470:verifier pnp" \
-  --speed 1.0
-```
 
 ## Outputs
 
-Batch and real-time runs write results under the selected output directory,
-normally `fusion2_outputs/`.
+Runs write results to the selected output directory.
 
-Typical output files:
+Typical files:
 
 | File | Description |
 |---|---|
@@ -283,57 +247,26 @@ Typical output files:
 | `map_meta.json` | Map origin, resolution, size, and extent |
 | `scan_overlay.png` | Raw scan overlay debug figure |
 | `run_summary.json` | Run statistics |
-| `verifications.csv` | Loop proposal / verification log |
+| `verifications.csv` | Loop proposal and verification log |
 
 Generated outputs are ignored by git.
 
-## Datasets
-
-The expected local datasets are:
-
-```text
-datasets/lab_hybrid
-datasets/lab_hybrid_small
-datasets/lab_hybrid_3
-datasets/lab_hybrid_3_slow
-```
-
-Example:
-
-```bash
-.venv/bin/python -m slam_core.fusion2.runner --dataset datasets/lab_hybrid --mode lidar
-```
-
 ## Configuration
 
-Most fusion parameters are in:
+Fusion parameters:
 
 ```text
 slam_core/fusion2/config.py
 ```
 
-LiDAR matcher profiles are defined in:
+LiDAR matcher profiles:
 
 ```text
 hector/config.py
 ```
 
-For implementation details, see:
+More implementation details:
 
 ```text
 slam_core/fusion2/README.md
-```
-
-## Basic Validation
-
-Compile-check the fusion2 Python files:
-
-```bash
-.venv/bin/python -m py_compile $(find slam_core/fusion2 -path '*/__pycache__' -prune -o -name '*.py' -print | sort)
-```
-
-Run the fusion2 test suite:
-
-```bash
-.venv/bin/python -m pytest tests/fusion2
 ```
