@@ -9,7 +9,9 @@ same shared SE(2) map.
 
 Example result from the real-time modular switching pipeline:
 
-![Fusion switching demo](docs/images/switching_demo_presentation.png)
+![Fusion switching demo](output/switching_demo_presentation.png)
+
+Video demo: [download the compressed switching demo](output/switching_demo_compressed.mp4).
 
 ## Main Idea
 
