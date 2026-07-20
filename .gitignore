@@ -35,6 +35,7 @@ datasets/
 carto_outputs/
 hector_outputs/
 outputs/
+*_outputs/
 visual_slam_outputs/
 
 # Nested generated folders
@@ -63,6 +64,13 @@ fusion_outputs/
 .codex
 .codex/
 CLAUDE.md
+
+# Markdown reports/docs are local-only except for the root README
+*.md
+!/README.md
+
+# Local model weights are too large for the code repository
+third_party/models/
 
 # Reference & planning docs (local reference only, never pushed)
 FUSION_STATUS.md

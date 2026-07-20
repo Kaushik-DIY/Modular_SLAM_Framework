@@ -679,6 +679,13 @@ def main(argv=None):
                     help="LiDAR local-mapping variant for modes lidar/lidar_orb "
                          "(scan_to_submap or scan_to_map, C++ or Python); default "
                          "comes from FusionV2Config.lidar_frontend")
+    ap.add_argument("--semantic", action="store_true",
+                    help="after the run, generate semantic-map outputs from the "
+                         "RGB-D stream: 4-panel video + semantic.png + metrics "
+                         "(post-processing; works with every mode)")
+    ap.add_argument("--semantic-speed", type=float, default=4.0,
+                    help="semantic video playback vs real time (1 = actual run "
+                         "speed); only with --semantic")
     args = ap.parse_args(argv)
 
     # Validate module choices before building the selected pipeline.
@@ -708,6 +715,15 @@ def main(argv=None):
                  else run_orb_mode(cfg))
     else:
         raise SystemExit(f"unknown mode {args.mode}")
+
+    if args.semantic:
+        # Post-run semantic mapping over the finished run dir (mode-agnostic:
+        # only needs the anchored trajectory + map grid + dataset RGB-D).
+        from slam_core.fusion2.Dependencies.semantic_pipeline import \
+            run_semantic_pipeline
+        stats["semantic"] = run_semantic_pipeline(
+            run_dir=Path(stats["run_dir"]), dataset=Path(cfg.dataset),
+            speed=args.semantic_speed)
 
     print(json.dumps(stats, indent=2, default=str))
 

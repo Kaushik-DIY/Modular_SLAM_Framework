@@ -155,16 +155,14 @@ def draw_map(R: _Run, ax):
     ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
     for sp in ax.spines.values():
         sp.set_edgecolor("#999"); sp.set_linewidth(0.8)
-    ax.set_title(f"Real-time module switching — {R.summary.get('mode','')} demo "
-                 f"({len(R.timeline)} kf, {R.summary.get('loops_accepted',0)} loops, "
-                 f"{len(R.switches)} switches)", fontsize=13, pad=8)
+    # Title intentionally omitted — the run counts and description live in the
+    # thesis figure caption, not baked onto the plot.
 
 
 def draw_displacement(R: _Run, ax):
     step = np.hypot(np.diff(R.px), np.diff(R.py))
     ax.plot(R.kf[1:], step, "-", lw=0.9, color="#1f77b4")
     ax.set_ylabel("KF step [m]"); ax.set_xlabel("keyframe")
-    ax.set_title("keyframe-to-keyframe displacement", fontsize=12, pad=16)
     ax.grid(alpha=0.2)
     R.switch_lines(ax)
 
@@ -181,7 +179,6 @@ def draw_tracking(R: _Run, ax):
     axb.set_ylabel("LiDAR match score", color="#2ca02c")
     ax.tick_params(axis="y", colors="#9467bd"); axb.tick_params(axis="y", colors="#2ca02c")
     ax.set_xlabel("keyframe")
-    ax.set_title("Front-end tracking quality per segment", fontsize=12, pad=16)
     ax.grid(alpha=0.2)
     R.switch_lines(ax)
 
@@ -197,7 +194,6 @@ def draw_loops(R: _Run, ax):
         ax.step(acc, np.arange(1, len(acc) + 1), where="post",
                 color="#d62728", lw=1.6, label=f"accepted ({len(acc)})")
     ax.set_ylabel("count (cumulative)"); ax.set_xlabel("keyframe")
-    ax.set_title("loop closure events", fontsize=12, pad=16)
     ax.grid(alpha=0.2)
     ax.legend(loc="upper left", fontsize=9, framealpha=0.85)
     R.switch_lines(ax)
@@ -233,12 +229,11 @@ def render(run_dir: Path, out_base: Path, dpi: int = 600, combined: bool = False
         _save(fig, Path(f"{out_base}_{name}"), dpi, tight=False)
 
     if combined:
-        fig = plt.figure(figsize=(13, 15))
-        gs = fig.add_gridspec(4, 1, height_ratios=[2.6, 1.0, 1.0, 1.0], hspace=0.30)
+        fig = plt.figure(figsize=(13, 11.7))
+        gs = fig.add_gridspec(3, 1, height_ratios=[2.6, 1.0, 1.0], hspace=0.55)
         draw_map(R, fig.add_subplot(gs[0]))
         draw_displacement(R, fig.add_subplot(gs[1]))
         draw_tracking(R, fig.add_subplot(gs[2]))
-        draw_loops(R, fig.add_subplot(gs[3]))
         _save(fig, out_base, dpi)
 
     nprop = len(R.verifs)

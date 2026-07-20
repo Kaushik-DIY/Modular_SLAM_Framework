@@ -1,11 +1,4 @@
-"""Native C++ LiDAR front-end wrapper (V4.4-P4).
-
-Same `process(t, scan_xy) -> (Pose2, pts_f32, is_kf)` contract as the legacy
-Python LidarFrontend; all per-scan work (voxel filter, extrapolator, matcher,
-insert, keyframe decision) runs GIL-released inside fusion_core. Config values
-come field-by-field from the hector per-dataset profile — hector/config.py
-stays the single source of truth for the LiDAR matcher parameters.
-"""
+"""Native C++ LiDAR front-end wrapper."""
 from __future__ import annotations
 
 import math

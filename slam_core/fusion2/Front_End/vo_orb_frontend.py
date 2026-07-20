@@ -1,12 +1,4 @@
-"""Native windowed C++ VO front-end wrapper (fusion v3).
-
-Drives fusion_core.VoFrontend per RGB-D frame. IMU usage (v3.6): the IMU is
-used ONLY as dead-reckoning during tracking dropouts — per-frame IMU priors
-measurably hurt projection matching on this robot (camera-mount tilt, V3.3
-A/B), but during a dropout there is nothing to match, and integrating the
-real measured rotation beats freezing the last visual velocity (which keeps
-"turning" at a stale rate through 2-4 s failure bursts). Two parameters the
-extrinsic file would normally give are learned online from data instead:
+"""Native windowed C++ VO front-end wrapper.
 
 - yaw SIGN: correlate VO heading deltas with IMU yaw deltas during good
   tracking; commit the sign once enough correlated rotation has been seen.

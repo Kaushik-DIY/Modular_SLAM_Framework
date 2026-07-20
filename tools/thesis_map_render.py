@@ -28,15 +28,16 @@ matplotlib.rcParams.update({
 })
 
 MODE_LABEL = {
-    "lidar_s2s_bnb": "LiDAR · scan-to-submap · B&B",
-    "lidar_s2s_icp": "LiDAR · scan-to-submap · ICP",
-    "lidar_s2m_bnb": "LiDAR · scan-to-map · B&B",
-    "lidar_s2m_icp": "LiDAR · scan-to-map · ICP",
-    "lidar_orb_s2s": "LiDAR + visual-PnP · scan-to-submap",
-    "lidar_orb_s2m": "LiDAR + visual-PnP · scan-to-map",
-    "orb_lidar_bnb": "Visual VO + LiDAR-B&B verify",
-    "orb_lidar_icp": "Visual VO + LiDAR-ICP verify",
-    "orb":           "Visual VO + visual-PnP",
+    # Consistent "front-end + proposer + verifier" naming across all panels.
+    "lidar_s2s_bnb": "Scan-to-submap + Proximity + B&B",
+    "lidar_s2s_icp": "Scan-to-submap + Proximity + ICP",
+    "lidar_s2m_bnb": "Scan-to-map + Proximity + B&B",
+    "lidar_s2m_icp": "Scan-to-map + Proximity + ICP",
+    "lidar_orb_s2s": "Scan-to-submap + Proximity + PnP",
+    "lidar_orb_s2m": "Scan-to-map + Proximity + PnP",
+    "orb_lidar_bnb": "VO + DBoW + B&B",
+    "orb_lidar_icp": "VO + DBoW + ICP",
+    "orb":           "VO + DBoW + PnP",
     "s2s_frontend":  "LiDAR scan-to-submap · front-end only (no loops)",
     "s2m_frontend":  "LiDAR scan-to-map · front-end only (no loops)",
     "vo_frontend":   "Visual VO + local BA · front-end only (no loops)",
@@ -68,7 +69,7 @@ COMBO_ORDER = ["lidar_s2s_bnb", "lidar_s2s_icp", "lidar_s2m_bnb", "lidar_s2m_icp
                "lidar_orb_s2s", "lidar_orb_s2m", "orb_lidar_bnb", "orb_lidar_icp", "orb"]
 
 _LEGEND_HANDLES = [
-    Line2D([0], [0], color="#1f77b4", lw=0.9, alpha=0.65, label="Trajectory"),
+    Line2D([0], [0], color="#1f77b4", lw=0.9, alpha=0.65, label="Path"),
     Line2D([0], [0], marker="o", color="w", markerfacecolor="#15a015", ms=6, label="Start"),
     Line2D([0], [0], marker="o", color="w", markerfacecolor="red",     ms=6, label="End"),
 ]
